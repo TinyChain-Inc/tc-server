@@ -70,39 +70,12 @@ Keep the following rules in mind whenever you extend the server:
 
 1. Add new handlers to the kernel builder and surface them through adapters via
    request routing, never by instantiating another kernel.
-2. Test changes through both the Rust unit tests and the Python integration test
-   (`client/py/tests/test_backend.py`) so the shared transaction state machine
-   stays in sync across interfaces.
-3. When touching `/lib` installs, storage, or WASM routing, also run
-   `cargo build -p tc-wasm --target wasm32-unknown-unknown --release &&
-   .venv/bin/pytest client/py/tests/test_install_wasm_script.py` to ensure the
-   PyO3 installer still handles the bundled example schema and the freshly built
-   WASM artifact, persisting it under `<data-dir>/lib/...`.
-3. Update this document or `ROADMAP.md` if you adjust kernel construction or the
+2. Update this document or `ROADMAP.md` if you adjust kernel construction or the
    transaction contract—future agents rely on this file to avoid regressions.
-4. **Never** hide core functionality behind adapter-only feature flags. If a
+3. **Never** hide core functionality behind adapter-only feature flags. If a
    new capability is only reachable when `http` is enabled (or only when
    `pyo3` is enabled), that’s a regression. Always add transport-agnostic
    entry points first, then plug the adapters into that shared code.
-5. When exposing new `State` variants (e.g., tensors/collections) or handler
+4. When exposing new `State` variants (e.g., tensors/collections) or handler
    verbs to Python, extend the PyO3 bindings in `tc-server/src/pyo3_runtime.rs`
-   so `PyState`/`PyKernelHandle` can deserialize them via destream. Pair these
-   changes with Python doc stubs under `client/py` per `ROADMAP.md` so Sphinx
-   stays in sync.
-
-## Python virtualenv (`.venv`)
-
-* The repo ships with a `.venv` managed by the install script. Always activate
-  it (`source .venv/bin/activate`) before running Python tests or reinstalling
-  the PyO3 extension.
-* `scripts/install_tc_server_python.sh` invokes `maturin develop` inside `.venv`
-  so that `import tinychain as tc` resolves to the freshly built module.
-* Keep `.venv` out of git status; wipe/recreate it only if the interpreter
-  becomes corrupted (remember to reinstall maturin inside the new env).
-* Run `cargo clippy --all-targets --all-features` (or the crate-specific subset)
-  before submitting Rust changes—clippy catches cross-target issues that `cargo
-  check` can miss, especially around PyO3 bindings and unused structs.
-* Use `destream` as the default codec for HTTP bodies, WASM manifests, PyO3
-  transfers, etc. `serde` is only acceptable for payloads that the protocol
-  bounds tightly (e.g., query strings) or for test fixtures, and any such usage
-  must be documented inline so we can migrate it later.
+   so `PyState`/`PyKernelHandle` can deserialize them via destream.
