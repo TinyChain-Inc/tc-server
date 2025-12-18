@@ -1,0 +1,65 @@
+[package]
+name = "tinychain"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "tinychain"
+
+[dependencies]
+bytes = "1"
+futures = "0.3"
+pathlink = "0.3"
+tc-ir = { path = "../tc-ir" }
+tc-error = "0.12"
+tc-value = { path = "../tc-value" }
+tc-state = { path = "../tc-state" }
+umask = "2.1"
+parking_lot = "0.12"
+url = "2"
+destream = "0.8"
+async-trait = "0.1"
+wasmtime = { version = "15", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.21"
+sha2 = "0.10"
+
+[dependencies.destream_json]
+version = "0.13"
+default-features = false
+optional = true
+
+[dependencies.pyo3]
+version = "0.21"
+features = ["macros", "extension-module"]
+optional = true
+
+[dependencies.http]
+version = "0.2"
+optional = true
+
+[dependencies.hyper]
+version = "0.14"
+features = ["full"]
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "macros", "sync"]
+optional = true
+
+[dependencies.tower]
+version = "0.4"
+features = ["make"]
+optional = true
+
+[features]
+default = ["http", "wasm"]
+http = ["dep:http", "dep:hyper", "dep:tokio", "dep:tower", "dep:destream_json"]
+pyo3 = ["dep:pyo3", "dep:destream_json", "tc-ir/pyo3-conversions"]
+wasm = ["dep:wasmtime"]
+
+[dev-dependencies]
+serde_json = "1"
+wat = "1"
