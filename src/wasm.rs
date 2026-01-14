@@ -22,8 +22,7 @@ use {
 #[cfg(feature = "pyo3")]
 use {
     crate::pyo3_runtime::{
-        PyKernelRequest, PyKernelResponse, decode_state_from_bytes_async,
-        py_state_handle_from_state, request_body_bytes,
+        PyKernelRequest, PyKernelResponse, request_body_bytes,
     },
     futures::lock::Mutex as AsyncMutex,
     pyo3::{exceptions::PyValueError, prelude::*},
@@ -116,14 +115,15 @@ impl WasmLibrary {
         };
 
         let typed = func
-            .typed::<(i32, i32, i32, i32), (i32, i32)>(&self.store)
+            .typed::<(i32, i32, i32, i32), i64>(&self.store)
             .map_err(map_wasm_error)?;
-        let (result_ptr, result_len) = typed
+        let packed = typed
             .call(
                 &mut self.store,
                 (header_ptr, header_len, body_ptr, body_len),
             )
             .map_err(map_wasm_error)?;
+        let (result_ptr, result_len) = unpack_wasm_pair(packed);
 
         let bytes = self.read_buffer(result_ptr, result_len)?;
         if header_len > 0 {
@@ -146,9 +146,10 @@ impl WasmLibrary {
             .get_func(&mut *store, "tc_library_entry")
             .ok_or_else(|| TCError::internal("missing tc_library_entry export"))?;
         let typed = func
-            .typed::<(), (i32, i32)>(&mut *store)
+            .typed::<(), i64>(&mut *store)
             .map_err(map_wasm_error)?;
-        let (ptr, len) = typed.call(&mut *store, ()).map_err(map_wasm_error)?;
+        let packed = typed.call(&mut *store, ()).map_err(map_wasm_error)?;
+        let (ptr, len) = unpack_wasm_pair(packed);
         let bytes = read_memory(store, memory, ptr, len)?;
         let manifest = decode_manifest(bytes)?;
         Ok((manifest.schema, manifest.routes))
@@ -203,6 +204,13 @@ fn read_memory(store: &mut Store<()>, memory: &Memory, ptr: i32, len: i32) -> TC
 
 fn map_wasm_error<E: std::fmt::Display>(err: E) -> TCError {
     TCError::internal(format!("wasm error: {err}"))
+}
+
+fn unpack_wasm_pair(value: i64) -> (i32, i32) {
+    let value = value as u64;
+    let ptr = (value & 0xffff_ffff) as u32 as i32;
+    let len = (value >> 32) as u32 as i32;
+    (ptr, len)
 }
 
 fn encode_json(header: &TxnHeader) -> TCResult<Vec<u8>> {
@@ -311,6 +319,8 @@ mod tests {
     pub(super) fn wasm_module() -> Vec<u8> {
         let manifest = r#"{"schema":{"id":"/library/example","version":"0.1.0","dependencies":[]},"routes":[{"path":"/hello","export":"hello"}]}"#;
         let response = r#""hello""#;
+        let manifest_packed = ((manifest.len() as u64) << 32) | 8u64;
+        let response_packed = ((response.len() as u64) << 32) | 512u64;
 
         let wat = format!(
             r#"(module
@@ -325,19 +335,17 @@ mod tests {
                     (local.get $addr)
                 )
                 (func (export "free") (param i32) (param i32))
-                (func (export "tc_library_entry") (result i32 i32)
-                    (i32.const 8)
-                    (i32.const {manifest_len})
+                (func (export "tc_library_entry") (result i64)
+                    (i64.const {manifest_packed})
                 )
-                (func (export "hello") (param i32 i32 i32 i32) (result i32 i32)
-                    (i32.const 512)
-                    (i32.const {response_len})
+                (func (export "hello") (param i32 i32 i32 i32) (result i64)
+                    (i64.const {response_packed})
                 )
             )"#,
             manifest = escape_wat_string(manifest),
             response = escape_wat_string(response),
-            manifest_len = manifest.len(),
-            response_len = response.len()
+            manifest_packed = manifest_packed,
+            response_packed = response_packed
         );
 
         wat::parse_str(wat).expect("valid wat")
@@ -653,17 +661,20 @@ async fn py_handle_route(
 }
 
 #[cfg(feature = "pyo3")]
-async fn py_wasm_response(bytes: Vec<u8>, txn: TxnHandle) -> PyResult<PyKernelResponse> {
+async fn py_wasm_response(bytes: Vec<u8>, _txn: TxnHandle) -> PyResult<PyKernelResponse> {
     if bytes.is_empty() {
         return Ok(PyKernelResponse::new(200, None, None));
     }
 
-    let decoded = decode_state_from_bytes_async(bytes, txn)
-        .await
-        .map_err(PyValueError::new_err)?;
-
     Python::with_gil(|py| {
-        let body = py_state_handle_from_state(py, decoded)?;
+        let body = match std::str::from_utf8(&bytes) {
+            Ok(text) => crate::pyo3_runtime::PyStateHandle::new(
+                pyo3::types::PyString::new_bound(py, text).into_py(py),
+            ),
+            Err(_) => crate::pyo3_runtime::PyStateHandle::new(
+                pyo3::types::PyBytes::new_bound(py, &bytes).into_py(py),
+            ),
+        };
         Ok(PyKernelResponse::new(200, None, Some(body)))
     })
 }

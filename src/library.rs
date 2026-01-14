@@ -1,15 +1,13 @@
 use std::{
-    io,
     str::FromStr,
     sync::{Arc, RwLock},
 };
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use bytes::Bytes;
 use destream::de;
-use futures::{executor, stream};
 use pathlink::{Link, PathSegment};
+use serde::Deserialize;
 use tc_error::{TCError, TCResult};
 use tc_ir::{
     Dir, HandleDelete, HandleGet, HandlePost, HandlePut, Library, LibraryModule, LibrarySchema,
@@ -309,9 +307,62 @@ pub fn apply_wasm_install<Request, Response>(
 }
 
 fn decode_install_payload(bytes: &[u8]) -> Result<InstallPayloadRaw, InstallError> {
-    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::copy_from_slice(bytes))]);
-    executor::block_on(destream_json::try_decode((), stream))
-        .map_err(|err| InstallError::bad_request(err.to_string()))
+    #[derive(Deserialize)]
+    struct RawSchema {
+        id: String,
+        version: String,
+        #[serde(default)]
+        dependencies: Vec<String>,
+    }
+
+    impl TryFrom<RawSchema> for LibrarySchema {
+        type Error = String;
+
+        fn try_from(raw: RawSchema) -> Result<Self, Self::Error> {
+            let id = Link::from_str(&raw.id).map_err(|err| format!("invalid schema id: {err}"))?;
+            let dependencies = raw
+                .dependencies
+                .into_iter()
+                .map(|dep| Link::from_str(&dep).map_err(|err| format!("invalid dependency link: {err}")))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(LibrarySchema::new(id, raw.version, dependencies))
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct InstallPayload {
+        schema: RawSchema,
+        #[serde(default)]
+        artifacts: Vec<InstallArtifactRaw>,
+    }
+
+    #[derive(Deserialize)]
+    struct InstallArtifactRaw {
+        path: String,
+        content_type: String,
+        bytes: String,
+    }
+
+    let payload: InstallPayload = serde_json::from_slice(bytes)
+        .map_err(|err| InstallError::bad_request(format!("invalid install payload json: {err}")))?;
+
+    let schema = payload
+        .schema
+        .try_into()
+        .map_err(|err| InstallError::bad_request(err))?;
+
+    Ok(InstallPayloadRaw {
+        schema,
+        artifacts: payload
+            .artifacts
+            .into_iter()
+            .map(|artifact| InstallArtifact {
+                path: artifact.path,
+                content_type: artifact.content_type,
+                bytes: artifact.bytes,
+            })
+            .collect(),
+    })
 }
 
 pub type LibraryRouteFactory<Request, Response> = Arc<
