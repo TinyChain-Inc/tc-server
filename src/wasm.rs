@@ -8,10 +8,10 @@ use wasmtime::{Engine, Func, Instance, Memory, Module, Store};
 
 use crate::KernelHandler;
 
-#[cfg(any(feature = "http", feature = "pyo3"))]
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
 use crate::library::{RouteMetadata, SchemaRoutes};
 
-#[cfg(feature = "http")]
+#[cfg(feature = "http-server")]
 use {
     crate::txn::TxnHandle,
     hyper::{Body, Request, Response, StatusCode, body},
@@ -317,7 +317,7 @@ mod tests {
     use umask::Mode;
 
     pub(super) fn wasm_module() -> Vec<u8> {
-        let manifest = r#"{"schema":{"id":"/library/example","version":"0.1.0","dependencies":[]},"routes":[{"path":"/hello","export":"hello"}]}"#;
+        let manifest = r#"{"schema":{"id":"/lib/example","version":"0.1.0","dependencies":[]},"routes":[{"path":"/hello","export":"hello"}]}"#;
         let response = r#""hello""#;
         let manifest_packed = ((manifest.len() as u64) << 32) | 8u64;
         let response_packed = ((response.len() as u64) << 32) | 512u64;
@@ -370,7 +370,7 @@ mod tests {
             TxnId::from_parts(NetworkTime::from_nanos(1), 0),
             NetworkTime::from_nanos(1),
             Claim::new(
-                pathlink::Link::from_str("/library/example").unwrap(),
+                pathlink::Link::from_str("/lib/example").unwrap(),
                 Mode::all(),
             ),
         );
@@ -382,7 +382,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "http"))]
+#[cfg(all(test, feature = "http-server"))]
 mod http_tests {
     use super::*;
     use crate::{
@@ -399,7 +399,7 @@ mod http_tests {
     async fn kernel_dispatches_wasm_route() {
         let bytes = super::tests::wasm_module();
         let initial =
-            tc_ir::LibrarySchema::new(Link::from_str("/library/initial").unwrap(), "0.0.1", vec![]);
+            tc_ir::LibrarySchema::new(Link::from_str("/lib/initial").unwrap(), "0.0.1", vec![]);
         let module = build_http_library_module(initial, None);
         let handlers = http_library_handlers(&module);
 
@@ -413,7 +413,7 @@ mod http_tests {
 
         let install_payload = serde_json::json!({
             "schema": {
-                "id": "/library/example",
+                "id": "/lib/example",
                 "version": "0.1.0",
                 "dependencies": []
             },
@@ -457,7 +457,7 @@ mod http_tests {
     }
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "http-server")]
 pub fn http_wasm_route_handler_from_bytes(
     bytes: Vec<u8>,
 ) -> TCResult<(
@@ -491,7 +491,7 @@ pub fn http_wasm_route_handler_from_bytes(
     Ok((handler, schema, schema_routes))
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "http-server")]
 async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request<Body>) -> Response<Body> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
@@ -541,7 +541,7 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request<Body>) ->
     }
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "http-server")]
 fn txn_header(req: &Request<Body>) -> TCResult<TxnHeader> {
     req.extensions()
         .get::<TxnHandle>()
@@ -550,7 +550,7 @@ fn txn_header(req: &Request<Body>) -> TCResult<TxnHeader> {
         .map(|handle| handle.header())
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "http-server")]
 fn method_not_allowed(method: &hyper::Method, path: &str) -> Response<Body> {
     error_response(TCError::method_not_allowed(
         method.clone(),
@@ -558,12 +558,12 @@ fn method_not_allowed(method: &hyper::Method, path: &str) -> Response<Body> {
     ))
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "http-server")]
 fn not_found(path: &str) -> Response<Body> {
     error_response(TCError::not_found(path))
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "http-server")]
 fn error_response(err: TCError) -> Response<Body> {
     let status = match err.code() {
         ErrorKind::BadGateway | ErrorKind::BadRequest => StatusCode::BAD_REQUEST,

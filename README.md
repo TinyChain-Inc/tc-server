@@ -21,11 +21,14 @@ the kernel is compiled, every adapter clones the same instance so `/lib`,
 ## Building & testing
 
 ```bash
-# HTTP-only build (default features already enable http)
-cargo build -p tc-server --features http
+# HTTP server build (default features already enable it)
+cargo build -p tc-server --features http-server
+
+# HTTP client-only build (for PyO3 in-process hosts which proxy to remote HTTP hosts)
+cargo build -p tc-server --no-default-features --features "http-client"
 
 # PyO3 host (requires working Python toolchain)
-cargo build -p tc-server --features "http pyo3"
+cargo build -p tc-server --features "http-server pyo3"
 
 # Run the crate’s test suite
 cargo test -p tc-server --all-features
@@ -54,7 +57,7 @@ async fn main() -> hyper::Result<()> {
             Ok::<_, Infallible>(Response::new(Body::from("service ok")))
         },
         |_req: Request<Body>| async {
-            Ok::<_, Infallible>(Response::new(Body::from("kernel metrics")))
+            Ok::<_, Infallible>(Response::new(Body::from("host metrics")))
         },
         |_req: Request<Body>| async {
             Ok::<_, Infallible>(Response::new(Body::from("healthy")))
@@ -112,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
     use std::str::FromStr;
 
     let schema = LibrarySchema::new(
-        Link::from_str("/library/examples/hello")?,
+        Link::from_str("/lib/examples/hello")?,
         "0.1.0",
         vec![],
     );

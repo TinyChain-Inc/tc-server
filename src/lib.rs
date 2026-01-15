@@ -20,10 +20,10 @@ pub use tc_value::Value;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-#[cfg(feature = "http")]
+#[cfg(feature = "http-server")]
 pub mod http;
 
-#[cfg(feature = "http")]
+#[cfg(feature = "http-server")]
 pub use http::{
     HttpKernel, HttpKernelConfig, HttpServer, build_http_kernel, build_http_kernel_with_config,
 };

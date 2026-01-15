@@ -8,7 +8,7 @@ deployment, so keep the crate thin and transport-agnostic.
 ## How this crate fits into TinyChain
 
 - Owns kernel construction, transaction lifecycle management, and the canonical
-  routing for `/state`, `/class`, `/library`, `/service`, `/host`, and `/healthz`.
+  routing for `/state`, `/class`, `/lib`, `/service`, `/host`, and `/healthz`.
 - Hydrates on-disk library storage (`<data-dir>/lib/...`) so installed WASM
   artifacts become available to every adapter automatically.
 - Provides reference binaries/tests that client runtimes and CI environments use

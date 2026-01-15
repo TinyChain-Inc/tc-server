@@ -81,7 +81,7 @@ where
             (Method::Get, "/lib") => Some(self.lib_get_handler.call(req)),
             (Method::Put, "/lib") => Some(self.lib_put_handler.call(req)),
             (Method::Get, "/service") => Some(self.service_handler.call(req)),
-            (Method::Get, "/kernel/metrics") => Some(self.kernel_handler.call(req)),
+            (Method::Get, "/host/metrics") => Some(self.kernel_handler.call(req)),
             (Method::Get, "/healthz") => Some(self.health_handler.call(req)),
             _ => None,
         }
@@ -288,7 +288,7 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
                 .unwrap_or_else(|| stub_handler("service")),
             kernel_handler: self
                 .kernel_handler
-                .unwrap_or_else(|| stub_handler("kernel/metrics")),
+                .unwrap_or_else(|| stub_handler("host/metrics")),
             health_handler: self
                 .health_handler
                 .unwrap_or_else(|| stub_handler("healthz")),

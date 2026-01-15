@@ -705,7 +705,7 @@ mod tests {
         }
 
         let schema = LibrarySchema::new(
-            Link::from_str("/library/native").expect("schema link"),
+            Link::from_str("/lib/native").expect("schema link"),
             "0.1.0",
             vec![],
         );

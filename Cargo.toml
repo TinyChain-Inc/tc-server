@@ -55,8 +55,11 @@ features = ["make"]
 optional = true
 
 [features]
-default = ["http", "wasm"]
-http = ["dep:http", "dep:hyper", "dep:tokio", "dep:tower", "dep:destream_json"]
+default = ["http-server", "wasm"]
+# Outbound HTTP client support (for proxying requests to remote hosts).
+http-client = ["dep:http", "dep:hyper", "dep:tokio", "dep:destream_json"]
+# Inbound HTTP server support (Hyper server + tower make_service wiring).
+http-server = ["http-client", "dep:tower"]
 pyo3 = ["dep:pyo3", "dep:destream_json", "tc-ir/pyo3-conversions"]
 wasm = ["dep:wasmtime"]
 

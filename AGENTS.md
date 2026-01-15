@@ -23,8 +23,7 @@ Keep the following rules in mind whenever you extend the server:
   for chain-wrapped collections, `/state/collection` for shard-local data,
   `/state/scalar` plus `/state/scalar/tuple`, `/state/scalar/map`,
   `/state/scalar/value` for tuples/maps/primitives, and soon `/state/media`),
-  `/class`, `/library` (alias
-  `/lib`), `/service`, `/host`, and `/healthz`. Keep new features within these
+  `/class`, `/lib`, `/service`, `/host`, and `/healthz`. Keep new features within these
   namespaces and reuse the standard response contracts so adapters stay aligned.
 * The PyO3 adapter exposes the same kernel as HTTP. Once a WASM library is
   installed under `<data-dir>/lib/...`, PyO3 automatically exposes the same
@@ -48,13 +47,17 @@ Keep the following rules in mind whenever you extend the server:
 * Transactions are owned by the kernel. Protocol layers may parse `txn_id`
   parameters or detect empty bodies, but all begin/continue/commit/rollback
   decisions end up in `Kernel::route_request`.
+* There is exactly one transaction semantics implementation. Do not duplicate any part of the
+  claim, token chaining, begin/continue, commit, or rollback logic in adapters; they only parse
+  transport cues and delegate to the kernel.
 * Ownership flows exactly as in TinyChain `host`:
   - Missing `txn_id` ⇒ kernel begins a transaction and returns a handle.
   - Subsequent calls include `?txn_id=...` and the kernel reuses the pending
     handle. Interfaces must attach the handle to the request extensions so
     handlers can access it.
-  - Empty `POST` ⇒ commit, empty `DELETE` ⇒ rollback. Non-empty bodies are routed
-    as regular requests even if they reuse `POST`/`DELETE`.
+  - Root-only finalize: empty `POST`/`DELETE` finalize **only** when sent to the canonical
+    component root (derived from the manifest). Empty bodies to subpaths must be treated as
+    ordinary requests, not commit/rollback.
 * Only the kernel finalizes a transaction. Adapters must **not** call
   `TxnManager` directly except to parse/attach handles via `route_request`.
 * The transaction owner enforces a **3-second** temporal locality window. Handlers
@@ -65,6 +68,18 @@ Keep the following rules in mind whenever you extend the server:
   `/state/<publisher>/queues/<name>` tables referencing `/state/media/...` for
   large blobs). The kernel handles leasing/failover automatically; do **not**
   invent ad-hoc `claim`/`ack` verbs.
+
+## Network egress (security boundary)
+
+* TinyChain application code must never gain arbitrary network access. Any outbound HTTP client
+  usage inside `tc-server` is an internal adapter used by the kernel gateway.
+* Egress is default-deny and manifest-driven:
+  - a library/service may only call its explicit dependency set (library-wide, non-transitive),
+    authorized by canonical path;
+  - absolute URIs are only permitted when their authority is explicitly whitelisted for that
+    canonical path by host configuration/registry rules (avoid blacklist filtering).
+* Enforce this uniformly across HTTP and PyO3: both adapters must route outbound calls through the
+  same kernel gateway so dependency checks and token chaining cannot be bypassed.
 
 ## When extending tc-server
 

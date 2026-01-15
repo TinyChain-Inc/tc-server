@@ -89,7 +89,7 @@ impl LibraryState {
 /// Default schema used when no persisted library is present on disk yet.
 pub fn default_library_schema() -> LibrarySchema {
     LibrarySchema::new(
-        Link::from_str("/library/default").expect("default library link"),
+        Link::from_str("/lib/default").expect("default library link"),
         "0.0.0",
         vec![],
     )
@@ -288,7 +288,7 @@ pub fn apply_wasm_install<Request, Response>(
     let (manifest_schema, schema_routes, handler) =
         factory(wasm_bytes.clone()).map_err(|err| InstallError::internal(err.to_string()))?;
 
-    if manifest_schema != payload.schema {
+    if !schemas_equivalent(&manifest_schema, &payload.schema) {
         return Err(InstallError::bad_request(
             "manifest schema does not match wasm descriptor",
         ));
@@ -304,6 +304,36 @@ pub fn apply_wasm_install<Request, Response>(
     }
 
     Ok(())
+}
+
+fn schemas_equivalent(left: &LibrarySchema, right: &LibrarySchema) -> bool {
+    left.version() == right.version()
+        && canonical_link(left.id()) == canonical_link(right.id())
+        && canonical_links(left.dependencies()) == canonical_links(right.dependencies())
+}
+
+fn canonical_links(links: &[Link]) -> Vec<String> {
+    let mut out = links.iter().map(canonical_link).collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+fn canonical_link(link: &Link) -> String {
+    let raw = link.to_string();
+    if raw.starts_with('/') {
+        return raw;
+    }
+
+    // Accept both path-only and absolute link string forms by comparing on the path suffix.
+    // This keeps the `/lib` install payload stable even if a `Link` string round-trip adds a
+    // scheme or authority prefix.
+    match raw.split_once("://") {
+        Some((_, rest)) => rest
+            .find('/')
+            .map(|idx| rest[idx..].to_string())
+            .unwrap_or(raw),
+        None => raw,
+    }
 }
 
 fn decode_install_payload(bytes: &[u8]) -> Result<InstallPayloadRaw, InstallError> {
@@ -483,14 +513,14 @@ impl<Request, Response> Clone for LibraryHandlers<Request, Response> {
     }
 }
 
-#[cfg(any(feature = "http", feature = "pyo3"))]
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
 #[derive(Clone)]
 pub struct NativeLibrary<H> {
     schema: LibrarySchema,
     routes: Arc<Dir<H>>,
 }
 
-#[cfg(any(feature = "http", feature = "pyo3"))]
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
 impl<H> NativeLibrary<H>
 where
     H: Clone,
@@ -511,7 +541,7 @@ where
     }
 }
 
-#[cfg(any(feature = "http", feature = "pyo3"))]
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
 pub trait NativeLibraryHandler: HandleGet<TxnHandle, Request = Value, RequestContext = (), Response = Value, Error = TCError>
     + HandlePut<TxnHandle, Request = Value, RequestContext = (), Response = Value, Error = TCError>
     + HandlePost<TxnHandle, Request = Value, RequestContext = (), Response = Value, Error = TCError>
@@ -523,7 +553,7 @@ pub trait NativeLibraryHandler: HandleGet<TxnHandle, Request = Value, RequestCon
 {
 }
 
-#[cfg(any(feature = "http", feature = "pyo3"))]
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
 impl<T> NativeLibraryHandler for T where
     T: HandleGet<
             TxnHandle,
@@ -638,7 +668,7 @@ where
     }
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "http-server")]
 pub mod http {
     use std::{io, sync::Arc};
 
@@ -800,7 +830,7 @@ pub mod http {
         }
     }
 
-    #[cfg(all(test, feature = "http"))]
+    #[cfg(all(test, feature = "http-server"))]
     mod tests {
         use super::*;
         use crate::{Method, kernel::Kernel};
@@ -813,7 +843,7 @@ pub mod http {
         #[tokio::test]
         async fn serves_schema_over_http() {
             let initial = LibrarySchema::new(
-                Link::from_str("/library/service").expect("link"),
+                Link::from_str("/lib/service").expect("link"),
                 "0.1.0",
                 vec![],
             );
@@ -841,7 +871,7 @@ pub mod http {
             let body = to_bytes(response.into_body()).await.expect("body");
             let json: JsonValue = serde_json::from_slice(&body).expect("json");
 
-            assert_eq!(json["id"], "/library/service");
+            assert_eq!(json["id"], "/lib/service");
             assert_eq!(json["version"], "0.1.0");
             assert!(json["dependencies"].is_array());
         }
@@ -849,7 +879,7 @@ pub mod http {
         #[tokio::test]
         async fn installs_schema_via_put() {
             let initial = LibrarySchema::new(
-                Link::from_str("/library/service").expect("link"),
+                Link::from_str("/lib/service").expect("link"),
                 "0.1.0",
                 vec![],
             );
@@ -862,7 +892,7 @@ pub mod http {
                 .finish();
 
             let new_schema = serde_json::json!({
-                "id": "/library/updated",
+                "id": "/lib/updated",
                 "version": "0.2.0",
                 "dependencies": [],
             });
@@ -896,7 +926,7 @@ pub mod http {
                 serde_json::from_slice(&to_bytes(get_response.into_body()).await.unwrap())
                     .expect("json");
 
-            assert_eq!(json["id"], "/library/updated");
+            assert_eq!(json["id"], "/lib/updated");
             assert_eq!(json["version"], "0.2.0");
         }
     }

@@ -169,7 +169,7 @@ use crate::Method;
 
 fn default_claim() -> Claim {
     Claim::new(
-        Link::from_str("/library/default").expect("default claim link"),
+        Link::from_str("/lib/default").expect("default claim link"),
         Mode::all(),
     )
 }
