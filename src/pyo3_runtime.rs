@@ -4,11 +4,12 @@ use std::{fmt, io, marker::PhantomData, path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, executor, stream};
+use pathlink::Link;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyModule, PyString, PyType};
 use pyo3::{Bound, PyClassInitializer, PyRef};
-use tc_ir::{LibrarySchema, Scalar, TxnId};
+use tc_ir::{LibrarySchema, OpRef, Scalar, Subject, TxnId};
 use url::form_urlencoded;
 
 use crate::{
@@ -288,13 +289,19 @@ pub(crate) fn python_kernel_builder_with_config(
     let module = build_pyo3_library_module(config.initial_schema.clone(), storage);
     let library_handlers = pyo3_library_handlers(&module);
 
-    Kernel::builder()
+    let mut builder = Kernel::builder()
         .with_host_id(config.host_id.clone())
         .with_library_module(module, library_handlers)
         .with_service_handler(python_handler(service))
         .with_kernel_handler(python_handler(metrics.unwrap_or_else(stub_py_handler)))
-        .with_health_handler(python_health_handler())
-        .finish()
+        .with_health_handler(python_health_handler());
+
+    #[cfg(feature = "http-client")]
+    {
+        builder = builder.with_http_rpc_gateway();
+    }
+
+    builder.finish()
 }
 
 fn build_pyo3_library_module(
@@ -372,6 +379,7 @@ pub(crate) fn stub_py_handler() -> Py<PyAny> {
 pub struct KernelHandle {
     inner: Arc<PyKernel>,
     txn_manager: TxnManager,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl Clone for KernelHandle {
@@ -379,6 +387,7 @@ impl Clone for KernelHandle {
         Self {
             inner: Arc::clone(&self.inner),
             txn_manager: self.txn_manager.clone(),
+            runtime: Arc::clone(&self.runtime),
         }
     }
 }
@@ -386,10 +395,22 @@ impl Clone for KernelHandle {
 impl KernelHandle {
     fn from_kernel(kernel: PyKernel) -> Self {
         let txn_manager = kernel.txn_manager().clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
         Self {
             inner: Arc::new(kernel),
             txn_manager,
+            runtime: Arc::new(runtime),
         }
+    }
+
+    fn block_on<F>(&self, fut: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        self.runtime.block_on(fut)
     }
 }
 
@@ -424,23 +445,129 @@ impl KernelHandle {
         Ok(Self::from_kernel(kernel))
     }
 
+    #[classmethod]
+    pub fn with_library_schema_and_dependency_route(
+        _cls: &Bound<'_, PyType>,
+        schema_json: &str,
+        dependency_root: &str,
+        authority: &str,
+    ) -> PyResult<Self> {
+        let schema = decode_schema_from_json(schema_json)?;
+        let module = build_pyo3_library_module(schema, None);
+        let handlers = pyo3_library_handlers(&module);
+        let kernel = Kernel::builder()
+            .with_host_id("tc-py-kernel")
+            .with_library_module(module, handlers)
+            .with_dependency_route(dependency_root, authority)
+            .with_http_rpc_gateway()
+            .finish();
+        Ok(Self::from_kernel(kernel))
+    }
+
+    #[pyo3(signature = (path, bearer_token=None))]
+    pub fn resolve_get(
+        &self,
+        path: &str,
+        bearer_token: Option<String>,
+    ) -> PyResult<PyKernelResponse> {
+        use std::str::FromStr;
+
+        let Some(component_root) = crate::uri::component_root(path) else {
+            return Err(PyValueError::new_err("invalid target path"));
+        };
+
+        let token = match bearer_token.as_deref() {
+            Some(token) => Some(
+                self.block_on(self.inner.token_verifier().verify(token.to_string()))
+                    .map_err(|_| PyValueError::new_err("invalid bearer token"))?,
+            ),
+            None => None,
+        };
+
+        let txn_id = match token.as_ref() {
+            Some(token) => self
+                .txn_manager
+                .begin_with_owner(Some(&token.owner_id), Some(&token.bearer_token))
+                .id(),
+            None => self.txn_manager.begin().id(),
+        };
+
+        let op = OpRef::Get((
+            Subject::Link(Link::from_str(path).map_err(|_| PyValueError::new_err("invalid path"))?),
+            Scalar::default(),
+        ));
+
+        let resolved = self.block_on(self.inner.resolve_op(txn_id, bearer_token.clone(), op))
+            .map_err(|err| PyValueError::new_err(err.message().to_string()));
+
+        let rollback_op = OpRef::Delete((
+            Subject::Link(
+                Link::from_str(component_root)
+                    .map_err(|_| PyValueError::new_err("invalid component root"))?,
+            ),
+            Scalar::default(),
+        ));
+
+        let _ = self.block_on(self.inner.resolve_op(txn_id, bearer_token, rollback_op));
+        let _ = self.txn_manager.rollback(txn_id);
+
+        let response = resolved?;
+        Python::with_gil(|py| {
+            let body = if response.body.is_empty() {
+                None
+            } else {
+                Some(PyStateHandle::new(
+                    PyBytes::new_bound(py, &response.body).into_py(py),
+                ))
+            };
+
+            Ok(PyKernelResponse::new(
+                response.status,
+                Some(response.headers),
+                body,
+            ))
+        })
+    }
+
     pub fn dispatch(&self, request: PyKernelRequest) -> PyResult<PyKernelResponse> {
         let method = request.method_enum();
         let raw_path = request.path_owned();
         let (route_path, txn_id) = parse_path_and_txn_id(&raw_path)?;
         let body_is_none = py_body_is_none(request.body());
+        let bearer = py_bearer_token(&request);
+        let token = match bearer {
+            Some(token) => Some(
+                self.block_on(self.inner.token_verifier().verify(token))
+                    .map_err(|_| PyValueError::new_err("invalid bearer token"))?,
+            ),
+            None => None,
+        };
+        let inbound_txn_id = txn_id;
+        let mut minted_txn_id: Option<TxnId> = None;
 
         match self.inner.route_request(
             method,
             &route_path,
             request,
-            txn_id,
+            inbound_txn_id,
             body_is_none,
+            token.as_ref(),
             |handle, req| {
+                minted_txn_id = Some(handle.id());
                 req.bind_txn_handle(handle.clone());
             },
         ) {
-            Ok(KernelDispatch::Response(resp)) => executor::block_on(resp),
+            Ok(KernelDispatch::Response(resp)) => {
+                let mut response = self.block_on(resp)?;
+                if inbound_txn_id.is_none()
+                    && let Some(txn_id) = minted_txn_id
+                {
+                    response
+                        .headers
+                        .push(("x-tc-txn-id".to_string(), txn_id.to_string()));
+                }
+                Ok(response)
+            }
             Ok(KernelDispatch::Finalize { commit: _, result }) => {
                 let status = if result.is_ok() { 204 } else { 400 };
                 Ok(PyKernelResponse::new(status, None, None))
@@ -449,6 +576,9 @@ impl KernelHandle {
                 "no handler for method {method} path {route_path}"
             ))),
             Err(TxnError::NotFound) => Err(PyValueError::new_err("unknown transaction id")),
+            Err(TxnError::Unauthorized) => {
+                Err(PyValueError::new_err("unauthorized transaction owner"))
+            }
         }
     }
 }
@@ -509,6 +639,306 @@ fn parse_method(method: &str) -> PyResult<Method> {
         other => Err(PyValueError::new_err(format!(
             "unsupported method: {other}"
         ))),
+    }
+}
+
+fn py_bearer_token(request: &PyKernelRequest) -> Option<String> {
+    request.headers.iter().find_map(|(key, value)| {
+        if !key.eq_ignore_ascii_case("authorization") {
+            return None;
+        }
+
+        let (scheme, token) = value.split_once(' ')?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return None;
+        }
+
+        let token = token.trim();
+        if token.is_empty() {
+            None
+        } else {
+            Some(token.to_string())
+        }
+    })
+}
+
+#[cfg(all(test, feature = "pyo3", feature = "http-server", feature = "wasm"))]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+    use futures::FutureExt;
+    use hyper::{Body, Request, Response, StatusCode, body::to_bytes};
+    use pathlink::Link;
+    use std::{net::TcpListener, str::FromStr};
+    use tower::Service;
+    use url::form_urlencoded;
+
+    #[derive(Clone)]
+    struct KernelService {
+        kernel: crate::HttpKernel,
+    }
+
+    impl KernelService {
+        fn new(kernel: crate::HttpKernel) -> Self {
+            Self { kernel }
+        }
+    }
+
+    impl Service<Request<Body>> for KernelService {
+        type Response = Response<Body>;
+        type Error = hyper::Error;
+        type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<Body>) -> Self::Future {
+            let uri = req.uri().clone();
+            let method = req.method().clone();
+            let path = uri.path().to_owned();
+            let kernel = self.kernel.clone();
+
+            Box::pin(async move {
+                let method = match method {
+                    hyper::Method::GET => crate::Method::Get,
+                    hyper::Method::PUT => crate::Method::Put,
+                    hyper::Method::POST => crate::Method::Post,
+                    hyper::Method::DELETE => crate::Method::Delete,
+                    _ => {
+                        return Ok(Response::builder()
+                            .status(StatusCode::METHOD_NOT_ALLOWED)
+                            .body(Body::empty())
+                            .expect("method not allowed"));
+                    }
+                };
+
+                let (req, body_is_none) = match parse_body(req).await {
+                    Ok(pair) => pair,
+                    Err(resp) => return Ok(resp),
+                };
+
+                let txn_id = match parse_txn_id(&req) {
+                    Ok(id) => id,
+                    Err(()) => {
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from("invalid transaction id"))
+                            .expect("bad request"));
+                    }
+                };
+
+                match kernel.route_request(
+                    method,
+                    &path,
+                    req,
+                    txn_id,
+                    body_is_none,
+                    None,
+                    |handle, req| {
+                        req.extensions_mut().insert(handle.clone());
+                    },
+                ) {
+                    Ok(crate::KernelDispatch::Response(resp)) => Ok(resp.await),
+                    Ok(crate::KernelDispatch::Finalize { commit: _, result }) => {
+                        let status = if result.is_ok() {
+                            StatusCode::NO_CONTENT
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        };
+                        Ok(Response::builder()
+                            .status(status)
+                            .body(Body::empty())
+                            .expect("finalize response"))
+                    }
+                    Ok(crate::KernelDispatch::NotFound) => Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Body::empty())
+                        .expect("not found")),
+                    Err(crate::txn::TxnError::NotFound) => Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from("unknown transaction id"))
+                        .expect("bad request")),
+                    Err(crate::txn::TxnError::Unauthorized) => Ok(Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(Body::empty())
+                        .expect("unauthorized")),
+                }
+            })
+        }
+    }
+
+    async fn parse_body(req: Request<Body>) -> Result<(Request<Body>, bool), Response<Body>> {
+        let (parts, body) = req.into_parts();
+        let body_bytes = to_bytes(body).await.map_err(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("failed to read request body"))
+                .expect("internal error")
+        })?;
+        let body_is_none = body_bytes.iter().all(|b| b.is_ascii_whitespace());
+        Ok((
+            Request::from_parts(parts, Body::from(body_bytes)),
+            body_is_none,
+        ))
+    }
+
+    fn parse_txn_id(req: &Request<Body>) -> Result<Option<tc_ir::TxnId>, ()> {
+        let query = req.uri().query().unwrap_or("");
+        let txn_id_param = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .find(|(k, _)| k.eq_ignore_ascii_case("txn_id"))
+            .map(|(_, v)| v);
+
+        match txn_id_param {
+            Some(raw) => raw.parse::<tc_ir::TxnId>().map(Some).map_err(|_| ()),
+            None => Ok(None),
+        }
+    }
+
+    fn ok_py_response() -> PyResult<PyKernelResponse> {
+        Ok(PyKernelResponse::new(200, None, None))
+    }
+
+    fn ok_py_handler() -> impl KernelHandler<PyKernelRequest, PyResult<PyKernelResponse>> {
+        |_req: PyKernelRequest| async move { ok_py_response() }.boxed()
+    }
+
+    fn wasm_module() -> Vec<u8> {
+        crate::test_utils::wasm_hello_world_module()
+    }
+
+    #[tokio::test]
+    async fn pyo3_kernel_resolves_remote_opref_over_http() {
+        use tc_ir::OpRef;
+
+        let bytes = wasm_module();
+        let initial =
+            tc_ir::LibrarySchema::new(Link::from_str("/lib/initial").unwrap(), "0.0.1", vec![]);
+        let module = crate::library::http::build_http_library_module(initial, None);
+        let handlers = crate::library::http::http_library_handlers(&module);
+
+        let remote_kernel: crate::HttpKernel = crate::Kernel::builder()
+            .with_host_id("tc-remote-test")
+            .with_library_module(module, handlers)
+            .with_service_handler(|_req| async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from("service"))
+                    .expect("service response")
+            })
+            .with_kernel_handler(|_req| async move { Response::new(Body::empty()) })
+            .with_health_handler(|_req| async move { Response::new(Body::empty()) })
+            .finish();
+
+        let install_payload = serde_json::json!({
+            "schema": {
+                "id": "/lib/example",
+                "version": "0.1.0",
+                "dependencies": []
+            },
+            "artifacts": [{
+                "path": "/lib/wasm",
+                "content_type": "application/wasm",
+                "bytes": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }]
+        });
+
+        let install_request = Request::builder()
+            .method("PUT")
+            .uri("/lib")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(install_payload.to_string()))
+            .expect("install request");
+
+        let install_response = remote_kernel
+            .dispatch(crate::Method::Put, "/lib", install_request)
+            .expect("install handler")
+            .await;
+        assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let server_kernel = remote_kernel.clone();
+        let server = hyper::Server::from_tcp(listener)
+            .expect("hyper server")
+            .serve(tower::make::Shared::new(KernelService::new(server_kernel)));
+
+        let server_task = tokio::spawn(async move { server.await.expect("server") });
+
+        let local_schema = tc_ir::LibrarySchema::new(
+            Link::from_str("/lib/local").unwrap(),
+            "0.1.0",
+            vec![Link::from_str("/lib").unwrap()],
+        );
+        let local_module = build_pyo3_library_module(local_schema, None);
+        let local_handlers = pyo3_library_handlers(&local_module);
+
+        let local_kernel: PyKernel = crate::Kernel::builder()
+            .with_host_id("tc-py-local")
+            .with_library_module(local_module, local_handlers)
+            .with_dependency_route("/lib", addr.to_string())
+            .with_http_rpc_gateway()
+            .with_service_handler(ok_py_handler())
+            .with_kernel_handler(ok_py_handler())
+            .with_health_handler(ok_py_handler())
+            .finish();
+
+        let txn_id = remote_kernel.txn_manager().begin().id();
+        let op = OpRef::Get((
+            tc_ir::Subject::Link(Link::from_str("/lib/hello").unwrap()),
+            tc_ir::Scalar::default(),
+        ));
+
+        let response = local_kernel
+            .resolve_op(txn_id, None, op)
+            .await
+            .expect("resolve response");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"\"hello\"");
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn pyo3_kernel_rejects_unauthorized_egress() {
+        use tc_ir::OpRef;
+
+        let local_schema = tc_ir::LibrarySchema::new(
+            Link::from_str("/lib/local").unwrap(),
+            "0.1.0",
+            vec![Link::from_str("/lib").unwrap()],
+        );
+        let local_module = build_pyo3_library_module(local_schema, None);
+        let local_handlers = pyo3_library_handlers(&local_module);
+
+        let local_kernel: PyKernel = crate::Kernel::builder()
+            .with_host_id("tc-py-local")
+            .with_library_module(local_module, local_handlers)
+            .with_dependency_route("/lib", "127.0.0.1:1")
+            .with_http_rpc_gateway()
+            .with_service_handler(ok_py_handler())
+            .with_kernel_handler(ok_py_handler())
+            .with_health_handler(ok_py_handler())
+            .finish();
+
+        let txn_id = local_kernel.txn_manager().begin().id();
+        let op = OpRef::Get((
+            tc_ir::Subject::Link(Link::from_str("/service").unwrap()),
+            tc_ir::Scalar::default(),
+        ));
+
+        let err = local_kernel
+            .resolve_op(txn_id, None, op)
+            .await
+            .expect_err("unauthorized");
+
+        assert_eq!(err.code(), tc_error::ErrorKind::Unauthorized);
     }
 }
 

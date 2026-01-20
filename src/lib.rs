@@ -1,10 +1,19 @@
+pub mod auth;
+pub mod egress;
+pub mod gateway;
 pub mod kernel;
+pub mod resolve;
+pub mod txn_server;
+pub mod uri;
 
 pub use kernel::{Kernel, KernelBuilder, KernelDispatch, KernelHandler, Method};
 pub use tc_ir::{
     Dir, HandleDelete, HandleGet, HandlePost, HandlePut, Handler, Route, Transaction,
     parse_route_path,
 };
+
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 pub mod library;
 pub use library::NativeLibrary;
@@ -13,6 +22,7 @@ pub mod storage;
 
 pub mod txn;
 pub use txn::{TxnHandle, TxnManager};
+pub use txn_server::TxnServer;
 
 pub use tc_state::State;
 pub use tc_value::Value;
@@ -22,6 +32,9 @@ pub mod wasm;
 
 #[cfg(feature = "http-server")]
 pub mod http;
+
+#[cfg(feature = "http-client")]
+pub(crate) mod http_client;
 
 #[cfg(feature = "http-server")]
 pub use http::{

@@ -46,18 +46,20 @@ struct Inner {
 #[derive(Clone)]
 struct TxnRecord {
     claim: Claim,
+    owner_id: Option<String>,
+    bearer_token: Option<String>,
+    claims: Vec<Claim>,
 }
 
 #[derive(Debug)]
 pub enum TxnError {
     NotFound,
+    Unauthorized,
 }
 
 pub enum TxnFlow {
     Begin(TxnHandle),
-    Use(Option<TxnHandle>),
-    Commit(TxnHandle),
-    Rollback(TxnHandle),
+    Use(TxnHandle),
 }
 
 impl Default for TxnManager {
@@ -82,6 +84,14 @@ impl TxnManager {
     }
 
     pub fn begin(&self) -> TxnHandle {
+        self.begin_with_owner(None, None)
+    }
+
+    pub fn begin_with_owner(
+        &self,
+        owner_id: Option<&str>,
+        bearer_token: Option<&str>,
+    ) -> TxnHandle {
         let mut inner = self.inner.lock();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -94,19 +104,40 @@ impl TxnManager {
         let trace = compute_trace(&self.host_id, ts, nonce);
         let id = TxnId::from_parts(ts, nonce).with_trace(trace);
         let claim = default_claim();
+        let owner_id = owner_id.map(str::to_string);
+        let bearer_token = bearer_token.map(str::to_string);
         inner.txns.insert(
             id,
             TxnRecord {
                 claim: claim.clone(),
+                owner_id,
+                bearer_token,
+                claims: Vec::new(),
             },
         );
         TxnHandle { id, claim }
     }
 
     pub fn get(&self, id: &TxnId) -> Option<TxnHandle> {
+        self.get_with_owner(id, None).ok()
+    }
+
+    pub fn get_with_owner(
+        &self,
+        id: &TxnId,
+        owner_id: Option<&str>,
+    ) -> Result<TxnHandle, TxnError> {
         let canonical = self.ensure_trace(*id);
         let inner = self.inner.lock();
-        inner.txns.get(&canonical).cloned().map(|record| TxnHandle {
+        let record = inner
+            .txns
+            .get(&canonical)
+            .cloned()
+            .ok_or(TxnError::NotFound)?;
+        if !owners_match(record.owner_id.as_deref(), owner_id) {
+            return Err(TxnError::Unauthorized);
+        }
+        Ok(TxnHandle {
             id: canonical,
             claim: record.claim,
         })
@@ -132,23 +163,49 @@ impl TxnManager {
 
     pub fn interpret_request(
         &self,
-        method: Method,
         txn_id: Option<TxnId>,
-        body_is_none: bool,
+        owner_id: Option<&str>,
+        bearer_token: Option<&str>,
     ) -> Result<TxnFlow, TxnError> {
         match txn_id {
-            None => Ok(TxnFlow::Begin(self.begin())),
-            Some(id) => {
-                let handle = self.get(&id).ok_or(TxnError::NotFound)?;
-                if method == Method::Post && body_is_none {
-                    Ok(TxnFlow::Commit(handle))
-                } else if method == Method::Delete && body_is_none {
-                    Ok(TxnFlow::Rollback(handle))
-                } else {
-                    Ok(TxnFlow::Use(Some(handle)))
+            None => Ok(TxnFlow::Begin(
+                self.begin_with_owner(owner_id, bearer_token),
+            )),
+            Some(id) => match self.get_with_owner(&id, owner_id) {
+                Ok(handle) => Ok(TxnFlow::Use(handle)),
+                Err(TxnError::NotFound) => {
+                    let Some(owner_id) = owner_id else {
+                        return Err(TxnError::NotFound);
+                    };
+
+                    Ok(TxnFlow::Begin(self.begin_with_id(
+                        id,
+                        Some(owner_id),
+                        bearer_token,
+                    )))
                 }
-            }
+                Err(err) => Err(err),
+            },
         }
+    }
+
+    pub fn bearer_token(&self, id: &TxnId) -> Option<String> {
+        let canonical = self.ensure_trace(*id);
+        self.inner
+            .lock()
+            .txns
+            .get(&canonical)
+            .and_then(|record| record.bearer_token.clone())
+    }
+
+    pub fn record_claim(&self, id: &TxnId, claim: Claim) -> Result<(), TxnError> {
+        let canonical = self.ensure_trace(*id);
+        let mut inner = self.inner.lock();
+        let record = inner.txns.get_mut(&canonical).ok_or(TxnError::NotFound)?;
+        if !record.claims.contains(&claim) {
+            record.claims.push(claim);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -164,8 +221,38 @@ impl TxnManager {
             TxnId::from_parts(id.timestamp(), id.nonce()).with_trace(trace)
         }
     }
+
+    fn begin_with_id(
+        &self,
+        id: TxnId,
+        owner_id: Option<&str>,
+        bearer_token: Option<&str>,
+    ) -> TxnHandle {
+        let canonical = self.ensure_trace(id);
+        let claim = default_claim();
+        self.inner.lock().txns.insert(
+            canonical,
+            TxnRecord {
+                claim: claim.clone(),
+                owner_id: owner_id.map(str::to_string),
+                bearer_token: bearer_token.map(str::to_string),
+                claims: Vec::new(),
+            },
+        );
+        TxnHandle {
+            id: canonical,
+            claim,
+        }
+    }
 }
-use crate::Method;
+
+fn owners_match(existing: Option<&str>, request: Option<&str>) -> bool {
+    match (existing, request) {
+        (None, None) => true,
+        (Some(existing), Some(request)) => existing == request,
+        _ => false,
+    }
+}
 
 fn default_claim() -> Claim {
     Claim::new(

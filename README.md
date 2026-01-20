@@ -37,6 +37,22 @@ cargo test -p tc-server --all-features
 When developing the PyO3 adapter, also run `client/py/tests` via the repo’s
 virtualenv to keep the shared transaction flow in sync.
 
+## Examples
+
+```bash
+# Start an HTTP host with a WASM "Hello" library installed (prints "<addr> <lib-id>")
+cargo run --manifest-path tc-server/Cargo.toml --example http_rpc_host
+
+# Start an in-process HTTP host, install the WASM library, then resolve an outbound RPC via OpRef::Get
+cargo run --manifest-path tc-server/Cargo.toml --example http_rpc_opref_get
+
+# Run a local in-process PyO3 kernel which resolves an OpRef over HTTP (requires the tinychain PyO3 module)
+python tc-server/examples/pyo3_http_rpc_demo.py --authority <host:port>
+```
+
+To build the `tinychain` PyO3 module and run the Python integration tests, follow
+`client/py/README.md` (entrypoint: `scripts/install_tc_server_python.sh`).
+
 ## HTTP quickstart
 
 Use the curated builders so every adapter shares the same kernel wiring:

@@ -4,7 +4,7 @@ This note explains how to stand up a TinyChain-compatible server (or custom adap
 
 ## Compatibility targets
 
-- **HTTP semantics:** Match the v1 API shapes documented at docs.tinychain.net (`txn_id` query parameter, `/state/...` paths, `/lib` installer shape, empty-body commit/rollback). The v1 GitBook remains the authoritative description of these verbs and resource layouts.
+- **HTTP semantics:** Match the v1 API shapes documented at docs.tinychain.net (`txn_id` query parameter, `/state/...` paths, `/lib` installer shape, root-only empty-body commit/rollback). The v1 GitBook remains the authoritative description of these verbs and resource layouts.
 - **IR contract:** Route inbound requests into `tc-ir` handlers so the same capability manifests and IR types are exercised regardless of transport.
 - **Transaction + auth surface:** Preserve the `txn_id` lifecycle and capability masks; adapters only translate protocol details and defer begin/commit/rollback to the shared kernel (`Kernel::route_request`).
 
@@ -19,6 +19,8 @@ helpers). The host remains the sole owner of both routing decisions and authoriz
 - **Explicit, non-transitive dependencies.** A library/service `A` may call `B` iff `B` appears in
   `A`’s manifest-declared dependency set (library-wide). If `A → B` and `B → C`, that does not
   imply `A → C`.
+- **Default-deny egress.** Outbound RPC is rejected unless the target component is a declared
+  dependency and the host has an explicit route/authority allowlist entry for it.
 - **Authorize by canonical path, not network location.** Authorization is determined using the
   canonical resource path; whether `B` is served locally or remotely must not change the result.
 - **Path-only vs absolute URIs.** Routing is derived from the URI shape:
@@ -40,8 +42,39 @@ touches additional components.
 **Rules:**
 
 - **Finalize semantics.** Commit is an empty `POST` to the canonical service or library root
-  derived from the manifest; rollback is an empty `DELETE` to the same root. The kernel
-  interprets these empty-body finalize requests uniformly across adapters.
+  derived from the manifest; rollback is an empty `DELETE` to the same root. Empty-body
+  `POST`/`DELETE` requests to subpaths must not finalize. The kernel interprets finalize
+  requests uniformly across adapters.
+- **Begin response includes the minted txn ID.** When a request omits `?txn_id=...`, the kernel
+  begins a transaction and adapters return the minted ID in the `x-tc-txn-id` response header so
+  callers can continue/finalize without minting their own IDs.
+- **Transaction ownership is pinned.** For any active `txn_id`, the kernel rejects requests whose
+  `Authorization: Bearer ...` token does not resolve to the same owner identity which began the
+  transaction. Additionally, the kernel only accepts a previously-unseen `?txn_id=...` when a
+  bearer token is present (so it can pin ownership before executing any handler). Adapters only
+  forward the opaque bearer token; token signature verification and claim chaining are still
+  pending.
+- **Reserved transaction claim (v1-compatible).** When the bearer token carries structured claims,
+  the kernel derives the transaction owner from the claim whose `link` is `/txn/<txn_id>` and whose
+  mask includes `umask::USER_EXEC`. If the token also includes a `/txn/<txn_id>` claim with
+  `umask::USER_WRITE` (a “lock” claim), it must match the same `(host, actor)` identity as the
+  owner claim.
+- **Kernel-owned HTTP egress.** When routing a request to a remote host, the kernel constructs
+  outbound HTTP requests via its shared gateway so `?txn_id=...` and `Authorization: Bearer ...`
+  propagation is implemented once (not duplicated in adapters).
+- **Kernel-owned token verification/chaining hooks.** Adapters treat the bearer token as opaque and
+  forward it into the kernel. The kernel resolves a stable owner identity via its configured
+  `TokenVerifier` and uses the same hook to extend/chains tokens for outbound RPC as a transaction
+  touches additional components. The default verifier is currently opaque; signature verification
+  and claim-chain encoding are still pending. The `rjwt-token` feature enables an RJWT-backed
+  verifier (same bearer token format as v1) once the host can resolve actor keys:
+  - in-process via an in-memory keyring resolver (`KeyringActorResolver`);
+  - over HTTP (with `http-client`) via `RpcActorResolver`, which fetches actor public keys from the
+    issuer host using `GET /host/public_key?key=<actor-id>` (response body is a JSON string
+    containing base64-encoded Ed25519 public key bytes).
+- **Op references (partial).** The workspace includes a v1-shaped `tc_ir::OpRef` plus a minimal
+  executor (`tc_server::resolve`) which can run `TCRef::Op` via the kernel RPC gateway. Encoding
+  `OpRef` parameters into the on-the-wire scalar format is still in progress.
 - **Token chaining.** When the kernel routes a call into a library/service, it signs (or extends)
   the transaction token with the minimal claim required for that component and mode. As the
   transaction touches more components, the token accumulates one claim per participating
@@ -49,6 +82,9 @@ touches additional components.
 - **Remote calls preserve txn context.** Outbound requests include the existing `txn_id` and the
   current chained token, so the remote host participates in the same transaction context rather
   than starting a new one.
+- **Host endpoints are non-transactional.** `/host/...` and `/healthz` routes do not begin,
+  continue, or finalize transactions. They may receive a `txn_id` query parameter (because the
+  kernel always propagates it for RPC), but the host handler ignores it.
 
 ## Cluster replication, correctness, and restart convergence
 
@@ -138,7 +174,7 @@ must match the URI segments exactly so HTTP, PyO3, and future adapters stay alig
 ## Fastest paths to a bespoke server
 
 1. **Reuse the kernel, swap the transport.** Instantiate the reference kernel via `tc_server::http::build_http_kernel_with_config` (or the config-free builder) and mount it behind your own HTTP/gRPC/serverless adapter. Your adapter should:
-   - Parse the same transaction cues as the v1 HTTP protocol (`?txn_id=...`, empty POST/DELETE for finalize) and attach them to the request extensions.
+   - Parse the same transaction cues as the v1 HTTP protocol (`?txn_id=...`, and root-only empty POST/DELETE for finalize) and attach them to the request extensions.
    - Translate HTTP-style verbs/paths into the `Route` + `State` types expected by `Kernel::route_request`.
    - Map `TCError` categories back to protocol status codes consistent with docs.tinychain.net.
 2. **Use `tc-server` as a minimal kernel crate.** When you want the TinyChain router primitives without the built-in HTTP/PyO3/WASM adapters, depend on `tc-server` with `default-features = false`. This exposes `Dir`, `Route`, `Handler`, `Transaction`, `Kernel`, and the `TxnManager`/`TxnHandle` pair while skipping optional transports. Re-enable adapters explicitly via `features = ["http-server"]`, `features = ["pyo3"]`, or `features = ["wasm"]` as needed for your embedding.

@@ -353,7 +353,9 @@ fn decode_install_payload(bytes: &[u8]) -> Result<InstallPayloadRaw, InstallErro
             let dependencies = raw
                 .dependencies
                 .into_iter()
-                .map(|dep| Link::from_str(&dep).map_err(|err| format!("invalid dependency link: {err}")))
+                .map(|dep| {
+                    Link::from_str(&dep).map_err(|err| format!("invalid dependency link: {err}"))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(LibrarySchema::new(id, raw.version, dependencies))
         }

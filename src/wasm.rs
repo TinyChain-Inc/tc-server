@@ -21,9 +21,7 @@ use {
 
 #[cfg(feature = "pyo3")]
 use {
-    crate::pyo3_runtime::{
-        PyKernelRequest, PyKernelResponse, request_body_bytes,
-    },
+    crate::pyo3_runtime::{PyKernelRequest, PyKernelResponse, request_body_bytes},
     futures::lock::Mutex as AsyncMutex,
     pyo3::{exceptions::PyValueError, prelude::*},
 };
@@ -145,9 +143,7 @@ impl WasmLibrary {
         let func = instance
             .get_func(&mut *store, "tc_library_entry")
             .ok_or_else(|| TCError::internal("missing tc_library_entry export"))?;
-        let typed = func
-            .typed::<(), i64>(&mut *store)
-            .map_err(map_wasm_error)?;
+        let typed = func.typed::<(), i64>(&mut *store).map_err(map_wasm_error)?;
         let packed = typed.call(&mut *store, ()).map_err(map_wasm_error)?;
         let (ptr, len) = unpack_wasm_pair(packed);
         let bytes = read_memory(store, memory, ptr, len)?;
@@ -317,46 +313,7 @@ mod tests {
     use umask::Mode;
 
     pub(super) fn wasm_module() -> Vec<u8> {
-        let manifest = r#"{"schema":{"id":"/lib/example","version":"0.1.0","dependencies":[]},"routes":[{"path":"/hello","export":"hello"}]}"#;
-        let response = r#""hello""#;
-        let manifest_packed = ((manifest.len() as u64) << 32) | 8u64;
-        let response_packed = ((response.len() as u64) << 32) | 512u64;
-
-        let wat = format!(
-            r#"(module
-                (memory (export "memory") 1)
-                (global $heap (mut i32) (i32.const 1024))
-                (data (i32.const 8) "{manifest}")
-                (data (i32.const 512) "{response}")
-                (func (export "alloc") (param i32) (result i32)
-                    (local $addr i32)
-                    (local.set $addr (global.get $heap))
-                    (global.set $heap (i32.add (global.get $heap) (local.get 0)))
-                    (local.get $addr)
-                )
-                (func (export "free") (param i32) (param i32))
-                (func (export "tc_library_entry") (result i64)
-                    (i64.const {manifest_packed})
-                )
-                (func (export "hello") (param i32 i32 i32 i32) (result i64)
-                    (i64.const {response_packed})
-                )
-            )"#,
-            manifest = escape_wat_string(manifest),
-            response = escape_wat_string(response),
-            manifest_packed = manifest_packed,
-            response_packed = response_packed
-        );
-
-        wat::parse_str(wat).expect("valid wat")
-    }
-
-    fn escape_wat_string(input: &str) -> String {
-        input
-            .replace("\\", "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
+        crate::test_utils::wasm_hello_world_module()
     }
 
     #[test]

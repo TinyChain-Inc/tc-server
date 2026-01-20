@@ -24,6 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.21"
 sha2 = "0.10"
+rjwt = { version = "0.6", optional = true }
 
 [dependencies.destream_json]
 version = "0.13"
@@ -60,9 +61,12 @@ default = ["http-server", "wasm"]
 http-client = ["dep:http", "dep:hyper", "dep:tokio", "dep:destream_json"]
 # Inbound HTTP server support (Hyper server + tower make_service wiring).
 http-server = ["http-client", "dep:tower"]
-pyo3 = ["dep:pyo3", "dep:destream_json", "tc-ir/pyo3-conversions"]
+pyo3 = ["http-client", "dep:pyo3", "dep:destream_json", "tc-ir/pyo3-conversions"]
 wasm = ["dep:wasmtime"]
+rjwt-token = ["dep:rjwt", "pathlink/serialize", "tc-value/serialize"]
 
 [dev-dependencies]
 serde_json = "1"
 wat = "1"
+wasm-encoder = "0.206"
+tc-wasm = { path = "../tc-wasm" }

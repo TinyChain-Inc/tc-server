@@ -7,11 +7,17 @@ behavior of the upstream `host` crate.
 
 ## Current transaction flow (as implemented today)
 
-- **Begin:** Any HTTP or PyO3 request that omits `txn_id` triggers `TxnManager::begin`.
+- **Begin:** Any HTTP or PyO3 request to a transactional endpoint which omits `txn_id` triggers
+  `TxnManager::begin` (`/host/...` and `/healthz` are non-transactional).
   The handler executes immediately within that transaction and the server records the new ID.
-- **Continue:** Subsequent requests include `?txn_id=<id>` in the URI. The dispatcher
-  loads the pending transaction and stores the `TxnHandle` (plus parsed body state) in
-  the request extensions before invoking the kernel handler.
+  Adapters return the minted ID in the `x-tc-txn-id` response header so callers can continue or
+  finalize without minting their own transaction IDs.
+- **Continue:** Subsequent requests to transactional endpoints include `?txn_id=<id>` in the URI.
+  The dispatcher
+  loads the pending transaction, verifies the same `Authorization: Bearer ...` owner token (when
+  present), and stores the `TxnHandle` (plus parsed body state) in the request extensions before
+  invoking the kernel handler. A previously-unseen `?txn_id=...` is only accepted when a bearer
+  token is present, so the kernel can pin transaction ownership before executing any handler.
 - **Finalize:** Sending an *empty* `POST` to the **canonical component root** with
   `?txn_id=<id>` commits the transaction. Sending an empty `DELETE` to the same root rolls it
   back. “Component root” means the canonical library/service path derived from its manifest
@@ -74,6 +80,72 @@ ops atomic and deterministic.
   3. On handler success, defer commit until the client sends `Finalize`; on error, auto-roll
      back and surface the failure.
 
+### Transaction ownership + leadership claims (work needed)
+
+**Objective:** Make transaction ownership and per-component leadership enforceable so a host can:
+- reject any request for an active `txn_id` which is not authorized by the same owner identity, and
+- gate commit/rollback (overall and per component) on explicit, verifiable claims.
+
+This is required for cross-host transactions, and it is also required for safe on-disk workspace
+GC: a host must know who “owns” an active transaction before it can accept new work for it.
+
+**Scope note:** The current v2 `TxnManager` is a host-local handle registry. The work below adds
+the missing signed-token and claim validation layer. This must stay kernel-owned; adapters may
+only forward `txn_id`, request metadata, and an opaque bearer token.
+
+**Current scaffolding:** This repo now has kernel-owned hooks for token verification and chaining:
+
+- `tc-server/src/auth.rs` (`TokenVerifier` + default opaque verifier) is the single entrypoint for
+  mapping a bearer token to a stable owner identity, and (later) for extending tokens with
+  per-component claims.
+- `tc-server/src/kernel.rs` (`KernelBuilder::with_token_verifier`) allows swapping in a real JWT
+  verifier/resolver without pushing transaction semantics into adapters.
+- `tc-server` has an optional `rjwt-token` feature which wires in an RJWT-compatible verifier (same
+  bearer token format as v1) once the host can resolve actor keys.
+
+**Work items**
+
+1. **Define a signed transaction token type and verifier.**
+   - Add a v2 equivalent of v1’s `SignedToken` plus a verifier which can validate signatures using
+     a kernel-supplied resolver (e.g., resolve a public key for an actor/host from a registry).
+   - Ensure all adapters call into a single kernel verification entrypoint (no duplicated logic in
+     HTTP, PyO3, or WASM bindings).
+
+2. **Specify the ownership claim shape and invariants.**
+   - Define a reserved, deterministic claim path which binds an “owner” identity to a `txn_id`.
+   - Invariants to enforce (at minimum):
+     - exactly one owner claim for a given `txn_id`,
+     - the owner claim cannot change once the txn is active,
+     - any required “lock”/finalize authority must be consistent with (and derived from) the owner.
+
+3. **Specify leadership claims keyed by component root.**
+   - Define a “leader” (per-component) claim keyed by the canonical component root derived from
+     manifests / `tc.uri` builders (not by route subpaths).
+   - This allows a single transaction to have one global owner plus multiple per-component leaders.
+
+4. **Enforce owner identity on every request with `txn_id`.**
+   - Extend the transaction registry to store the pinned owner identity for each active txn
+     (`txn_id → owner key + expiry`).
+   - On each request which supplies `txn_id`, verify the bearer token and reject the request if:
+     - the token is invalid,
+     - its structural invariants are invalid (reserved-path misuse, multiple owners, etc.), or
+     - the derived owner identity does not match the pinned owner for the active txn.
+
+5. **Make finalize authorization explicit (root-only + claim-gated).**
+   - Keep finalize detection root-only (already implemented).
+   - Require explicit authorization for:
+     - overall commit/rollback (owner-gated), and
+     - per-component commit/rollback (leader-gated).
+   - Ensure an empty-body request to a non-root path is treated as an ordinary request and cannot
+     bypass authorization checks.
+
+6. **Add TTL + deterministic GC with rollback-on-expiry.**
+   - Track active transactions by expiry time.
+   - When a txn expires, force rollback and delete its workspace state (idempotently).
+   - Keep GC host-local and default-deny; it must not depend on any global registry.
+   - v2 status: a minimal in-memory TTL tracker exists (`tc-server/src/txn_server.rs`); txfs
+     workspace cleanup is deferred until txfs is integrated.
+
 ### HTTP verb coverage (`GET`/`PUT`/`POST`/`DELETE`)
 
 **Objective:** The kernel must be able to route all four standard verbs into library/service
@@ -88,6 +160,9 @@ Plan:
    - `/service`: route `/service/...` subpaths to the service handler for all four verbs.
 2. **Mirror the v1 `Gateway` boundary.** Model the v2 “request executor” interface as
    `get/put/post/delete` so that local dispatch and remote HTTP proxying share one verb surface.
+   - v2 status: a minimal op executor exists (`tc-server/src/resolve.rs`) which can execute
+     `tc_ir::TCRef::Op` via the kernel’s configured RPC gateway and egress gate (`Kernel::resolve_op`).
+     Payload encoding for `OpRef` parameters is still pending while the scalar/container IR surface is stabilized.
 3. **Add minimal routing tests.** Add HTTP tests which verify that a library route can receive
    a non-`GET` request (e.g., `POST /lib/<...>/<route>`), and that a service route under
    `/service/...` is reachable with all four verbs (even if the handler returns
@@ -98,24 +173,13 @@ Plan:
 **Objective:** Avoid accidental commit/rollback triggered by empty `POST`/`DELETE` requests to
 non-root paths.
 
-Plan:
+Implemented:
 
-1. **Move finalize detection into `Kernel::route_request`.** `TxnManager` should only validate
-   `txn_id` existence and return a `TxnHandle`; the kernel decides whether a request is a normal
-   op or a finalize op based on `(method, body_is_none, path)`.
-2. **Define “component root” parsing.** Add a single helper which maps an inbound path to its
-   canonical component root and remainder (if any):
-   - `/lib` is a component root for `/lib` installs.
-   - `/lib/<publisher>/<name>/<version>` is a component root for a library install.
-   - `/service/<publisher>/<namespace>/<name>/<version>` is a component root for a service.
-   This helper must be transport-agnostic and reused by HTTP and PyO3 routing.
-3. **Enforce root-only finalize.** Only treat `(POST|DELETE, empty body, txn_id present)` as
-   finalize when `path == component_root`. For all other paths, dispatch normally.
-4. **Add regression tests.**
-   - Start a txn by staging an install (e.g., `PUT /lib`).
-   - Issue an empty `POST` to a non-root path (e.g., `/lib/hello?txn_id=...`) and assert the
-     txn is still pending.
-   - Issue an empty `POST` to the correct root (`/lib?txn_id=...`) and assert commit succeeds.
+- `Kernel::route_request` (not `TxnManager`) owns finalize detection.
+- “Component root” parsing is transport-agnostic and recognizes `/lib`,
+  `/lib/<publisher>/<name>/<version>`, and `/service/<publisher>/<namespace>/<name>/<version>`.
+- Root-only finalize is enforced: empty-body `POST`/`DELETE` to subpaths is dispatched normally.
+- Regression coverage lives in the HTTP adapter tests (`tc-server/src/http.rs`).
 
 Implementation import notes (v1 reference points, repo-relative):
 
@@ -137,6 +201,7 @@ Implementation import notes (v1 reference points, repo-relative):
   - v1: `host/server/src/client.rs` (`ClientInner` loopback routing; `Client` egress policy hook)
 - **HTTP RPC implementation for `Gateway`.** Import the “txn_id + bearer token propagation” rule:
   - v1: `host/src/http/client.rs` (adds `txn_id` to the URI; forwards JWT; decodes responses)
+  - v2: `tc-server/src/http_client.rs` (`HttpRpcGateway` appends `?txn_id=...` and forwards `Authorization: Bearer ...`)
 - **Finalize protocol (commit/rollback).** Align finalize semantics with the shared kernel rule:
   - commit is an empty `POST` to the canonical component root derived from the manifest;
   - rollback is an empty `DELETE` to the same root;
