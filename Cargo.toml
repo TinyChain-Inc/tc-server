@@ -33,7 +33,7 @@ optional = true
 
 [dependencies.pyo3]
 version = "0.21"
-features = ["macros", "extension-module"]
+features = ["macros"]
 optional = true
 
 [dependencies.http]
@@ -62,6 +62,7 @@ http-client = ["dep:http", "dep:hyper", "dep:tokio", "dep:destream_json"]
 # Inbound HTTP server support (Hyper server + tower make_service wiring).
 http-server = ["http-client", "dep:tower"]
 pyo3 = ["http-client", "dep:pyo3", "dep:destream_json", "tc-ir/pyo3-conversions"]
+pyo3-extension = ["pyo3", "pyo3/extension-module"]
 wasm = ["dep:wasmtime"]
 rjwt-token = ["dep:rjwt", "pathlink/serialize", "tc-value/serialize"]
 
@@ -70,7 +71,3 @@ serde_json = "1"
 wat = "1"
 wasm-encoder = "0.206"
 tc-wasm = { path = "../tc-wasm" }
-
-[patch.crates-io]
-destream = { path = "../deps/destream" }
-destream_json = { path = "../deps/destream_json" }
