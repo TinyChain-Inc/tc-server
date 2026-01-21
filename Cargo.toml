@@ -70,3 +70,7 @@ serde_json = "1"
 wat = "1"
 wasm-encoder = "0.206"
 tc-wasm = { path = "../tc-wasm" }
+
+[patch.crates-io]
+destream = { path = "../deps/destream" }
+destream_json = { path = "../deps/destream_json" }
