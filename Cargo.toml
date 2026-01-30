@@ -11,7 +11,7 @@ bytes = "1"
 futures = "0.3"
 pathlink = "0.4"
 tc-ir = { path = "../tc-ir" }
-tc-error = { path = "../tc-error" }
+tc-error = "0.13"
 tc-value = { path = "../tc-value" }
 tc-state = { path = "../tc-state" }
 umask = "2.1"
