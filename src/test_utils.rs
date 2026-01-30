@@ -4,9 +4,9 @@ use std::sync::OnceLock;
 use pathlink::Link;
 use tc_ir::{Claim, Dir, Library, LibrarySchema, Transaction, TxnId};
 use wasm_encoder::{
-    CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function,
-    FunctionSection, GlobalSection, GlobalType, Instruction, MemorySection, MemoryType, Module,
-    TypeSection, ValType,
+    CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function, FunctionSection,
+    GlobalSection, GlobalType, Instruction, MemorySection, MemoryType, Module, TypeSection,
+    ValType,
 };
 
 pub(crate) fn wasm_hello_world_module() -> Vec<u8> {
@@ -31,18 +31,14 @@ fn build_wasm_hello_world_module() -> Vec<u8> {
     let routes = [tc_wasm::RouteExport::new("/hello", "hello")];
     let manifest = tc_wasm::manifest_bytes(&library, &routes);
 
-    let manifest_len: u32 = manifest
-        .len()
-        .try_into()
-        .expect("manifest fits in u32");
+    let manifest_len: u32 = manifest.len().try_into().expect("manifest fits in u32");
     let response_bytes = RESPONSE_JSON.as_bytes();
     let response_len: u32 = response_bytes
         .len()
         .try_into()
         .expect("response fits in u32");
 
-    let manifest_packed: i64 =
-        (((manifest_len as u64) << 32) | (MANIFEST_OFFSET as u64)) as i64;
+    let manifest_packed: i64 = (((manifest_len as u64) << 32) | (MANIFEST_OFFSET as u64)) as i64;
 
     let mut module = Module::new();
 
@@ -131,7 +127,10 @@ fn build_wasm_hello_world_module() -> Vec<u8> {
     hello.instruction(&Instruction::LocalGet(4));
     hello.instruction(&Instruction::I32Const(RESPONSE_OFFSET as i32));
     hello.instruction(&Instruction::I32Const(response_len as i32));
-    hello.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    hello.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
     hello.instruction(&Instruction::I32Const(response_len as i32));
     hello.instruction(&Instruction::I64ExtendI32U);
     hello.instruction(&Instruction::I64Const(32));
@@ -145,11 +144,7 @@ fn build_wasm_hello_world_module() -> Vec<u8> {
     module.section(&code);
 
     let mut data = DataSection::new();
-    data.active(
-        0,
-        &ConstExpr::i32_const(MANIFEST_OFFSET as i32),
-        manifest,
-    );
+    data.active(0, &ConstExpr::i32_const(MANIFEST_OFFSET as i32), manifest);
     data.active(
         0,
         &ConstExpr::i32_const(RESPONSE_OFFSET as i32),
@@ -168,7 +163,10 @@ struct FixtureTxn {
 impl Default for FixtureTxn {
     fn default() -> Self {
         Self {
-            claim: Claim::new(Link::from_str("/lib/example").expect("claim link"), umask::Mode::all()),
+            claim: Claim::new(
+                Link::from_str("/lib/example").expect("claim link"),
+                umask::Mode::all(),
+            ),
         }
     }
 }

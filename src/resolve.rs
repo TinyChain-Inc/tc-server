@@ -60,9 +60,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tc_ir::NetworkTime;
 
+    type GatewayCall = (Method, String, TxnId, Option<String>, Vec<u8>);
+
     #[derive(Clone, Default)]
     struct MockGateway {
-        calls: Arc<Mutex<Vec<(Method, String, TxnId, Option<String>, Vec<u8>)>>>,
+        calls: Arc<Mutex<Vec<GatewayCall>>>,
     }
 
     impl RpcGateway for MockGateway {

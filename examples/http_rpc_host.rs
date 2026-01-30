@@ -100,8 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let kernel = build_http_kernel_with_config(
         HttpKernelConfig::default().with_host_id("tc-http-rpc-host"),
-        ok_handler.clone(),
-        ok_handler.clone(),
+        ok_handler,
+        ok_handler,
         ok_handler,
     );
 

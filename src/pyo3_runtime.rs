@@ -20,9 +20,9 @@ use crate::{
         default_library_schema,
     },
     storage::LibraryDir,
-    txn::{TxnError, TxnHandle, TxnManager},
+    txn::{TxnError, TxnManager},
 };
-use tc_state::{Collection, StateContext, Tensor};
+use tc_state::{Collection, Tensor};
 use tc_value::Value;
 
 pub type PyKernel = Kernel<PyKernelRequest, PyResult<PyKernelResponse>>;
@@ -497,7 +497,8 @@ impl KernelHandle {
             Scalar::default(),
         ));
 
-        let resolved = self.block_on(self.inner.resolve_op(txn_id, bearer_token.clone(), op))
+        let resolved = self
+            .block_on(self.inner.resolve_op(txn_id, bearer_token.clone(), op))
             .map_err(|err| PyValueError::new_err(err.message().to_string()));
 
         let rollback_op = OpRef::Delete((
@@ -1127,33 +1128,6 @@ async fn encode_state_via_destream_async(state: State) -> Result<Vec<u8>, String
             Ok(acc)
         })
         .await
-}
-
-pub(crate) async fn decode_state_from_bytes_async(
-    bytes: Vec<u8>,
-    txn: TxnHandle,
-) -> Result<State, String> {
-    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(bytes))]);
-    destream_json::try_decode(StateContext::with_data(txn), stream)
-        .await
-        .map_err(|err| err.to_string())
-}
-
-pub(crate) fn py_state_handle_from_state(py: Python<'_>, state: State) -> PyResult<PyStateHandle> {
-    let py_state = initialize_py_state(py, state)?;
-    Ok(PyStateHandle::new(py_state))
-}
-
-fn initialize_py_state(py: Python<'_>, state: State) -> PyResult<Py<PyAny>> {
-    match state {
-        State::Collection(collection @ Collection::Tensor(_)) => {
-            let initializer = PyState::initializer_from_state(State::Collection(collection))
-                .add_subclass(PyCollection)
-                .add_subclass(PyTensor);
-            Py::new(py, initializer).map(|value| value.into_py(py))
-        }
-        other => Py::new(py, PyState::initializer_from_state(other)).map(|value| value.into_py(py)),
-    }
 }
 
 fn py_body_is_none(body: Option<PyStateHandle>) -> bool {

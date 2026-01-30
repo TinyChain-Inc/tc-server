@@ -79,11 +79,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let b_root = "/lib/example-devco/b/0.1.0";
     let b_hello = format!("{b_root}/hello");
 
-    let initial_schema = tc_ir::LibrarySchema::new(
-        pathlink::Link::from_str("/lib/initial")?,
-        "0.0.1",
-        vec![],
-    );
+    let initial_schema =
+        tc_ir::LibrarySchema::new(pathlink::Link::from_str("/lib/initial")?, "0.0.1", vec![]);
     let module = build_http_library_module(initial_schema, None);
     let handlers = http_library_handlers(&module);
 
@@ -166,4 +163,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server_task.abort();
     Ok(())
 }
-

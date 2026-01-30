@@ -188,7 +188,8 @@ mod rjwt_token {
             }
 
             let body = String::from_utf8(response.body).map_err(|_| TxnError::Unauthorized)?;
-            let encoded: String = serde_json::from_str(&body).map_err(|_| TxnError::Unauthorized)?;
+            let encoded: String =
+                serde_json::from_str(&body).map_err(|_| TxnError::Unauthorized)?;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|_| TxnError::Unauthorized)?;

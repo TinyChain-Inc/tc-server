@@ -241,6 +241,9 @@ where
         expired
     }
 
+    #[allow(clippy::too_many_arguments)]
+    // This is the internal entrypoint for adapter request routing; splitting this signature would
+    // obscure the core dispatch flow without reducing complexity.
     pub fn route_request<F>(
         &self,
         method: Method,
@@ -626,6 +629,16 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
     }
 }
 
+fn stub_handler<Request: Send + 'static, Response: Send + 'static>(
+    label: &str,
+) -> Arc<dyn KernelHandler<Request, Response>> {
+    let label = label.to_string();
+    Arc::new(move |_req: Request| {
+        let label = label.clone();
+        async move { panic!("stub handler {label} not implemented") }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,7 +647,7 @@ mod tests {
     use tc_ir::{LibrarySchema, NetworkTime};
 
     fn ok_handler() -> impl KernelHandler<(), ()> {
-        |_req: ()| async { () }.boxed()
+        |_req: ()| async {}.boxed()
     }
 
     #[test]
@@ -855,14 +868,4 @@ mod tests {
             .expect_err("expected unauthorized");
         assert_eq!(err.code(), tc_error::ErrorKind::Unauthorized);
     }
-}
-
-fn stub_handler<Request: Send + 'static, Response: Send + 'static>(
-    label: &str,
-) -> Arc<dyn KernelHandler<Request, Response>> {
-    let label = label.to_string();
-    Arc::new(move |_req: Request| {
-        let label = label.clone();
-        async move { panic!("stub handler {label} not implemented") }
-    })
 }

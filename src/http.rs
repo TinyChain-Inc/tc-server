@@ -699,10 +699,7 @@ mod tests {
     use hyper::Body;
     use pathlink::Link;
     use std::str::FromStr;
-    use tc_ir::{
-        HandleDelete, HandleGet, HandlePost, HandlePut, LibraryModule,
-        tc_library_routes,
-    };
+    use tc_ir::{HandleDelete, HandleGet, HandlePost, HandlePut, LibraryModule, tc_library_routes};
 
     fn ok_handler() -> impl crate::KernelHandler<Request<Body>, Response<Body>> {
         move |_req: Request<Body>| {

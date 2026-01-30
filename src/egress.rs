@@ -27,10 +27,7 @@ impl EgressPolicy {
         dependency_root: impl Into<String>,
         authority: impl Into<String>,
     ) {
-        let rule = self
-            .deps
-            .entry(dependency_root.into())
-            .or_insert_with(DependencyRule::default);
+        let rule = self.deps.entry(dependency_root.into()).or_default();
 
         rule.authorities.insert(authority.into());
     }
@@ -45,10 +42,7 @@ impl EgressPolicy {
     ) {
         let dependency_root = dependency_root.into();
         let authority = authority.into();
-        let rule = self
-            .deps
-            .entry(dependency_root)
-            .or_insert_with(DependencyRule::default);
+        let rule = self.deps.entry(dependency_root).or_default();
 
         rule.default_authority = Some(authority.clone());
         rule.authorities.insert(authority);

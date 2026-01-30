@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use destream::de;
 use pathlink::{Link, PathSegment};
@@ -113,7 +112,6 @@ pub struct InstallArtifact {
     pub bytes: String,
 }
 
-#[async_trait]
 impl de::FromStream for InstallArtifact {
     type Context = ();
 
@@ -123,7 +121,6 @@ impl de::FromStream for InstallArtifact {
     ) -> Result<Self, D::Error> {
         struct ArtifactVisitor;
 
-        #[async_trait]
         impl de::Visitor for ArtifactVisitor {
             type Value = InstallArtifact;
 
@@ -201,7 +198,6 @@ struct InstallPayloadRaw {
     artifacts: Vec<InstallArtifact>,
 }
 
-#[async_trait]
 impl de::FromStream for InstallPayloadRaw {
     type Context = ();
 
@@ -211,7 +207,6 @@ impl de::FromStream for InstallPayloadRaw {
     ) -> Result<Self, D::Error> {
         struct PayloadVisitor;
 
-        #[async_trait]
         impl de::Visitor for PayloadVisitor {
             type Value = InstallPayloadRaw;
 
@@ -381,7 +376,7 @@ fn decode_install_payload(bytes: &[u8]) -> Result<InstallPayloadRaw, InstallErro
     let schema = payload
         .schema
         .try_into()
-        .map_err(|err| InstallError::bad_request(err))?;
+        .map_err(InstallError::bad_request)?;
 
     Ok(InstallPayloadRaw {
         schema,
