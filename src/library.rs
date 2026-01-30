@@ -648,6 +648,31 @@ where
 
         Ok(())
     }
+
+    /// Install a WASM library from raw bytes (in-process).
+    ///
+    /// This bypasses the HTTP `/lib` installer envelope and uses the manifest embedded in the WASM
+    /// module as the source of truth for the installed [`LibrarySchema`] and routes.
+    ///
+    /// The returned schema is the manifest schema parsed from the WASM module.
+    pub fn install_wasm_bytes(&self, wasm_bytes: Vec<u8>) -> TCResult<LibrarySchema> {
+        let factory = self
+            .route_factory
+            .as_ref()
+            .ok_or_else(|| TCError::bad_request("wasm installs are not supported"))?;
+
+        let (manifest_schema, schema_routes, handler) = factory(wasm_bytes.clone())?;
+
+        self.state
+            .replace_with_routes(manifest_schema.clone(), schema_routes);
+        self.routes.replace_arc(handler);
+
+        if let Some(storage) = &self.storage {
+            storage.persist_library(&manifest_schema, &wasm_bytes)?;
+        }
+
+        Ok(manifest_schema)
+    }
 }
 
 impl<Request, Response> Clone for LibraryRuntime<Request, Response>

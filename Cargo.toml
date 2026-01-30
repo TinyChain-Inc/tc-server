@@ -79,3 +79,7 @@ required-features = ["http-server"]
 [[example]]
 name = "http_rpc_opref_get"
 required-features = ["http-server"]
+
+[[example]]
+name = "http_wasm_opref_get"
+required-features = ["http-server", "wasm"]

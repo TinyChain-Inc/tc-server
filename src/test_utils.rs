@@ -15,7 +15,7 @@ pub(crate) fn wasm_hello_world_module() -> Vec<u8> {
 }
 
 fn build_wasm_hello_world_module() -> Vec<u8> {
-    const SCHEMA_ID: &str = "/lib/example";
+    const SCHEMA_ID: &str = "/lib/example-devco/example/0.1.0";
     const RESPONSE_JSON: &str = r#""hello""#;
     const MANIFEST_OFFSET: u32 = 8;
     const RESPONSE_OFFSET: u32 = 512;
@@ -164,7 +164,7 @@ impl Default for FixtureTxn {
     fn default() -> Self {
         Self {
             claim: Claim::new(
-                Link::from_str("/lib/example").expect("claim link"),
+                Link::from_str("/lib/example-devco/example/0.1.0").expect("claim link"),
                 umask::Mode::all(),
             ),
         }

@@ -181,6 +181,34 @@ impl HttpServer {
         let make_service = tower::make::Shared::new(service);
         hyper::Server::from_tcp(listener)?.serve(make_service).await
     }
+
+    pub async fn serve_with_shutdown<F>(self, addr: SocketAddr, shutdown: F) -> hyper::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let service = KernelService::new(self.kernel);
+        let make_service = tower::make::Shared::new(service);
+        hyper::Server::bind(&addr)
+            .serve(make_service)
+            .with_graceful_shutdown(shutdown)
+            .await
+    }
+
+    pub async fn serve_listener_with_shutdown<F>(
+        self,
+        listener: TcpListener,
+        shutdown: F,
+    ) -> hyper::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let service = KernelService::new(self.kernel);
+        let make_service = tower::make::Shared::new(service);
+        hyper::Server::from_tcp(listener)?
+            .serve(make_service)
+            .with_graceful_shutdown(shutdown)
+            .await
+    }
 }
 
 #[derive(Clone)]
@@ -256,6 +284,7 @@ impl Service<Request<Body>> for KernelService {
                 |handle, req| {
                     minted_txn_id = Some(handle.id());
                     req.extensions_mut().insert(handle.clone());
+                    req.extensions_mut().insert(kernel.clone());
                 },
             ) {
                 Ok(KernelDispatch::Response(resp)) => {
@@ -943,7 +972,7 @@ mod tests {
 
         let install_payload = serde_json::json!({
             "schema": {
-                "id": "/lib/example",
+                "id": "/lib/example-devco/example/0.1.0",
                 "version": "0.1.0",
                 "dependencies": []
             },
@@ -982,7 +1011,7 @@ mod tests {
         let schema = LibrarySchema::new(
             Link::from_str("/lib/acme/a/1.0.0").expect("schema id"),
             "1.0.0",
-            vec![Link::from_str("/lib").expect("dependency root")],
+            vec![Link::from_str("/lib/example-devco/example/0.1.0").expect("dependency root")],
         );
 
         let module = crate::library::http::build_http_library_module(schema, None);
@@ -990,11 +1019,12 @@ mod tests {
 
         let local_kernel: HttpKernel = crate::Kernel::builder()
             .with_library_module(module, handlers)
-            .with_dependency_route("/lib", addr.to_string())
+            .with_dependency_route("/lib/example-devco/example/0.1.0", addr.to_string())
             .with_http_rpc_gateway()
             .finish();
 
-        let link = Link::from_str("/lib/hello").expect("op link");
+        let link =
+            Link::from_str("/lib/example-devco/example/0.1.0/hello").expect("op link");
         let op = OpRef::Get((tc_ir::Subject::Link(link), tc_ir::Scalar::default()));
 
         let response = local_kernel

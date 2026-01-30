@@ -14,6 +14,8 @@ use crate::library::{RouteMetadata, SchemaRoutes};
 #[cfg(feature = "http-server")]
 use {
     crate::txn::TxnHandle,
+    bytes::Bytes,
+    futures::stream,
     hyper::{Body, Request, Response, StatusCode, body},
     tc_error::ErrorKind,
     tokio::sync::Mutex,
@@ -327,7 +329,7 @@ mod tests {
             TxnId::from_parts(NetworkTime::from_nanos(1), 0),
             NetworkTime::from_nanos(1),
             Claim::new(
-                pathlink::Link::from_str("/lib/example").unwrap(),
+                pathlink::Link::from_str("/lib/example-devco/example/0.1.0").unwrap(),
                 Mode::all(),
             ),
         );
@@ -345,12 +347,21 @@ mod http_tests {
     use crate::{
         kernel::{Kernel, Method},
         library::http::{build_http_library_module, http_library_handlers},
+        HttpServer,
         txn::TxnManager,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-    use hyper::{Body, Request};
+    use hyper::{Body, Client, Request, StatusCode, body};
     use pathlink::Link;
+    use std::net::TcpListener;
     use std::str::FromStr;
+    use tc_ir::{Claim, NetworkTime, Transaction, TxnId};
+    use umask::Mode;
+    use wasm_encoder::{
+        CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function, FunctionSection,
+        GlobalSection, GlobalType, Instruction, MemorySection, MemoryType, Module, TypeSection,
+        ValType,
+    };
 
     #[tokio::test]
     async fn kernel_dispatches_wasm_route() {
@@ -370,7 +381,7 @@ mod http_tests {
 
         let install_payload = serde_json::json!({
             "schema": {
-                "id": "/lib/example",
+                "id": "/lib/example-devco/example/0.1.0",
                 "version": "0.1.0",
                 "dependencies": []
             },
@@ -400,17 +411,348 @@ mod http_tests {
 
         let mut request = Request::builder()
             .method("GET")
-            .uri("/lib/hello")
+            .uri("/lib/example-devco/example/0.1.0/hello")
             .body(Body::empty())
             .expect("request");
         request.extensions_mut().insert(txn.clone());
 
         let fut = kernel
-            .dispatch(Method::Get, "/lib/hello", request)
+            .dispatch(Method::Get, "/lib/example-devco/example/0.1.0/hello", request)
             .expect("wasm handler");
         let response = fut.await;
         let body = body::to_bytes(response.into_body()).await.expect("body");
         assert_eq!(body.as_ref(), b"\"hello\"");
+    }
+
+    fn wasm_static_response_module(
+        schema: LibrarySchema,
+        route_path: &'static str,
+        export: &'static str,
+        response_bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        const MANIFEST_OFFSET: u32 = 8;
+        const RESPONSE_OFFSET: u32 = 512;
+        const HEAP_INIT: u32 = 1024;
+
+        #[derive(Clone)]
+        struct FixtureTxn {
+            claim: Claim,
+        }
+
+        impl Default for FixtureTxn {
+            fn default() -> Self {
+                Self {
+                    claim: Claim::new(
+                        Link::from_str("/lib/example-devco/example/0.1.0").expect("claim link"),
+                        Mode::all(),
+                    ),
+                }
+            }
+        }
+
+        impl Transaction for FixtureTxn {
+            fn id(&self) -> TxnId {
+                TxnId::from_parts(NetworkTime::from_nanos(1), 0).with_trace([0; 32])
+            }
+
+            fn timestamp(&self) -> NetworkTime {
+                NetworkTime::from_nanos(1)
+            }
+
+            fn claim(&self) -> &Claim {
+                &self.claim
+            }
+        }
+
+        #[derive(Clone)]
+        struct FixtureLibrary {
+            schema: LibrarySchema,
+            routes: tc_ir::Dir<()>,
+        }
+
+        impl FixtureLibrary {
+            fn new(schema: LibrarySchema) -> Self {
+                Self {
+                    schema,
+                    routes: tc_ir::Dir::default(),
+                }
+            }
+        }
+
+        impl tc_ir::Library for FixtureLibrary {
+            type Txn = FixtureTxn;
+            type Routes = tc_ir::Dir<()>;
+
+            fn schema(&self) -> &LibrarySchema {
+                &self.schema
+            }
+
+            fn routes(&self) -> &Self::Routes {
+                &self.routes
+            }
+        }
+
+        let library = FixtureLibrary::new(schema);
+        let routes = [tc_wasm::RouteExport::new(route_path, export)];
+        let manifest = tc_wasm::manifest_bytes(&library, &routes);
+        let manifest_len: u32 = manifest.len().try_into().expect("manifest fits in u32");
+        let response_len: u32 = response_bytes
+            .len()
+            .try_into()
+            .expect("response fits in u32");
+
+        let manifest_packed: i64 = (((manifest_len as u64) << 32) | (MANIFEST_OFFSET as u64)) as i64;
+
+        let mut module = Module::new();
+
+        let mut types = TypeSection::new();
+        types.function([ValType::I32], [ValType::I32]); // 0 alloc
+        types.function([ValType::I32, ValType::I32], []); // 1 free
+        types.function([], [ValType::I64]); // 2 entry
+        types.function(
+            [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            [ValType::I64],
+        ); // 3 route
+
+        module.section(&types);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        functions.function(1);
+        functions.function(2);
+        functions.function(3);
+        module.section(&functions);
+
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        module.section(&memories);
+
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(HEAP_INIT as i32),
+        );
+        module.section(&globals);
+
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("alloc", ExportKind::Func, 0);
+        exports.export("free", ExportKind::Func, 1);
+        exports.export("tc_library_entry", ExportKind::Func, 2);
+        exports.export(export, ExportKind::Func, 3);
+        module.section(&exports);
+
+        let mut code = CodeSection::new();
+
+        // alloc(len: i32) -> i32
+        let mut alloc = Function::new([(1, ValType::I32)]);
+        alloc.instruction(&Instruction::GlobalGet(0));
+        alloc.instruction(&Instruction::LocalSet(1));
+        alloc.instruction(&Instruction::GlobalGet(0));
+        alloc.instruction(&Instruction::LocalGet(0));
+        alloc.instruction(&Instruction::I32Add);
+        alloc.instruction(&Instruction::GlobalSet(0));
+        alloc.instruction(&Instruction::LocalGet(1));
+        alloc.instruction(&Instruction::End);
+        code.function(&alloc);
+
+        // free(ptr: i32, len: i32) -> ()
+        let mut free = Function::new([]);
+        free.instruction(&Instruction::End);
+        code.function(&free);
+
+        // tc_library_entry() -> i64
+        let mut entry = Function::new([]);
+        entry.instruction(&Instruction::I64Const(manifest_packed));
+        entry.instruction(&Instruction::End);
+        code.function(&entry);
+
+        // route(...) -> i64
+        // Allocate a response buffer, copy response bytes, return (len<<32 | ptr).
+        let mut route = Function::new([(1, ValType::I32)]);
+        route.instruction(&Instruction::I32Const(response_len as i32));
+        route.instruction(&Instruction::Call(0));
+        route.instruction(&Instruction::LocalSet(4));
+        route.instruction(&Instruction::LocalGet(4));
+        route.instruction(&Instruction::I32Const(RESPONSE_OFFSET as i32));
+        route.instruction(&Instruction::I32Const(response_len as i32));
+        route.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+        route.instruction(&Instruction::I32Const(response_len as i32));
+        route.instruction(&Instruction::I64ExtendI32U);
+        route.instruction(&Instruction::I64Const(32));
+        route.instruction(&Instruction::I64Shl);
+        route.instruction(&Instruction::LocalGet(4));
+        route.instruction(&Instruction::I64ExtendI32U);
+        route.instruction(&Instruction::I64Or);
+        route.instruction(&Instruction::End);
+        code.function(&route);
+
+        module.section(&code);
+
+        let mut data = DataSection::new();
+        data.active(0, &ConstExpr::i32_const(MANIFEST_OFFSET as i32), manifest);
+        data.active(
+            0,
+            &ConstExpr::i32_const(RESPONSE_OFFSET as i32),
+            response_bytes,
+        );
+        module.section(&data);
+
+        module.finish()
+    }
+
+    #[tokio::test]
+    async fn http_wasm_route_resolves_opref_via_gateway() -> Result<(), Box<dyn std::error::Error>> {
+        let b_root = "/lib/example-devco/b/0.1.0";
+        let b_hello = "/lib/example-devco/b/0.1.0/hello";
+        let b_route = "/hello";
+
+        let initial_schema =
+            tc_ir::LibrarySchema::new(Link::from_str("/lib/initial")?, "0.0.1", vec![]);
+        let b_module = build_http_library_module(initial_schema, None);
+        let b_handlers = http_library_handlers(&b_module);
+
+        let b_kernel: Kernel<Request<Body>, Response<Body>> = Kernel::builder()
+            .with_host_id("tc-http-b")
+            .with_library_module(b_module, b_handlers)
+            .with_service_handler(|_req| async { Response::new(Body::empty()) })
+            .with_kernel_handler(|_req| async { Response::new(Body::empty()) })
+            .with_health_handler(|_req| async { Response::new(Body::empty()) })
+            .finish();
+
+        let b_schema =
+            tc_ir::LibrarySchema::new(Link::from_str(b_root)?, "0.1.0", vec![]);
+        let wasm_b = wasm_static_response_module(b_schema, b_route, "hello", br#""hello""#.to_vec());
+
+        let install_payload_b = serde_json::json!({
+            "schema": {
+                "id": b_root,
+                "version": "0.1.0",
+                "dependencies": [],
+            },
+            "artifacts": [{
+                "path": "/lib/wasm",
+                "content_type": "application/wasm",
+                "bytes": BASE64.encode(&wasm_b),
+            }]
+        });
+
+        let install_request_b = Request::builder()
+            .method("PUT")
+            .uri("/lib")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(install_payload_b.to_string()))?;
+
+        let install_response_b = b_kernel
+            .dispatch(Method::Put, "/lib", install_request_b)
+            .ok_or("missing install handler for /lib")?
+            .await;
+
+        assert_eq!(install_response_b.status(), StatusCode::NO_CONTENT);
+
+        let b_listener = TcpListener::bind("127.0.0.1:0")?;
+        let b_addr = b_listener.local_addr()?;
+        let b_task = {
+            let kernel = b_kernel.clone();
+            tokio::spawn(async move {
+                let _ = HttpServer::new(kernel).serve_listener(b_listener).await;
+            })
+        };
+
+        let a_root = "/lib/example-devco/a/0.1.0";
+        let a_from_b = "/lib/example-devco/a/0.1.0/from_b";
+        let a_route = "/from_b";
+
+        let a_schema = tc_ir::LibrarySchema::new(
+            Link::from_str(a_root)?,
+            "0.1.0",
+            vec![Link::from_str(b_root)?],
+        );
+        let a_module = build_http_library_module(a_schema.clone(), None);
+        let a_handlers = http_library_handlers(&a_module);
+
+        let a_kernel: Kernel<Request<Body>, Response<Body>> = Kernel::builder()
+            .with_host_id("tc-http-a")
+            .with_library_module(a_module, a_handlers)
+            .with_dependency_route(b_root, b_addr.to_string())
+            .with_http_rpc_gateway()
+            .with_service_handler(|_req| async { Response::new(Body::empty()) })
+            .with_kernel_handler(|_req| async { Response::new(Body::empty()) })
+            .with_health_handler(|_req| async { Response::new(Body::empty()) })
+            .finish();
+
+        let wasm_response = {
+            let mut map = serde_json::Map::new();
+            map.insert(
+                b_hello.to_string(),
+                serde_json::Value::Array(vec![serde_json::Value::Null]),
+            );
+            serde_json::Value::Object(map)
+        };
+        let wasm_a = wasm_static_response_module(a_schema, a_route, "from_b", wasm_response.to_string().into_bytes());
+
+        let install_payload_a = serde_json::json!({
+            "schema": {
+                "id": a_root,
+                "version": "0.1.0",
+                "dependencies": [b_root],
+            },
+            "artifacts": [{
+                "path": "/lib/wasm",
+                "content_type": "application/wasm",
+                "bytes": BASE64.encode(&wasm_a),
+            }]
+        });
+
+        let install_request_a = Request::builder()
+            .method("PUT")
+            .uri("/lib")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(install_payload_a.to_string()))?;
+
+        let install_response_a = a_kernel
+            .dispatch(Method::Put, "/lib", install_request_a)
+            .ok_or("missing install handler for /lib")?
+            .await;
+
+        assert_eq!(install_response_a.status(), StatusCode::NO_CONTENT);
+
+        let a_listener = TcpListener::bind("127.0.0.1:0")?;
+        let a_addr = a_listener.local_addr()?;
+        let a_task = {
+            let kernel = a_kernel.clone();
+            tokio::spawn(async move {
+                let _ = HttpServer::new(kernel).serve_listener(a_listener).await;
+            })
+        };
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("http://{a_addr}{a_from_b}"))
+            .header(hyper::header::AUTHORIZATION, "Bearer demo-user")
+            .body(Body::empty())?;
+
+        let response = Client::new().request(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body()).await?;
+        assert_eq!(body.as_ref(), b"\"hello\"");
+
+        a_task.abort();
+        b_task.abort();
+        Ok(())
     }
 }
 
@@ -466,34 +808,65 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request<Body>) ->
         Err(err) => return error_response(err),
     };
 
+    let kernel = req
+        .extensions()
+        .get::<crate::Kernel<Request<Body>, Response<Body>>>()
+        .cloned();
+
     let body = match body::to_bytes(req.into_body()).await {
         Ok(bytes) => bytes.to_vec(),
         Err(err) => return error_response(TCError::internal(err)),
     };
 
-    let relative = &path["/lib".len()..];
-    let normalized = if relative.starts_with('/') {
-        relative
-    } else {
-        return not_found(&path);
-    };
-
-    let segments = match parse_route_path(normalized) {
-        Ok(segments) => segments,
-        Err(err) => return error_response(err),
-    };
-
     let result = {
         let mut guard = wasm.lock().await;
+        let schema_id = guard.schema().id().to_string();
+        let schema_rel = schema_id.strip_prefix("/lib").unwrap_or(&schema_id);
+
+        let relative = &path["/lib".len()..];
+        let normalized = if relative.starts_with('/') {
+            relative
+        } else {
+            return not_found(&path);
+        };
+
+        let normalized = if schema_rel.is_empty() {
+            normalized
+        } else if normalized.starts_with(schema_rel) {
+            &normalized[schema_rel.len()..]
+        } else {
+            return not_found(&path);
+        };
+
+        let segments = match parse_route_path(normalized) {
+            Ok(segments) => segments,
+            Err(err) => return error_response(err),
+        };
+
         guard.call_route(&segments, &header, &body)
     };
 
     match result {
-        Ok(bytes) => Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(bytes))
-            .unwrap(),
+        Ok(bytes) => {
+            // If the WASM route returns a TinyChain ref envelope (`TCRef` or `OpRef`) as JSON,
+            // resolve it within the current transaction and return the resolved RPC response.
+            if let Some(kernel) = kernel
+                && let Some(r) = try_decode_wasm_ref(&bytes).await
+            {
+                match r {
+                    tc_ir::TCRef::Op(op) => match kernel.resolve_op(header.id(), None, op).await {
+                        Ok(rpc) => return rpc_response(rpc),
+                        Err(err) => return error_response(err),
+                    },
+                }
+            }
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(bytes))
+                .unwrap()
+        }
         Err(err) => error_response(err),
     }
 }
@@ -536,6 +909,54 @@ fn error_response(err: TCError) -> Response<Body> {
         .header(hyper::header::CONTENT_TYPE, "text/plain")
         .body(Body::from(err.message().to_string()))
         .unwrap()
+}
+
+#[cfg(feature = "http-server")]
+async fn try_decode_wasm_ref(bytes: &[u8]) -> Option<tc_ir::TCRef> {
+    if let Ok(r) = try_decode_json_slice::<tc_ir::TCRef>(bytes).await {
+        return Some(r);
+    }
+
+    if let Ok(op) = try_decode_json_slice::<tc_ir::OpRef>(bytes).await {
+        return Some(tc_ir::TCRef::Op(op));
+    }
+
+    None
+}
+
+#[cfg(feature = "http-server")]
+async fn try_decode_json_slice<T>(bytes: &[u8]) -> Result<T, String>
+where
+    T: destream::de::FromStream<Context = ()>,
+{
+    use std::io;
+
+    if bytes.is_empty() {
+        return Err("empty payload".to_string());
+    }
+
+    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::copy_from_slice(bytes))]);
+    destream_json::try_decode((), stream)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(feature = "http-server")]
+fn rpc_response(rpc: crate::gateway::RpcResponse) -> Response<Body> {
+    let status = StatusCode::from_u16(rpc.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+
+    for (name, value) in rpc.headers {
+        if let Ok(name) = hyper::header::HeaderName::from_str(&name)
+            && let Ok(value) = hyper::header::HeaderValue::from_str(&value)
+        {
+            if let Some(headers) = builder.headers_mut() {
+                headers.insert(name, value);
+            }
+        }
+    }
+
+    builder.body(Body::from(rpc.body)).unwrap()
 }
 
 #[cfg(feature = "pyo3")]

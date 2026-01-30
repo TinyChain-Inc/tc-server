@@ -149,18 +149,34 @@ where
         let txn_server = self.txn_server.clone();
 
         async move {
-            let (method, target) = match op {
-                tc_ir::OpRef::Get((tc_ir::Subject::Link(link), _key)) => {
-                    (Method::Get, link.to_string())
+            fn encode_request_body(scalar: tc_ir::Scalar) -> Vec<u8> {
+                match scalar {
+                    tc_ir::Scalar::Value(tc_value::Value::None) => Vec::new(),
+                    tc_ir::Scalar::Value(tc_value::Value::String(s)) => {
+                        serde_json::to_vec(&s).unwrap_or_default()
+                    }
+                    tc_ir::Scalar::Value(tc_value::Value::Number(n)) => {
+                        // Without a serde-backed `Number` encoding in v2 staging, fall back to a
+                        // JSON string representation.
+                        serde_json::to_vec(&n.to_string()).unwrap_or_default()
+                    }
+                    // For now, only value payloads are forwarded as request bodies.
+                    tc_ir::Scalar::Ref(_) => Vec::new(),
                 }
-                tc_ir::OpRef::Put((tc_ir::Subject::Link(link), _key, _value)) => {
-                    (Method::Put, link.to_string())
+            }
+
+            let (method, target, body) = match op {
+                tc_ir::OpRef::Get((tc_ir::Subject::Link(link), key)) => {
+                    (Method::Get, link.to_string(), encode_request_body(key))
+                }
+                tc_ir::OpRef::Put((tc_ir::Subject::Link(link), _key, value)) => {
+                    (Method::Put, link.to_string(), encode_request_body(value))
                 }
                 tc_ir::OpRef::Post((tc_ir::Subject::Link(link), _params)) => {
-                    (Method::Post, link.to_string())
+                    (Method::Post, link.to_string(), Vec::new())
                 }
-                tc_ir::OpRef::Delete((tc_ir::Subject::Link(link), _key)) => {
-                    (Method::Delete, link.to_string())
+                tc_ir::OpRef::Delete((tc_ir::Subject::Link(link), key)) => {
+                    (Method::Delete, link.to_string(), encode_request_body(key))
                 }
                 _ => {
                     return Err(TCError::bad_request(
@@ -219,7 +235,7 @@ where
             let resolved = egress.resolve_target(&schema, &target)?;
 
             gateway
-                .request(method, resolved, txn_id, bearer_token, Vec::new())
+                .request(method, resolved, txn_id, bearer_token, body)
                 .await
                 .map_err(|err| match err {
                     crate::gateway::RpcError::InvalidTarget(msg) => TCError::bad_request(msg),
