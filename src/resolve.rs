@@ -26,7 +26,10 @@ pub trait Resolve: Send + Sync + 'static {
     }
 }
 
-impl Resolve for dyn RpcGateway {
+impl<G> Resolve for G
+where
+    G: RpcGateway + ?Sized,
+{
     fn resolve_op(
         &self,
         txn_id: TxnId,

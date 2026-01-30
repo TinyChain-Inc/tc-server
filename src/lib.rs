@@ -7,6 +7,7 @@ pub mod txn_server;
 pub mod uri;
 
 pub use kernel::{Kernel, KernelBuilder, KernelDispatch, KernelHandler, Method};
+pub use gateway::RpcGateway as RpcClient;
 pub use tc_ir::{
     Dir, HandleDelete, HandleGet, HandlePost, HandlePut, Handler, Route, Transaction,
     parse_route_path,
@@ -16,6 +17,7 @@ pub use tc_ir::{
 pub(crate) mod test_utils;
 
 pub mod library;
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
 pub use library::NativeLibrary;
 
 pub mod storage;
@@ -34,7 +36,10 @@ pub mod wasm;
 pub mod http;
 
 #[cfg(feature = "http-client")]
-pub(crate) mod http_client;
+pub mod http_client;
+
+#[cfg(feature = "http-client")]
+pub use http_client::HttpRpcGateway;
 
 #[cfg(feature = "http-server")]
 pub use http::{

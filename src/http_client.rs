@@ -19,27 +19,6 @@ impl HttpRpcGateway {
             client: hyper::Client::new(),
         }
     }
-
-    #[allow(dead_code)]
-    pub fn finalize_request(
-        &self,
-        commit: bool,
-        uri: String,
-        txn_id: TxnId,
-        bearer_token: Option<String>,
-    ) -> BoxFuture<'static, Result<RpcResponse, RpcError>> {
-        let uri = match validate_finalize_target(&uri) {
-            Ok(uri) => uri,
-            Err(err) => return futures::future::ready(Err(err)).boxed(),
-        };
-        self.request(
-            if commit { Method::Post } else { Method::Delete },
-            uri,
-            txn_id,
-            bearer_token,
-            Vec::new(),
-        )
-    }
 }
 
 impl Default for HttpRpcGateway {
