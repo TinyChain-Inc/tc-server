@@ -2,6 +2,7 @@ pub mod auth;
 pub mod egress;
 pub mod gateway;
 pub mod kernel;
+pub mod ir;
 pub mod resolve;
 pub mod txn_server;
 pub mod uri;
@@ -82,11 +83,4 @@ pub(crate) fn build_python_kernel_with_config(
     config: pyo3_runtime::PyKernelConfig,
 ) -> PyKernel {
     pyo3_runtime::python_kernel_builder_with_config(lib, service, metrics, config)
-}
-
-#[cfg(feature = "pyo3")]
-#[allow(deprecated)]
-#[pymodule]
-fn tinychain(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
-    register_python_api(module)
 }

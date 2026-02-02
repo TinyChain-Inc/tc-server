@@ -40,14 +40,10 @@ virtualenv to keep the shared transaction flow in sync.
 ## Examples
 
 ```bash
-# Start an HTTP host with a WASM "Hello" library installed (prints "<addr> <lib-id>")
-cargo run --manifest-path tc-server/Cargo.toml --example http_rpc_host
-
-# Start an in-process HTTP host, install the WASM library, then resolve an outbound RPC via OpRef::Get
-cargo run --manifest-path tc-server/Cargo.toml --example http_rpc_opref_get
-
-# Run a local in-process PyO3 kernel which resolves an OpRef over HTTP (requires the tinychain PyO3 module)
-python tc-server/examples/pyo3_http_rpc_demo.py --authority <host:port>
+# Run the end-to-end PyO3 + WASM + remote OpRef integration example
+# (from this `tc-server/` directory inside the monorepo)
+../scripts/install_tc_server_python.sh
+../.venv/bin/python ../client/py/examples/library_integration_example.py
 ```
 
 To build the `tinychain` PyO3 module and run the Python integration tests, follow

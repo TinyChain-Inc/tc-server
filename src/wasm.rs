@@ -911,7 +911,7 @@ fn error_response(err: TCError) -> Response<Body> {
         .unwrap()
 }
 
-#[cfg(feature = "http-server")]
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
 async fn try_decode_wasm_ref(bytes: &[u8]) -> Option<tc_ir::TCRef> {
     if let Ok(r) = try_decode_json_slice::<tc_ir::TCRef>(bytes).await {
         return Some(r);
@@ -924,7 +924,7 @@ async fn try_decode_wasm_ref(bytes: &[u8]) -> Option<tc_ir::TCRef> {
     None
 }
 
-#[cfg(feature = "http-server")]
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
 async fn try_decode_json_slice<T>(bytes: &[u8]) -> Result<T, String>
 where
     T: destream::de::FromStream<Context = ()>,
@@ -941,7 +941,6 @@ where
         .map_err(|err| err.to_string())
 }
 
-#[cfg(feature = "http-server")]
 fn rpc_response(rpc: crate::gateway::RpcResponse) -> Response<Body> {
     let status = StatusCode::from_u16(rpc.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
@@ -1024,16 +1023,65 @@ async fn py_handle_route(
         return Ok(PyKernelResponse::new(404, None, None));
     };
 
-    let segments = parse_route_path(normalized)
-        .map_err(|err| PyValueError::new_err(err.message().to_string()))?;
+    let kernel = req.kernel();
+    let bearer_token = crate::pyo3_runtime::py_bearer_token(&req);
 
     let result = {
         let mut guard = wasm.lock().await;
+        let schema_id = guard.schema().id().to_string();
+        let schema_rel = schema_id.strip_prefix("/lib").unwrap_or(&schema_id);
+
+        let normalized = if schema_rel.is_empty() {
+            normalized
+        } else if normalized.starts_with(schema_rel) {
+            &normalized[schema_rel.len()..]
+        } else {
+            return Ok(PyKernelResponse::new(404, None, None));
+        };
+
+        let segments = parse_route_path(normalized)
+            .map_err(|err| PyValueError::new_err(err.message().to_string()))?;
+
         guard.call_route(&segments, &header, &body)
     };
 
     match result {
-        Ok(bytes) => py_wasm_response(bytes, txn).await,
+        Ok(bytes) => {
+            // Match the HTTP adapter behavior: if the WASM route returns a TinyChain ref envelope
+            // (`TCRef`/`OpRef`) as JSON, resolve it within the current transaction and return the
+            // resolved RPC response.
+            if let Some(kernel) = kernel
+                && let Some(r) = try_decode_wasm_ref(&bytes).await
+            {
+                match r {
+                    tc_ir::TCRef::Op(op) => match kernel
+                        .resolve_op(txn.id(), bearer_token.clone(), op)
+                        .await
+                    {
+                        Ok(rpc) => {
+                            return Python::with_gil(|py| {
+                                let body = if rpc.body.is_empty() {
+                                    None
+                                } else {
+                                    Some(crate::pyo3_runtime::PyStateHandle::new(
+                                        pyo3::types::PyBytes::new_bound(py, &rpc.body).into_py(py),
+                                    ))
+                                };
+
+                                Ok(PyKernelResponse::new(
+                                    rpc.status,
+                                    Some(rpc.headers),
+                                    body,
+                                ))
+                            });
+                        }
+                        Err(err) => return Err(PyValueError::new_err(err.message().to_string())),
+                    },
+                }
+            }
+
+            py_wasm_response(bytes, txn).await
+        }
         Err(err) => Err(PyValueError::new_err(err.message().to_string())),
     }
 }

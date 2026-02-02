@@ -68,18 +68,9 @@ rjwt-token = ["dep:rjwt", "pathlink/serialize", "tc-value/serialize"]
 
 [dev-dependencies]
 serde_json = "1"
-wat = "1"
 wasm-encoder = "0.206"
 tc-wasm = { path = "../tc-wasm" }
 
 [[example]]
-name = "http_rpc_host"
+name = "http_rpc_native_host"
 required-features = ["http-server"]
-
-[[example]]
-name = "http_rpc_opref_get"
-required-features = ["http-server"]
-
-[[example]]
-name = "http_wasm_opref_get"
-required-features = ["http-server", "wasm"]

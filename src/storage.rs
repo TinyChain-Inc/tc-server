@@ -14,10 +14,17 @@ use tc_ir::LibrarySchema;
 /// ```text
 /// <root>/lib/<id>/<version>/schema.json
 /// <root>/lib/<id>/<version>/library.wasm
+/// <root>/lib/<id>/<version>/library.ir.json
 /// ```
 #[derive(Clone)]
 pub struct LibraryDir {
     root: PathBuf,
+}
+
+#[derive(Clone)]
+pub enum LibraryArtifact {
+    Wasm(Vec<u8>),
+    Ir(Vec<u8>),
 }
 
 impl LibraryDir {
@@ -29,7 +36,7 @@ impl LibraryDir {
         &self.root
     }
 
-    pub fn load_all(&self) -> TCResult<Vec<(LibrarySchema, Vec<u8>)>> {
+    pub fn load_all(&self) -> TCResult<Vec<(LibrarySchema, LibraryArtifact)>> {
         let mut out = Vec::new();
         let lib_root = self.root.join("lib");
         if !lib_root.exists() {
@@ -49,16 +56,30 @@ impl LibraryDir {
                 }
                 let schema_path = version_dir.join("schema.json");
                 let wasm_path = version_dir.join("library.wasm");
-                if !schema_path.exists() || !wasm_path.exists() {
+                let ir_path = version_dir.join("library.ir.json");
+                if !schema_path.exists() {
                     continue;
                 }
                 let schema_bytes = fs::read(&schema_path).map_err(map_io)?;
                 let schema = decode_schema_bytes(&schema_bytes).map_err(TCError::internal)?;
-                let wasm_bytes = fs::read(&wasm_path).map_err(map_io)?;
-                if schema_bytes.is_empty() || wasm_bytes.is_empty() {
+                if schema_bytes.is_empty() {
                     continue;
                 }
-                out.push((schema, wasm_bytes));
+
+                if wasm_path.exists() {
+                    let wasm_bytes = fs::read(&wasm_path).map_err(map_io)?;
+                    if !wasm_bytes.is_empty() {
+                        out.push((schema, LibraryArtifact::Wasm(wasm_bytes)));
+                        continue;
+                    }
+                }
+
+                if ir_path.exists() {
+                    let ir_bytes = fs::read(&ir_path).map_err(map_io)?;
+                    if !ir_bytes.is_empty() {
+                        out.push((schema, LibraryArtifact::Ir(ir_bytes)));
+                    }
+                }
             }
         }
 
@@ -73,12 +94,21 @@ impl LibraryDir {
         Ok(())
     }
 
-    pub fn persist_library(&self, schema: &LibrarySchema, wasm: &[u8]) -> TCResult<()> {
+    pub fn persist_wasm_library(&self, schema: &LibrarySchema, wasm: &[u8]) -> TCResult<()> {
         let dir = self.ensure_lib_dir(schema);
         fs::create_dir_all(&dir).map_err(map_io)?;
         let bytes = encode_schema(schema).map_err(map_io_str)?;
         fs::write(dir.join("schema.json"), bytes).map_err(map_io)?;
         fs::write(dir.join("library.wasm"), wasm).map_err(map_io)?;
+        Ok(())
+    }
+
+    pub fn persist_ir_library(&self, schema: &LibrarySchema, bytes: &[u8]) -> TCResult<()> {
+        let dir = self.ensure_lib_dir(schema);
+        fs::create_dir_all(&dir).map_err(map_io)?;
+        let schema_bytes = encode_schema(schema).map_err(map_io_str)?;
+        fs::write(dir.join("schema.json"), schema_bytes).map_err(map_io)?;
+        fs::write(dir.join("library.ir.json"), bytes).map_err(map_io)?;
         Ok(())
     }
 

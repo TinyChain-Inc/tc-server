@@ -863,7 +863,9 @@ mod tests {
             vec![],
         );
 
-        let module = Arc::new(crate::library::LibraryRuntime::new(schema, None, None));
+        let module = Arc::new(crate::library::LibraryRuntime::new(
+            schema, None, None, None,
+        ));
         let handlers = crate::library::LibraryHandlers::without_route(ok_handler(), ok_handler());
 
         let gateway = MockGateway::default();

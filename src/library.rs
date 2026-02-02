@@ -16,7 +16,8 @@ use tc_value::Value;
 
 use crate::{
     KernelHandler,
-    storage::{LibraryDir, decode_schema_bytes},
+    ir::IR_ARTIFACT_CONTENT_TYPE,
+    storage::{LibraryArtifact, LibraryDir, decode_schema_bytes},
     txn::TxnHandle,
 };
 
@@ -294,11 +295,79 @@ pub fn apply_wasm_install<Request, Response>(
 
     if let Some(storage) = storage {
         storage
-            .persist_library(&manifest_schema, &wasm_bytes)
+            .persist_wasm_library(&manifest_schema, &wasm_bytes)
             .map_err(|err| InstallError::internal(err.to_string()))?;
     }
 
     Ok(())
+}
+
+pub fn apply_ir_install<Request, Response>(
+    state: &LibraryState,
+    routes: &LibraryRoutes<Request, Response>,
+    storage: Option<&LibraryDir>,
+    route_factory: Option<&LibraryRouteFactory<Request, Response>>,
+    payload: InstallArtifacts,
+) -> Result<(), InstallError> {
+    let artifact = payload
+        .artifacts
+        .into_iter()
+        .find(|artifact| artifact.content_type == IR_ARTIFACT_CONTENT_TYPE)
+        .ok_or_else(|| InstallError::bad_request("missing application/tinychain+json artifact"))?;
+
+    let ir_bytes = BASE64
+        .decode(artifact.bytes.as_bytes())
+        .map_err(|err| InstallError::bad_request(format!("invalid base64 artifact: {err}")))?;
+
+    let factory = route_factory
+        .ok_or_else(|| InstallError::bad_request("ir installs are not supported"))?;
+
+    let (manifest_schema, schema_routes, handler) =
+        factory(ir_bytes.clone()).map_err(|err| InstallError::internal(err.to_string()))?;
+
+    if !schemas_equivalent(&manifest_schema, &payload.schema) {
+        return Err(InstallError::bad_request("manifest schema does not match descriptor"));
+    }
+
+    state.replace_with_routes(manifest_schema.clone(), schema_routes);
+    routes.replace_arc(handler);
+
+    if let Some(storage) = storage {
+        storage
+            .persist_ir_library(&manifest_schema, &ir_bytes)
+            .map_err(|err| InstallError::internal(err.to_string()))?;
+    }
+
+    Ok(())
+}
+
+pub fn apply_install<Request, Response>(
+    state: &LibraryState,
+    routes: &LibraryRoutes<Request, Response>,
+    storage: Option<&LibraryDir>,
+    wasm_factory: Option<&LibraryRouteFactory<Request, Response>>,
+    ir_factory: Option<&LibraryRouteFactory<Request, Response>>,
+    payload: InstallArtifacts,
+) -> Result<(), InstallError> {
+    if payload
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.content_type == "application/wasm")
+    {
+        return apply_wasm_install(state, routes, storage, wasm_factory, payload);
+    }
+
+    if payload
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.content_type == IR_ARTIFACT_CONTENT_TYPE)
+    {
+        return apply_ir_install(state, routes, storage, ir_factory, payload);
+    }
+
+    Err(InstallError::bad_request(
+        "missing supported artifact (expected application/wasm or application/tinychain+json)",
+    ))
 }
 
 fn schemas_equivalent(left: &LibrarySchema, right: &LibrarySchema) -> bool {
@@ -587,7 +656,8 @@ pub struct LibraryRuntime<Request, Response> {
     state: LibraryState,
     routes: LibraryRoutes<Request, Response>,
     storage: Option<crate::storage::LibraryDir>,
-    route_factory: Option<LibraryRouteFactory<Request, Response>>,
+    wasm_factory: Option<LibraryRouteFactory<Request, Response>>,
+    ir_factory: Option<LibraryRouteFactory<Request, Response>>,
 }
 
 impl<Request, Response> LibraryRuntime<Request, Response>
@@ -598,13 +668,15 @@ where
     pub fn new(
         initial_schema: LibrarySchema,
         storage: Option<crate::storage::LibraryDir>,
-        route_factory: Option<LibraryRouteFactory<Request, Response>>,
+        wasm_factory: Option<LibraryRouteFactory<Request, Response>>,
+        ir_factory: Option<LibraryRouteFactory<Request, Response>>,
     ) -> Self {
         Self {
             state: LibraryState::new(initial_schema),
             routes: LibraryRoutes::new(),
             storage,
-            route_factory,
+            wasm_factory,
+            ir_factory,
         }
     }
 
@@ -620,8 +692,12 @@ where
         self.storage.clone()
     }
 
-    pub fn route_factory(&self) -> Option<LibraryRouteFactory<Request, Response>> {
-        self.route_factory.clone()
+    pub fn wasm_factory(&self) -> Option<LibraryRouteFactory<Request, Response>> {
+        self.wasm_factory.clone()
+    }
+
+    pub fn ir_factory(&self) -> Option<LibraryRouteFactory<Request, Response>> {
+        self.ir_factory.clone()
     }
 
     pub fn hydrate_from_storage(&self) -> TCResult<()> {
@@ -630,19 +706,33 @@ where
             None => return Ok(()),
         };
 
-        let factory = match &self.route_factory {
-            Some(factory) => Arc::clone(factory),
-            None => return Ok(()),
-        };
-
         let entries = storage.load_all()?;
-        for (schema, wasm) in entries {
-            let (manifest_schema, schema_routes, handler) = factory(wasm)?;
+        for (schema, artifact) in entries {
+            let (manifest_schema, schema_routes, handler) = match artifact {
+                LibraryArtifact::Wasm(bytes) => {
+                    let factory = match &self.wasm_factory {
+                        Some(factory) => Arc::clone(factory),
+                        None => continue,
+                    };
+                    factory(bytes)?
+                }
+                LibraryArtifact::Ir(bytes) => {
+                    let factory = match &self.ir_factory {
+                        Some(factory) => Arc::clone(factory),
+                        None => continue,
+                    };
+                    factory(bytes)?
+                }
+            };
+
             if manifest_schema != schema {
                 return Err(TCError::internal("persisted schema mismatch"));
             }
-            self.state
-                .replace_with_routes(manifest_schema, schema_routes.clone());
+
+            self.state.replace_with_routes(
+                manifest_schema,
+                schema_routes.clone(),
+            );
             self.routes.replace_arc(handler);
         }
 
@@ -657,7 +747,7 @@ where
     /// The returned schema is the manifest schema parsed from the WASM module.
     pub fn install_wasm_bytes(&self, wasm_bytes: Vec<u8>) -> TCResult<LibrarySchema> {
         let factory = self
-            .route_factory
+            .wasm_factory
             .as_ref()
             .ok_or_else(|| TCError::bad_request("wasm installs are not supported"))?;
 
@@ -668,7 +758,7 @@ where
         self.routes.replace_arc(handler);
 
         if let Some(storage) = &self.storage {
-            storage.persist_library(&manifest_schema, &wasm_bytes)?;
+            storage.persist_wasm_library(&manifest_schema, &wasm_bytes)?;
         }
 
         Ok(manifest_schema)
@@ -685,7 +775,8 @@ where
             state: self.state.clone(),
             routes: self.routes.clone(),
             storage: self.storage.clone(),
-            route_factory: self.route_factory.clone(),
+            wasm_factory: self.wasm_factory.clone(),
+            ir_factory: self.ir_factory.clone(),
         }
     }
 }
@@ -702,22 +793,35 @@ pub mod http {
         KernelHandler,
         library::{
             InstallError, InstallRequest, LibraryHandlers, LibraryRouteFactory, LibraryRoutes,
-            LibraryRuntime, LibraryState, apply_wasm_install, decode_install_request_bytes,
+            LibraryRuntime, LibraryState, apply_install, decode_install_request_bytes,
         },
         storage::LibraryDir,
         wasm::http_wasm_route_handler_from_bytes,
+        ir::http_ir_route_handler_from_bytes,
     };
 
     pub fn build_http_library_module(
         initial_schema: LibrarySchema,
         storage: Option<LibraryDir>,
     ) -> Arc<LibraryRuntime<Request<Body>, Response<Body>>> {
-        let factory: LibraryRouteFactory<_, _> = Arc::new(|bytes: Vec<u8>| {
+        let wasm_factory: LibraryRouteFactory<_, _> = Arc::new(|bytes: Vec<u8>| {
             let (handler, schema, schema_routes) = http_wasm_route_handler_from_bytes(bytes)?;
             let handler: Arc<dyn KernelHandler<Request<Body>, Response<Body>>> = Arc::new(handler);
             Ok((schema, schema_routes, handler))
         });
-        Arc::new(LibraryRuntime::new(initial_schema, storage, Some(factory)))
+
+        let ir_factory: LibraryRouteFactory<_, _> = Arc::new(|bytes: Vec<u8>| {
+            let (handler, schema, schema_routes) = http_ir_route_handler_from_bytes(bytes)?;
+            let handler: Arc<dyn KernelHandler<Request<Body>, Response<Body>>> = Arc::new(handler);
+            Ok((schema, schema_routes, handler))
+        });
+
+        Arc::new(LibraryRuntime::new(
+            initial_schema,
+            storage,
+            Some(wasm_factory),
+            Some(ir_factory),
+        ))
     }
 
     pub fn http_library_handlers(
@@ -726,9 +830,10 @@ pub mod http {
         let state = module.state();
         let routes = module.routes();
         let storage = module.storage();
-        let factory = module.route_factory();
+        let wasm_factory = module.wasm_factory();
+        let ir_factory = module.ir_factory();
         let get = schema_get_handler(state.clone());
-        let put = schema_put_handler(state, routes.clone(), storage, factory);
+        let put = schema_put_handler(state, routes.clone(), storage, wasm_factory, ir_factory);
         let route = routes_handler(&routes);
         LibraryHandlers::with_route(get, put, route)
     }
@@ -746,13 +851,15 @@ pub mod http {
         state: LibraryState,
         routes: LibraryRoutes<Request<Body>, Response<Body>>,
         storage: Option<LibraryDir>,
-        route_factory: Option<LibraryRouteFactory<Request<Body>, Response<Body>>>,
+        wasm_factory: Option<LibraryRouteFactory<Request<Body>, Response<Body>>>,
+        ir_factory: Option<LibraryRouteFactory<Request<Body>, Response<Body>>>,
     ) -> impl KernelHandler<Request<Body>, Response<Body>> {
         move |req: Request<Body>| {
             let state = state.clone();
             let routes = routes.clone();
             let storage = storage.clone();
-            let route_factory = route_factory.clone();
+            let wasm_factory = wasm_factory.clone();
+            let ir_factory = ir_factory.clone();
             async move {
                 match decode_body(req).await {
                     Ok(InstallRequest::SchemaOnly(schema)) => {
@@ -765,11 +872,12 @@ pub mod http {
                         }
                         no_content_response()
                     }
-                    Ok(InstallRequest::WithArtifacts(payload)) => match apply_wasm_install(
+                    Ok(InstallRequest::WithArtifacts(payload)) => match apply_install(
                         &state,
                         &routes,
                         storage.as_ref(),
-                        route_factory.as_ref(),
+                        wasm_factory.as_ref(),
+                        ir_factory.as_ref(),
                         payload,
                     ) {
                         Ok(()) => no_content_response(),
