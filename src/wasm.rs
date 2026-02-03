@@ -14,8 +14,6 @@ use crate::library::{RouteMetadata, SchemaRoutes};
 #[cfg(feature = "http-server")]
 use {
     crate::txn::TxnHandle,
-    bytes::Bytes,
-    futures::stream,
     hyper::{Body, Request, Response, StatusCode, body},
     tc_error::ErrorKind,
     tokio::sync::Mutex,
@@ -24,6 +22,7 @@ use {
 #[cfg(feature = "pyo3")]
 use {
     crate::pyo3_runtime::{PyKernelRequest, PyKernelResponse, request_body_bytes},
+    crate::txn::TxnHandle,
     futures::lock::Mutex as AsyncMutex,
     pyo3::{exceptions::PyValueError, prelude::*},
 };
@@ -935,12 +934,15 @@ where
         return Err("empty payload".to_string());
     }
 
-    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::copy_from_slice(bytes))]);
+    let stream = futures::stream::iter(vec![Ok::<bytes::Bytes, io::Error>(
+        bytes::Bytes::copy_from_slice(bytes),
+    )]);
     destream_json::try_decode((), stream)
         .await
         .map_err(|err| err.to_string())
 }
 
+#[cfg(feature = "http-server")]
 fn rpc_response(rpc: crate::gateway::RpcResponse) -> Response<Body> {
     let status = StatusCode::from_u16(rpc.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
