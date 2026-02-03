@@ -34,20 +34,19 @@ cargo build -p tc-server --features "http-server pyo3"
 cargo test -p tc-server --all-features
 ```
 
-When developing the PyO3 adapter, also run `client/py/tests` via the repo’s
-virtualenv to keep the shared transaction flow in sync.
+When developing the PyO3 adapter, also run the TinyChain Python client
+integration tests (if available in your environment) to keep the shared
+transaction flow in sync.
 
 ## Examples
 
 ```bash
-# Run the end-to-end PyO3 + WASM + remote OpRef integration example
-# (from this `tc-server/` directory inside the monorepo)
-../scripts/install_tc_server_python.sh
-../.venv/bin/python ../client/py/examples/library_integration_example.py
+# See the TinyChain Python client repo for an end-to-end PyO3 + WASM + remote OpRef
+# integration example which exercises the in-process kernel against a remote host.
 ```
 
-To build the `tinychain` PyO3 module and run the Python integration tests, follow
-`client/py/README.md` (entrypoint: `scripts/install_tc_server_python.sh`).
+To build the `tinychain` PyO3 module and run Python integration tests, follow the
+setup instructions provided by the TinyChain Python client tooling you are using.
 
 ## HTTP quickstart
 

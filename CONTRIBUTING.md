@@ -16,17 +16,30 @@ deployment, so keep the crate thin and transport-agnostic.
 
 ## Contribution workflow
 
-1. Align proposals with `tc-server/AGENTS.md`—a single kernel, no adapter-only
+1. Align proposals with `AGENTS.md`—a single kernel, no adapter-only
    feature forks, and strict adherence to the 3-second sync budget.
-2. Follow `/CODE_STYLE.md`: group imports (std → external → internal), run
-   `cargo fmt`, and keep `cargo clippy --all-targets --all-features -D warnings`
-   clean before sending changes.
+2. Keep formatting and linting clean: run `cargo fmt` and
+   `cargo clippy --all-targets --all-features -D warnings` before sending
+   changes.
 3. Keep feature flags limited to adapter compilation; core logic must remain
    shared so HTTP, PyO3, and WASM loaders observe identical behavior.
-4. Run `cargo test -p tc-server` plus the relevant Python integration tests
-   (e.g., `client/py/tests/test_backend.py`) before opening a PR.
+4. Run `cargo test -p tc-server` plus any relevant client integration tests
+   (e.g., the TinyChain Python client backend tests) before opening a PR.
 5. Document observable behavior changes in `PROTOCOL_COMPATIBILITY.md` or
    `ROADMAP.md` when they affect external clients or rollout expectations.
+
+## Local development with unpublished sibling crates
+
+While the TinyChain crates are still being iterated as a set, this repository may
+depend on sibling crates via relative `path = "../..."` dependencies in
+`Cargo.toml`. To develop locally:
+
+1. Check out the required sibling repositories next to this repo so the relative
+   paths resolve (e.g., `../tc-ir`, `../tc-state`, `../tc-value`).
+2. If your checkout layout differs, either:
+   - adjust the `path = ...` entries in `Cargo.toml`, or
+   - create a small Cargo workspace which includes these crates at your chosen
+     paths.
 
 ### Shared CPython helper for PyO3 work
 
@@ -51,8 +64,8 @@ libpython; CI and released wheels will continue to bundle prebuilt extensions.
 ## Rights and licensing
 
 By contributing to this crate you represent that (a) the work is authored by
-you (or you have the necessary rights to contribute it) and (b) you transfer and
-assign all right, title, and interest in the contribution to the TinyChain
-Open-Source Project for distribution under the TinyChain open-source license
-(Apache 2.0, see the root `LICENSE`). No other restrictions or encumbrances may
-attach to your contribution.
+you (or you have the necessary rights to contribute it), (b) the contribution is
+unencumbered by third-party intellectual property claims, and (c) you transfer
+and assign all right, title, and interest in the contribution to The TinyChain
+Contributors for distribution under the Apache 2.0 license (see `LICENSE`). No
+other restrictions or encumbrances may attach to your contribution.
