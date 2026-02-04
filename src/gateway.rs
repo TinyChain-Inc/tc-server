@@ -1,28 +1,39 @@
 use futures::future::BoxFuture;
-use tc_ir::TxnId;
+use pathlink::Link;
+use tc_error::TCResult;
+use tc_ir::Map;
+use tc_state::State;
+use tc_value::Value;
 
-use crate::Method;
-
-#[derive(Debug)]
-pub enum RpcError {
-    InvalidTarget(String),
-    Transport(String),
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct RpcResponse {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
+use crate::txn::TxnHandle;
 
 pub trait RpcGateway: Send + Sync + 'static {
-    fn request(
+    fn get(
         &self,
-        method: Method,
-        uri: String,
-        txn_id: TxnId,
-        bearer_token: Option<String>,
-        body: Vec<u8>,
-    ) -> BoxFuture<'static, Result<RpcResponse, RpcError>>;
+        target: Link,
+        txn: TxnHandle,
+        key: Value,
+    ) -> BoxFuture<'static, TCResult<State>>;
+
+    fn put(
+        &self,
+        target: Link,
+        txn: TxnHandle,
+        key: Value,
+        value: State,
+    ) -> BoxFuture<'static, TCResult<()>>;
+
+    fn post(
+        &self,
+        target: Link,
+        txn: TxnHandle,
+        params: Map<State>,
+    ) -> BoxFuture<'static, TCResult<State>>;
+
+    fn delete(
+        &self,
+        target: Link,
+        txn: TxnHandle,
+        key: Value,
+    ) -> BoxFuture<'static, TCResult<()>>;
 }

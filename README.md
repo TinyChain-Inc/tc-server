@@ -14,7 +14,8 @@ the kernel is compiled, every adapter clones the same instance so `/lib`,
   `LibraryDir`, serve `/lib` installs, and expose health/service metrics.
 - `library` – tooling for `NativeLibrary` installers, `tc_library_routes!`,
   and route registries shared with WASM loaders.
-- `txn`, `storage`, `pyo3_runtime`, and optional `wasm` support modules.
+- `txn`, `storage`, `pyo3_runtime`, and optional `wasm` support modules (including
+  transaction-bound RPC resolution for `OpRef`/`Scalar::Ref` without adapter types).
 - Reference docs: see `AGENTS.md` for design guardrails and
   `PROTOCOL_COMPATIBILITY.md` for adapter expectations.
 

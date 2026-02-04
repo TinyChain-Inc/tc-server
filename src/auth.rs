@@ -69,26 +69,31 @@ pub(crate) fn default_token_verifier() -> Arc<dyn TokenVerifier> {
 #[cfg(feature = "rjwt-token")]
 mod rjwt_token {
     use std::collections::HashMap;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use futures::FutureExt;
     use parking_lot::RwLock;
     use pathlink::Link;
-    use rjwt::{Actor, Error as RjwtError, Resolve, VerifyingKey};
+    use rjwt::{Actor, Error as RjwtError, Resolve, SignedToken, Token, VerifyingKey};
     use tc_value::Value;
 
     use crate::auth::{TokenContext, TokenVerifier};
     use crate::txn::TxnError;
     use tc_ir::Claim;
 
+    pub type SignedTokenV1 = SignedToken<Link, Value, Claim>;
+    pub type TokenV1 = Token<Link, Value, Claim>;
+    pub type ActorV1 = Actor<Value>;
+
     #[derive(Clone, Default)]
     pub struct KeyringActorResolver {
-        actors: Arc<RwLock<HashMap<(Link, String), Actor<Value>>>>,
+        actors: Arc<RwLock<HashMap<(Link, String), ActorV1>>>,
     }
 
     impl KeyringActorResolver {
-        pub fn with_actor(self, host: Link, actor: Actor<Value>) -> Self {
+        pub fn with_actor(self, host: Link, actor: ActorV1) -> Self {
             self.actors
                 .write()
                 .insert((host, actor_identity(actor.id())), actor);
@@ -106,7 +111,7 @@ mod rjwt_token {
             self.keys.write().insert(actor_id.into(), key);
         }
 
-        pub fn insert_actor(&self, actor: &Actor<Value>) {
+        pub fn insert_actor(&self, actor: &ActorV1) {
             self.insert(actor_identity(actor.id()), actor.public_key());
         }
 
@@ -121,7 +126,7 @@ mod rjwt_token {
             &self,
             host: &Link,
             actor_id: &Value,
-        ) -> Result<Actor<Value>, TxnError>;
+        ) -> Result<ActorV1, TxnError>;
     }
 
     #[async_trait]
@@ -130,7 +135,7 @@ mod rjwt_token {
             &self,
             host: &Link,
             actor_id: &Value,
-        ) -> Result<Actor<Value>, TxnError> {
+        ) -> Result<ActorV1, TxnError> {
             self.actors
                 .read()
                 .get(&(host.clone(), actor_identity(actor_id)))
@@ -143,13 +148,16 @@ mod rjwt_token {
     #[derive(Clone)]
     pub struct RpcActorResolver {
         gateway: Arc<dyn crate::gateway::RpcGateway>,
-        txn_id: tc_ir::TxnId,
+        txn: crate::txn::TxnHandle,
     }
 
     #[cfg(feature = "http-client")]
     impl RpcActorResolver {
-        pub fn new(gateway: Arc<dyn crate::gateway::RpcGateway>, txn_id: tc_ir::TxnId) -> Self {
-            Self { gateway, txn_id }
+        pub fn new(
+            gateway: Arc<dyn crate::gateway::RpcGateway>,
+            txn: crate::txn::TxnHandle,
+        ) -> Self {
+            Self { gateway, txn }
         }
     }
 
@@ -160,36 +168,33 @@ mod rjwt_token {
             &self,
             host: &Link,
             actor_id: &Value,
-        ) -> Result<Actor<Value>, TxnError> {
+        ) -> Result<ActorV1, TxnError> {
             use base64::Engine as _;
 
             let actor_id = actor_identity(actor_id);
-            let mut url = url::Url::parse(&host.to_string()).map_err(|_| TxnError::Unauthorized)?;
-            url.set_path("/host/public_key");
-            url.set_query(Some(&format!(
-                "key={}",
-                url::form_urlencoded::byte_serialize(actor_id.as_bytes()).collect::<String>()
-            )));
+            let target = {
+                let host_segment = pathlink::PathSegment::from_str("host")
+                    .map_err(|_| TxnError::Unauthorized)?;
+                let key_segment = pathlink::PathSegment::from_str("public_key")
+                    .map_err(|_| TxnError::Unauthorized)?;
+                host.clone().append(host_segment).append(key_segment)
+            };
 
             let response = self
                 .gateway
-                .request(
-                    crate::Method::Get,
-                    url.to_string(),
-                    self.txn_id,
-                    None,
-                    Vec::new(),
+                .get(
+                    target,
+                    self.txn.clone(),
+                    Value::String(actor_id.clone()),
                 )
                 .await
                 .map_err(|_| TxnError::Unauthorized)?;
 
-            if response.status != 200 {
-                return Err(TxnError::Unauthorized);
-            }
+            let encoded = match response {
+                tc_state::State::Scalar(tc_ir::Scalar::Value(Value::String(s))) => s,
+                _ => return Err(TxnError::Unauthorized),
+            };
 
-            let body = String::from_utf8(response.body).map_err(|_| TxnError::Unauthorized)?;
-            let encoded: String =
-                serde_json::from_str(&body).map_err(|_| TxnError::Unauthorized)?;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|_| TxnError::Unauthorized)?;
@@ -276,7 +281,8 @@ mod rjwt_token {
 
 #[cfg(feature = "rjwt-token")]
 pub use rjwt_token::{
-    ActorResolver as RjwtActorResolver, KeyringActorResolver, PublicKeyStore, RjwtTokenVerifier,
+    ActorResolver as RjwtActorResolver, ActorV1 as Actor, KeyringActorResolver, PublicKeyStore,
+    RjwtTokenVerifier, SignedTokenV1 as SignedToken, TokenV1 as Token,
 };
 
 #[cfg(all(feature = "rjwt-token", feature = "http-client"))]

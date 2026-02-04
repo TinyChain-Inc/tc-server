@@ -13,6 +13,7 @@ use tc_ir::{
     Route,
 };
 use tc_value::Value;
+use umask::Mode;
 
 use crate::{
     KernelHandler,
@@ -744,6 +745,9 @@ where
     /// This bypasses the HTTP `/lib` installer envelope and uses the manifest embedded in the WASM
     /// module as the source of truth for the installed [`LibrarySchema`] and routes.
     ///
+    /// Callers must enforce authorization (e.g., require a txn claim for the target schema ID).
+    /// Prefer [`install_wasm_bytes_authorized`] where a txn is available.
+    ///
     /// The returned schema is the manifest schema parsed from the WASM module.
     pub fn install_wasm_bytes(&self, wasm_bytes: Vec<u8>) -> TCResult<LibrarySchema> {
         let factory = self
@@ -752,6 +756,34 @@ where
             .ok_or_else(|| TCError::bad_request("wasm installs are not supported"))?;
 
         let (manifest_schema, schema_routes, handler) = factory(wasm_bytes.clone())?;
+
+        self.state
+            .replace_with_routes(manifest_schema.clone(), schema_routes);
+        self.routes.replace_arc(handler);
+
+        if let Some(storage) = &self.storage {
+            storage.persist_wasm_library(&manifest_schema, &wasm_bytes)?;
+        }
+
+        Ok(manifest_schema)
+    }
+
+    /// Install a WASM library from raw bytes after validating a txn claim.
+    pub fn install_wasm_bytes_authorized(
+        &self,
+        txn: &crate::txn::TxnHandle,
+        wasm_bytes: Vec<u8>,
+    ) -> TCResult<LibrarySchema> {
+        let factory = self
+            .wasm_factory
+            .as_ref()
+            .ok_or_else(|| TCError::bad_request("wasm installs are not supported"))?;
+
+        let (manifest_schema, schema_routes, handler) = factory(wasm_bytes.clone())?;
+
+        if !txn.has_claim(manifest_schema.id(), Mode::new().with_class_perm(umask::USER, umask::WRITE)) {
+            return Err(TCError::unauthorized("unauthorized library install"));
+        }
 
         self.state
             .replace_with_routes(manifest_schema.clone(), schema_routes);
@@ -860,9 +892,18 @@ pub mod http {
             let storage = storage.clone();
             let wasm_factory = wasm_factory.clone();
             let ir_factory = ir_factory.clone();
+            let txn = req.extensions().get::<crate::txn::TxnHandle>().cloned();
             async move {
+                let txn = match txn {
+                    Some(txn) => txn,
+                    None => return unauthorized_response("missing transaction context"),
+                };
+
                 match decode_body(req).await {
                     Ok(InstallRequest::SchemaOnly(schema)) => {
+                        if !txn.has_claim(schema.id(), umask::USER_WRITE) {
+                            return unauthorized_response("unauthorized library install");
+                        }
                         state.replace_schema(schema);
                         routes.clear();
                         if let Some(storage) = &storage
@@ -872,17 +913,22 @@ pub mod http {
                         }
                         no_content_response()
                     }
-                    Ok(InstallRequest::WithArtifacts(payload)) => match apply_install(
-                        &state,
-                        &routes,
-                        storage.as_ref(),
-                        wasm_factory.as_ref(),
-                        ir_factory.as_ref(),
-                        payload,
-                    ) {
-                        Ok(()) => no_content_response(),
-                        Err(err) => install_error_response(err),
-                    },
+                    Ok(InstallRequest::WithArtifacts(payload)) => {
+                        if !txn.has_claim(payload.schema.id(), umask::USER_WRITE) {
+                            return unauthorized_response("unauthorized library install");
+                        }
+                        match apply_install(
+                            &state,
+                            &routes,
+                            storage.as_ref(),
+                            wasm_factory.as_ref(),
+                            ir_factory.as_ref(),
+                            payload,
+                        ) {
+                            Ok(()) => no_content_response(),
+                            Err(err) => install_error_response(err),
+                        }
+                    }
                     Err(err) => install_error_response(err),
                 }
             }
@@ -912,6 +958,7 @@ pub mod http {
         decode_install_request_bytes(&body_bytes)
     }
 
+
     fn bad_request(message: String) -> Response<Body> {
         Response::builder()
             .status(StatusCode::BAD_REQUEST)
@@ -924,6 +971,13 @@ pub mod http {
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::from(message))
             .expect("internal error response")
+    }
+
+    fn unauthorized_response(message: impl Into<String>) -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::from(message.into()))
+            .expect("unauthorized response")
     }
 
     fn no_content_response() -> Response<Body> {
@@ -1008,6 +1062,7 @@ pub mod http {
 
         #[tokio::test]
         async fn installs_schema_via_put() {
+            use tc_ir::Claim;
             let initial = LibrarySchema::new(
                 Link::from_str("/lib/service").expect("link"),
                 "0.1.0",
@@ -1027,12 +1082,21 @@ pub mod http {
                 "dependencies": [],
             });
 
-            let put_request = Request::builder()
+            let mut put_request = Request::builder()
                 .method("PUT")
                 .uri("/lib")
                 .header(hyper::header::CONTENT_TYPE, "application/json")
                 .body(Body::from(new_schema.to_string()))
                 .expect("install request");
+            let install_claim = Claim::new(
+                Link::from_str("/lib/updated").expect("install link"),
+                umask::USER_WRITE,
+            );
+            let install_txn = kernel
+                .txn_manager()
+                .begin()
+                .with_claims(vec![install_claim]);
+            put_request.extensions_mut().insert(install_txn);
 
             let put_response = kernel
                 .dispatch(Method::Put, "/lib", put_request)

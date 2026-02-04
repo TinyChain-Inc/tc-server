@@ -1,10 +1,15 @@
+use bytes::Bytes;
+use pathlink::Link;
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
-use tc_ir::TxnId;
+use tc_error::{TCError, TCResult};
+use tc_ir::{Map, TxnId};
+use tc_state::{State, StateContext};
+use tc_value::Value;
 use url::form_urlencoded;
 
 use crate::{
     Method,
-    gateway::{RpcError, RpcGateway, RpcResponse},
+    gateway::RpcGateway,
     uri::{component_root, normalize_path},
 };
 
@@ -28,20 +33,19 @@ impl Default for HttpRpcGateway {
 }
 
 impl RpcGateway for HttpRpcGateway {
-    fn request(
+    fn get(
         &self,
-        method: Method,
-        uri: String,
-        txn_id: TxnId,
-        bearer_token: Option<String>,
-        body: Vec<u8>,
-    ) -> BoxFuture<'static, Result<RpcResponse, RpcError>> {
-        let uri = match append_txn_id(&uri, txn_id) {
+        target: Link,
+        txn: crate::txn::TxnHandle,
+        key: Value,
+    ) -> BoxFuture<'static, TCResult<State>> {
+        let uri = match append_txn_id_and_key(&target.to_string(), txn.id(), &key) {
             Ok(uri) => uri,
             Err(err) => return futures::future::ready(Err(err)).boxed(),
         };
 
-        let request = match build_request(method, uri, bearer_token.as_deref(), body) {
+        let request = match build_request(Method::Get, uri, txn.authorization_header(), Vec::new())
+        {
             Ok(req) => req,
             Err(err) => return futures::future::ready(Err(err)).boxed(),
         };
@@ -50,46 +54,166 @@ impl RpcGateway for HttpRpcGateway {
         async move {
             let response = client
                 .request(request)
-                .map_err(|err| RpcError::Transport(err.to_string()))
+                .map_err(|err| TCError::bad_gateway(err.to_string()))
                 .await?;
 
-            let status = response.status().as_u16();
-            let headers = response
-                .headers()
-                .iter()
-                .filter_map(|(name, value)| {
-                    let value = value.to_str().ok()?;
-                    Some((name.to_string(), value.to_string()))
-                })
-                .collect();
-
+            let status = response.status();
             let body_bytes = hyper::body::to_bytes(response.into_body())
-                .map_err(|err| RpcError::Transport(err.to_string()))
+                .map_err(|err| TCError::bad_gateway(err.to_string()))
                 .await?;
 
-            Ok(RpcResponse {
-                status,
-                headers,
-                body: body_bytes.to_vec(),
-            })
+            if !status.is_success() {
+                return Err(tc_error_from_status(status, body_bytes));
+            }
+
+            decode_state_body(body_bytes, &txn).await
+        }
+        .boxed()
+    }
+
+    fn put(
+        &self,
+        target: Link,
+        txn: crate::txn::TxnHandle,
+        key: Value,
+        value: State,
+    ) -> BoxFuture<'static, TCResult<()>> {
+        let uri = match append_txn_id_and_key(&target.to_string(), txn.id(), &key) {
+            Ok(uri) => uri,
+            Err(err) => return futures::future::ready(Err(err)).boxed(),
+        };
+
+        let body = match encode_state_body(value) {
+            Ok(bytes) => bytes,
+            Err(err) => return futures::future::ready(Err(err)).boxed(),
+        };
+
+        let request = match build_request(Method::Put, uri, txn.authorization_header(), body) {
+            Ok(req) => req,
+            Err(err) => return futures::future::ready(Err(err)).boxed(),
+        };
+
+        let client = self.client.clone();
+        async move {
+            let response = client
+                .request(request)
+                .map_err(|err| TCError::bad_gateway(err.to_string()))
+                .await?;
+
+            let status = response.status();
+            let body_bytes = hyper::body::to_bytes(response.into_body())
+                .map_err(|err| TCError::bad_gateway(err.to_string()))
+                .await?;
+
+            if !status.is_success() {
+                return Err(tc_error_from_status(status, body_bytes));
+            }
+
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn post(
+        &self,
+        target: Link,
+        txn: crate::txn::TxnHandle,
+        params: Map<State>,
+    ) -> BoxFuture<'static, TCResult<State>> {
+        let uri = match append_txn_id_and_key(&target.to_string(), txn.id(), &Value::None) {
+            Ok(uri) => uri,
+            Err(err) => return futures::future::ready(Err(err)).boxed(),
+        };
+
+        let body = if params.is_empty() {
+            Vec::new()
+        } else {
+            match encode_params_body(params) {
+                Ok(bytes) => bytes,
+                Err(err) => return futures::future::ready(Err(err)).boxed(),
+            }
+        };
+
+        let request = match build_request(Method::Post, uri, txn.authorization_header(), body) {
+            Ok(req) => req,
+            Err(err) => return futures::future::ready(Err(err)).boxed(),
+        };
+
+        let client = self.client.clone();
+        async move {
+            let response = client
+                .request(request)
+                .map_err(|err| TCError::bad_gateway(err.to_string()))
+                .await?;
+
+            let status = response.status();
+            let body_bytes = hyper::body::to_bytes(response.into_body())
+                .map_err(|err| TCError::bad_gateway(err.to_string()))
+                .await?;
+
+            if !status.is_success() {
+                return Err(tc_error_from_status(status, body_bytes));
+            }
+
+            decode_state_body(body_bytes, &txn).await
+        }
+        .boxed()
+    }
+
+    fn delete(
+        &self,
+        target: Link,
+        txn: crate::txn::TxnHandle,
+        key: Value,
+    ) -> BoxFuture<'static, TCResult<()>> {
+        let uri = match append_txn_id_and_key(&target.to_string(), txn.id(), &key) {
+            Ok(uri) => uri,
+            Err(err) => return futures::future::ready(Err(err)).boxed(),
+        };
+
+        let request =
+            match build_request(Method::Delete, uri, txn.authorization_header(), Vec::new()) {
+            Ok(req) => req,
+            Err(err) => return futures::future::ready(Err(err)).boxed(),
+        };
+
+        let client = self.client.clone();
+        async move {
+            let response = client
+                .request(request)
+                .map_err(|err| TCError::bad_gateway(err.to_string()))
+                .await?;
+
+            let status = response.status();
+            let body_bytes = hyper::body::to_bytes(response.into_body())
+                .map_err(|err| TCError::bad_gateway(err.to_string()))
+                .await?;
+
+            if !status.is_success() {
+                return Err(tc_error_from_status(status, body_bytes));
+            }
+
+            Ok(())
         }
         .boxed()
     }
 }
 
 #[allow(dead_code)]
-fn validate_finalize_target(uri: &str) -> Result<String, RpcError> {
+fn validate_finalize_target(uri: &str) -> TCResult<String> {
     let parsed: http::Uri = uri
         .parse()
-        .map_err(|err| RpcError::InvalidTarget(format!("invalid URI: {err}")))?;
+        .map_err(|err| TCError::bad_request(format!("invalid URI: {err}")))?;
 
     let path = normalize_path(parsed.path());
     let root = component_root(path).ok_or_else(|| {
-        RpcError::InvalidTarget("commit/rollback target is not a TinyChain component".to_string())
+        TCError::bad_request(
+            "commit/rollback target is not a TinyChain component".to_string(),
+        )
     })?;
 
     if root != path {
-        return Err(RpcError::InvalidTarget(format!(
+        return Err(TCError::bad_request(format!(
             "commit/rollback target must be component root (got {path})"
         )));
     }
@@ -100,9 +224,9 @@ fn validate_finalize_target(uri: &str) -> Result<String, RpcError> {
 fn build_request(
     method: Method,
     uri: String,
-    bearer_token: Option<&str>,
+    authorization: Option<String>,
     body: Vec<u8>,
-) -> Result<http::Request<hyper::Body>, RpcError> {
+) -> TCResult<http::Request<hyper::Body>> {
     use http::header::{AUTHORIZATION, HeaderValue};
 
     let method = match method {
@@ -114,21 +238,91 @@ fn build_request(
 
     let mut builder = http::Request::builder().method(method).uri(uri);
 
-    if let Some(token) = bearer_token {
-        let value = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|err| RpcError::InvalidTarget(format!("invalid bearer token: {err}")))?;
+    if let Some(token) = authorization {
+        let value = HeaderValue::from_str(&token)
+            .map_err(|err| TCError::bad_request(format!("invalid bearer token: {err}")))?;
         builder = builder.header(AUTHORIZATION, value);
     }
 
     builder
         .body(hyper::Body::from(body))
-        .map_err(|err| RpcError::InvalidTarget(err.to_string()))
+        .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
-fn append_txn_id(uri: &str, txn_id: TxnId) -> Result<String, RpcError> {
+fn encode_state_body(state: State) -> TCResult<Vec<u8>> {
+    use futures::TryStreamExt;
+
+    if matches!(state, State::None | State::Scalar(tc_ir::Scalar::Value(Value::None))) {
+        return Ok(Vec::new());
+    }
+
+    let stream = destream_json::encode(state)
+        .map_err(|err| TCError::bad_request(err.to_string()))?;
+    futures::executor::block_on(async move {
+        stream
+            .map_err(|err| std::io::Error::other(err.to_string()))
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await
+            .map_err(|err| TCError::bad_request(err.to_string()))
+    })
+}
+
+fn encode_params_body(params: Map<State>) -> TCResult<Vec<u8>> {
+    use futures::TryStreamExt;
+
+    let stream = destream_json::encode(params)
+        .map_err(|err| TCError::bad_request(err.to_string()))?;
+    futures::executor::block_on(async move {
+        stream
+            .map_err(|err| std::io::Error::other(err.to_string()))
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await
+            .map_err(|err| TCError::bad_request(err.to_string()))
+    })
+}
+
+fn encode_value_json(value: &Value) -> TCResult<String> {
+    use futures::TryStreamExt;
+
+    let stream = destream_json::encode(value.clone())
+        .map_err(|err| TCError::bad_request(err.to_string()))?;
+    let bytes = futures::executor::block_on(async move {
+        stream
+            .map_err(|err| std::io::Error::other(err.to_string()))
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await
+            .map_err(|err| TCError::bad_request(err.to_string()))
+    })?;
+
+    String::from_utf8(bytes).map_err(|err| TCError::bad_request(err.to_string()))
+}
+
+async fn decode_state_body(body: Bytes, txn: &crate::txn::TxnHandle) -> TCResult<State> {
+    use futures::stream;
+
+    if body.is_empty() || body.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(State::None);
+    }
+
+    let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body)]);
+    destream_json::try_decode(StateContext::from(txn.clone()), stream)
+        .await
+        .map_err(|err| TCError::bad_request(err.to_string()))
+}
+
+fn append_txn_id_and_key(uri: &str, txn_id: TxnId, key: &Value) -> TCResult<String> {
     let parsed: http::Uri = uri
         .parse()
-        .map_err(|err| RpcError::InvalidTarget(format!("invalid URI: {err}")))?;
+        .map_err(|err| TCError::bad_request(format!("invalid URI: {err}")))?;
 
     let path = parsed.path().to_string();
     let query = parsed.query().unwrap_or("").to_string();
@@ -138,7 +332,7 @@ fn append_txn_id(uri: &str, txn_id: TxnId) -> Result<String, RpcError> {
         .into_iter()
         .any(|(key, _)| key.eq_ignore_ascii_case("txn_id"))
     {
-        return Err(RpcError::InvalidTarget(
+        return Err(TCError::bad_request(
             "outbound targets must not include txn_id; it is supplied by the kernel".to_string(),
         ));
     }
@@ -148,6 +342,10 @@ fn append_txn_id(uri: &str, txn_id: TxnId) -> Result<String, RpcError> {
         serializer.append_pair(&key, &value);
     }
     serializer.append_pair("txn_id", &txn_id.to_string());
+    if !matches!(key, Value::None) {
+        let key_json = encode_value_json(key)?;
+        serializer.append_pair("key", &key_json);
+    }
     let query = serializer.finish();
 
     let mut parts = parsed.into_parts();
@@ -159,13 +357,26 @@ fn append_txn_id(uri: &str, txn_id: TxnId) -> Result<String, RpcError> {
 
     parts.path_and_query = Some(
         http::uri::PathAndQuery::from_maybe_shared(path_and_query)
-            .map_err(|err| RpcError::InvalidTarget(err.to_string()))?,
+            .map_err(|err| TCError::bad_request(err.to_string()))?,
     );
 
     let rebuilt =
-        http::Uri::from_parts(parts).map_err(|err| RpcError::InvalidTarget(err.to_string()))?;
+        http::Uri::from_parts(parts).map_err(|err| TCError::bad_request(err.to_string()))?;
 
     Ok(rebuilt.to_string())
+}
+
+fn tc_error_from_status(status: http::StatusCode, body: Bytes) -> TCError {
+    let message = String::from_utf8_lossy(&body).to_string();
+    match status {
+        http::StatusCode::BAD_REQUEST => TCError::bad_request(message),
+        http::StatusCode::UNAUTHORIZED => TCError::unauthorized(message),
+        http::StatusCode::NOT_FOUND => TCError::not_found(message),
+        http::StatusCode::CONFLICT => TCError::conflict(message),
+        http::StatusCode::METHOD_NOT_ALLOWED => TCError::method_not_allowed("request", message),
+        http::StatusCode::BAD_GATEWAY => TCError::bad_gateway(message),
+        _ => TCError::internal(message),
+    }
 }
 
 #[cfg(test)]
@@ -178,7 +389,8 @@ mod tests {
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0_u8; 32]);
 
         let uri = "http://localhost:8702/lib?foo=bar";
-        let updated = append_txn_id(uri, txn_id).expect("append txn_id");
+        let updated =
+            append_txn_id_and_key(uri, txn_id, &Value::None).expect("append txn_id");
         assert!(updated.contains("foo=bar"));
         assert!(updated.contains("txn_id="));
     }
@@ -188,11 +400,9 @@ mod tests {
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(2), 2).with_trace([0_u8; 32]);
 
         let uri = "http://localhost:8702/lib?txn_id=old&foo=bar";
-        let err = append_txn_id(uri, txn_id).expect_err("should reject existing txn_id");
-        match err {
-            RpcError::InvalidTarget(msg) => assert!(msg.contains("must not include txn_id")),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let err = append_txn_id_and_key(uri, txn_id, &Value::None)
+            .expect_err("should reject existing txn_id");
+        assert!(err.message().contains("must not include txn_id"));
     }
 
     #[test]
@@ -200,7 +410,7 @@ mod tests {
         let request = build_request(
             Method::Get,
             "http://localhost:8702/lib?txn_id=1".to_string(),
-            Some("abc.def"),
+            Some("Bearer abc.def".to_string()),
             Vec::new(),
         )
         .expect("request");
@@ -213,11 +423,7 @@ mod tests {
     fn rejects_finalize_to_non_root() {
         let err = validate_finalize_target("http://localhost:8702/lib/acme/foo/1.0.0/echo")
             .expect_err("should reject");
-
-        match err {
-            RpcError::InvalidTarget(msg) => assert!(msg.contains("component root")),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(err.message().contains("component root"));
     }
 
     #[test]

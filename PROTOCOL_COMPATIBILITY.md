@@ -59,22 +59,23 @@ touches additional components.
   mask includes `umask::USER_EXEC`. If the token also includes a `/txn/<txn_id>` claim with
   `umask::USER_WRITE` (a “lock” claim), it must match the same `(host, actor)` identity as the
   owner claim.
-- **Kernel-owned HTTP egress.** When routing a request to a remote host, the kernel constructs
-  outbound HTTP requests via its shared gateway so `?txn_id=...` and `Authorization: Bearer ...`
-  propagation is implemented once (not duplicated in adapters).
-- **Kernel-owned token verification/chaining hooks.** Adapters treat the bearer token as opaque and
-  forward it into the kernel. The kernel resolves a stable owner identity via its configured
-  `TokenVerifier` and uses the same hook to extend/chains tokens for outbound RPC as a transaction
-  touches additional components. The default verifier is currently opaque; signature verification
-  and claim-chain encoding are still pending. The `rjwt-token` feature enables an RJWT-backed
-  verifier (same bearer token format as v1) once the host can resolve actor keys:
+- **Transaction-owned HTTP egress.** When routing a request to a remote host, the transaction
+  context constructs outbound HTTP requests via its shared gateway so `?txn_id=...` and
+  `Authorization: Bearer ...` propagation is implemented once (not duplicated in adapters).
+- **Transaction-owned token verification/chaining hooks.** Adapters treat the bearer token as
+  opaque and forward it into the kernel. The transaction resolver resolves a stable owner identity
+  via its configured `TokenVerifier` and uses the same hook to extend/chains tokens for outbound
+  RPC as a transaction touches additional components. The default verifier is currently opaque;
+  signature verification and claim-chain encoding are still pending. The `rjwt-token` feature
+  enables an RJWT-backed verifier (same bearer token format as v1) once the host can resolve actor
+  keys:
   - in-process via an in-memory keyring resolver (`KeyringActorResolver`);
   - over HTTP (with `http-client`) via `RpcActorResolver`, which fetches actor public keys from the
     issuer host using `GET /host/public_key?key=<actor-id>` (response body is a JSON string
     containing base64-encoded Ed25519 public key bytes).
 - **Op references (partial).** The workspace includes a v1-shaped `tc_ir::OpRef` plus a minimal
-  executor (`tc_server::resolve`) which can run `TCRef::Op` via the kernel RPC gateway. Encoding
-  `OpRef` parameters into the on-the-wire scalar format is still in progress.
+  executor (`tc_server::resolve`) which can run `TCRef::Op` via the transaction-bound RPC gateway.
+  Encoding `OpRef` parameters into the on-the-wire scalar format is still in progress.
 - **Token chaining.** When the kernel routes a call into a library/service, it signs (or extends)
   the transaction token with the minimal claim required for that component and mode. As the
   transaction touches more components, the token accumulates one claim per participating
@@ -180,6 +181,7 @@ must match the URI segments exactly so HTTP, PyO3, and future adapters stay alig
 2. **Use `tc-server` as a minimal kernel crate.** When you want the TinyChain router primitives without the built-in HTTP/PyO3/WASM adapters, depend on `tc-server` with `default-features = false`. This exposes `Dir`, `Route`, `Handler`, `Transaction`, `Kernel`, and the `TxnManager`/`TxnHandle` pair while skipping optional transports. Re-enable adapters explicitly via `features = ["http-server"]`, `features = ["pyo3"]`, or `features = ["wasm"]` as needed for your embedding.
    - Use `features = ["http-client"]` when you need outbound HTTP proxying without compiling the HTTP server adapter.
    - Use `features = ["http-server"]` when you need the inbound HTTP server adapter.
+   - Treat `TxnHandle` as the transaction context; when the kernel binds it to a request it carries the RPC resolver, so `Scalar::Ref` can be resolved without threading a `Kernel` reference through handlers.
 
    **Minimal feature set (for bespoke, non-published hosts):**
    - `default-features = false` to drop adapter and Wasmtime dependencies.

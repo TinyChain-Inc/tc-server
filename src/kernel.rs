@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use futures::future::BoxFuture;
 use std::fmt;
@@ -61,6 +61,8 @@ pub struct Kernel<Request, Response> {
     library_module: Option<Arc<LibraryRuntime<Request, Response>>>,
     rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
+    #[cfg(feature = "rjwt-token")]
+    kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
 }
 
 impl<Request, Response> Kernel<Request, Response>
@@ -84,16 +86,16 @@ where
             return Some(handler.call(req));
         }
 
-        if path == "/service" || path.starts_with("/service/") {
+        if path == crate::uri::SERVICE_ROOT || path.starts_with("/service/") {
             return Some(self.service_handler.call(req));
         }
 
         match (method, path) {
-            (Method::Get, "/lib") => Some(self.lib_get_handler.call(req)),
-            (Method::Put, "/lib") => Some(self.lib_put_handler.call(req)),
+            (Method::Get, crate::uri::LIB_ROOT) => Some(self.lib_get_handler.call(req)),
+            (Method::Put, crate::uri::LIB_ROOT) => Some(self.lib_put_handler.call(req)),
             (Method::Get, "/host/metrics") => Some(self.kernel_handler.call(req)),
             (Method::Get, "/host/public_key") => Some(self.kernel_handler.call(req)),
-            (Method::Get, "/healthz") => Some(self.health_handler.call(req)),
+            (Method::Get, crate::uri::HEALTHZ) => Some(self.health_handler.call(req)),
             _ => None,
         }
     }
@@ -114,135 +116,22 @@ where
         &self.token_verifier
     }
 
-    pub fn resolve_op(
+    pub fn with_resolver(
         &self,
-        txn_id: TxnId,
-        bearer_token: Option<String>,
-        op: tc_ir::OpRef,
-    ) -> BoxFuture<'static, tc_error::TCResult<crate::gateway::RpcResponse>> {
-        use futures::FutureExt;
-        use tc_error::TCError;
+        handle: crate::txn::TxnHandle,
+    ) -> crate::txn::TxnHandle {
+        handle.with_resolver(self.build_txn_resolver())
+    }
 
-        let gateway = match self.rpc_gateway.as_ref() {
-            Some(gateway) => Arc::clone(gateway),
-            None => {
-                return futures::future::ready(Err(TCError::bad_gateway(
-                    "no RPC gateway configured",
-                )))
-                .boxed();
-            }
-        };
-
-        let module = match self.library_module.as_ref() {
-            Some(module) => Arc::clone(module),
-            None => {
-                return futures::future::ready(Err(TCError::unauthorized(
-                    "no library manifest loaded (egress is default-deny)",
-                )))
-                .boxed();
-            }
-        };
-
-        let egress = self.egress.clone();
-        let token_verifier = Arc::clone(&self.token_verifier);
-        let txn_manager = self.txn_manager.clone();
-        let txn_server = self.txn_server.clone();
-
-        async move {
-            fn encode_request_body(scalar: tc_ir::Scalar) -> Vec<u8> {
-                match scalar {
-                    tc_ir::Scalar::Value(tc_value::Value::None) => Vec::new(),
-                    tc_ir::Scalar::Value(tc_value::Value::String(s)) => {
-                        serde_json::to_vec(&s).unwrap_or_default()
-                    }
-                    tc_ir::Scalar::Value(tc_value::Value::Number(n)) => {
-                        // Without a serde-backed `Number` encoding in v2 staging, fall back to a
-                        // JSON string representation.
-                        serde_json::to_vec(&n.to_string()).unwrap_or_default()
-                    }
-                    // For now, only value payloads are forwarded as request bodies.
-                    tc_ir::Scalar::Ref(_) => Vec::new(),
-                }
-            }
-
-            let (method, target, body) = match op {
-                tc_ir::OpRef::Get((tc_ir::Subject::Link(link), key)) => {
-                    (Method::Get, link.to_string(), encode_request_body(key))
-                }
-                tc_ir::OpRef::Put((tc_ir::Subject::Link(link), _key, value)) => {
-                    (Method::Put, link.to_string(), encode_request_body(value))
-                }
-                tc_ir::OpRef::Post((tc_ir::Subject::Link(link), _params)) => {
-                    (Method::Post, link.to_string(), Vec::new())
-                }
-                tc_ir::OpRef::Delete((tc_ir::Subject::Link(link), key)) => {
-                    (Method::Delete, link.to_string(), encode_request_body(key))
-                }
-                _ => {
-                    return Err(TCError::bad_request(
-                        "cannot resolve OpRef subject Ref without a scope",
-                    ));
-                }
-            };
-
-            let bearer_token = match bearer_token {
-                Some(token) => {
-                    let ctx = token_verifier
-                        .verify(token)
-                        .await
-                        .map_err(|_| TCError::unauthorized("invalid bearer token"))?;
-
-                    let owner_id = if ctx.claims.is_empty() {
-                        ctx.owner_id.clone()
-                    } else {
-                        txn_owner_id_from_token(txn_id, &ctx)
-                            .map_err(|_| TCError::unauthorized("invalid bearer token"))?
-                    };
-
-                    match txn_manager.interpret_request(
-                        Some(txn_id),
-                        Some(&owner_id),
-                        Some(&ctx.bearer_token),
-                    ) {
-                        Ok(crate::txn::TxnFlow::Begin(handle))
-                        | Ok(crate::txn::TxnFlow::Use(handle)) => txn_server.touch(handle.id()),
-                        Err(crate::txn::TxnError::NotFound) => {
-                            return Err(TCError::bad_request("unknown transaction id"));
-                        }
-                        Err(crate::txn::TxnError::Unauthorized) => {
-                            return Err(TCError::unauthorized("unauthorized transaction owner"));
-                        }
-                    };
-
-                    let claim = token_claim_for_target(method, &target);
-                    let ctx = match claim {
-                        Some(claim) => {
-                            let _ = txn_manager.record_claim(&txn_id, claim.clone());
-                            token_verifier
-                                .grant(ctx, claim)
-                                .await
-                                .map_err(|_| TCError::unauthorized("invalid bearer token"))?
-                        }
-                        None => ctx,
-                    };
-
-                    Some(ctx.bearer_token)
-                }
-                None => txn_manager.bearer_token(&txn_id),
-            };
-
-            let schema = module.state().schema();
-            let resolved = egress.resolve_target(&schema, &target)?;
-
-            gateway
-                .request(method, resolved, txn_id, bearer_token, body)
-                .await
-                .map_err(|err| match err {
-                    crate::gateway::RpcError::InvalidTarget(msg) => TCError::bad_request(msg),
-                    crate::gateway::RpcError::Transport(msg) => TCError::bad_gateway(msg),
-                })
-        }
-        .boxed()
+    fn build_txn_resolver(&self) -> Arc<dyn crate::gateway::RpcGateway> {
+        Arc::new(KernelTxnResolver {
+            gateway: self.rpc_gateway.as_ref().map(Arc::clone),
+            library_state: self.library_module.as_ref().map(|module| module.state()),
+            egress: self.egress.clone(),
+            token_verifier: Arc::clone(&self.token_verifier),
+            txn_manager: self.txn_manager.clone(),
+            txn_server: self.txn_server.clone(),
+        })
     }
 
     pub fn expire_transactions(&self) -> Vec<TxnId> {
@@ -277,22 +166,44 @@ where
 
         let path = normalize_path(path);
 
-        if path == "/healthz" || path == "/host" || path.starts_with("/host/") {
+        if path == crate::uri::HEALTHZ
+            || path == crate::uri::HOST_ROOT
+            || path.starts_with("/host/")
+        {
             return Ok(dispatch_or_not_found(self.dispatch(method, path, req)));
         }
 
         let is_component_root =
             component_root(path).is_some_and(|component_root| component_root == path);
-        let (owner_id, bearer_token) = match (txn_id, token) {
+        let (owner_id, bearer_token, claims) = match (txn_id, token) {
             (Some(txn_id), Some(token)) if !token.claims.is_empty() => {
-                let owner_id = txn_owner_id_from_token(txn_id, token)?;
-                (Some(owner_id), Some(token.bearer_token.to_string()))
+                let owner_id = crate::txn::owner_id_from_token(txn_id, token)?;
+                let claims = token
+                    .claims
+                    .iter()
+                    .map(|(_, _, claim)| claim.clone())
+                    .collect::<Vec<_>>();
+                (Some(owner_id), Some(token.bearer_token.to_string()), Some(claims))
             }
-            (_, Some(token)) => (
-                Some(token.owner_id.to_string()),
-                Some(token.bearer_token.to_string()),
-            ),
-            _ => (None, None),
+            (_, Some(token)) => {
+                let claims = if token.claims.is_empty() {
+                    None
+                } else {
+                    Some(
+                        token
+                            .claims
+                            .iter()
+                            .map(|(_, _, claim)| claim.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                (
+                    Some(token.owner_id.to_string()),
+                    Some(token.bearer_token.to_string()),
+                    claims,
+                )
+            }
+            _ => (None, None, None),
         };
         let owner_id = owner_id.as_deref();
         let bearer_token = bearer_token.as_deref();
@@ -305,6 +216,25 @@ where
             let handle = self
                 .txn_manager
                 .get_with_owner(&txn_id.expect("txn_id checked above"), owner_id)?;
+
+            let required = match method {
+                Method::Post => umask::USER_EXEC,
+                Method::Delete => umask::USER_WRITE,
+                _ => umask::Mode::new(),
+            };
+            let handle = match claims {
+                Some(claims) => handle.with_claims(claims),
+                None => handle,
+            };
+            if bearer_token.is_none() {
+                return Err(crate::txn::TxnError::Unauthorized);
+            }
+
+            let txn_link = pathlink::Link::from_str(&format!("/txn/{}", handle.id()))
+                .map_err(|_| crate::txn::TxnError::Unauthorized)?;
+            if !handle.has_claim(&txn_link, required) {
+                return Err(crate::txn::TxnError::Unauthorized);
+            }
 
             self.txn_server.forget(&handle.id());
 
@@ -324,11 +254,29 @@ where
         let dispatch = match flow {
             TxnFlow::Begin(handle) => {
                 self.txn_server.touch(handle.id());
+                let handle = if let Some(claims) = &claims {
+                    for claim in claims {
+                        let _ = self.txn_manager.record_claim(&handle.id(), claim.clone());
+                    }
+                    handle.with_claims(claims.clone())
+                } else {
+                    handle
+                };
+                let handle = self.with_resolver(handle);
                 bind_txn(&handle, &mut req);
                 dispatch_or_not_found(self.dispatch(method, path, req))
             }
             TxnFlow::Use(handle) => {
                 self.txn_server.touch(handle.id());
+                let handle = if let Some(claims) = &claims {
+                    for claim in claims {
+                        let _ = self.txn_manager.record_claim(&handle.id(), claim.clone());
+                    }
+                    handle.with_claims(claims.clone())
+                } else {
+                    handle
+                };
+                let handle = self.with_resolver(handle);
                 bind_txn(&handle, &mut req);
                 dispatch_or_not_found(self.dispatch(method, path, req))
             }
@@ -355,59 +303,6 @@ fn token_claim_for_target(method: Method, target: &str) -> Option<tc_ir::Claim> 
     Some(tc_ir::Claim::new(link, mask))
 }
 
-fn txn_owner_id_from_token(
-    txn_id: TxnId,
-    token: &crate::auth::TokenContext,
-) -> Result<String, crate::txn::TxnError> {
-    use std::str::FromStr;
-
-    let txn_link = format!("/txn/{txn_id}");
-    let txn_link =
-        pathlink::Link::from_str(&txn_link).map_err(|_| crate::txn::TxnError::Unauthorized)?;
-
-    let mut owner: Option<(&str, &str)> = None;
-    let mut lock: Option<(&str, &str)> = None;
-
-    for (host, actor_id, claim) in &token.claims {
-        if claim.link != txn_link {
-            if claim.link.to_string().starts_with("/txn/") {
-                return Err(crate::txn::TxnError::Unauthorized);
-            }
-            continue;
-        }
-
-        if claim.mask.has(umask::USER_EXEC) {
-            if owner.is_some() {
-                return Err(crate::txn::TxnError::Unauthorized);
-            }
-            owner = Some((host.as_str(), actor_id.as_str()));
-        }
-
-        if claim.mask.has(umask::USER_WRITE) {
-            if lock.is_some() {
-                return Err(crate::txn::TxnError::Unauthorized);
-            }
-            lock = Some((host.as_str(), actor_id.as_str()));
-        }
-    }
-
-    if let Some(lock) = lock {
-        if let Some(owner) = owner {
-            if owner != lock {
-                return Err(crate::txn::TxnError::Unauthorized);
-            }
-        } else {
-            return Err(crate::txn::TxnError::Unauthorized);
-        }
-    }
-
-    let Some((host, actor_id)) = owner else {
-        return Err(crate::txn::TxnError::Unauthorized);
-    };
-
-    Ok(format!("{host}::{actor_id}"))
-}
-
 fn dispatch_or_not_found<Response>(
     fut: Option<BoxFuture<'static, Response>>,
 ) -> KernelDispatch<Response> {
@@ -424,6 +319,166 @@ pub enum KernelDispatch<Response> {
         result: Result<(), crate::txn::TxnError>,
     },
     NotFound,
+}
+
+#[derive(Clone)]
+struct KernelTxnResolver {
+    gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
+    library_state: Option<crate::library::LibraryState>,
+    egress: EgressPolicy,
+    token_verifier: Arc<dyn crate::auth::TokenVerifier>,
+    txn_manager: crate::txn::TxnManager,
+    txn_server: TxnServer,
+}
+
+impl KernelTxnResolver {
+    async fn prepare_outbound(
+        &self,
+        method: Method,
+        target: &pathlink::Link,
+        txn: &crate::txn::TxnHandle,
+    ) -> tc_error::TCResult<(pathlink::Link, crate::txn::TxnHandle)> {
+        let target_str = target.to_string();
+        let library_state = self.library_state.clone().ok_or_else(|| {
+            tc_error::TCError::unauthorized(
+                "no library manifest loaded (egress is default-deny)",
+            )
+        })?;
+
+        let bearer_token = match txn.raw_token() {
+            Some(token) => {
+                let ctx = self
+                    .token_verifier
+                    .verify(token.to_string())
+                    .await
+                    .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
+
+                let owner_id = if ctx.claims.is_empty() {
+                    ctx.owner_id.clone()
+                } else {
+                    crate::txn::owner_id_from_token(txn.id(), &ctx)
+                        .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?
+                };
+
+                match self.txn_manager.interpret_request(
+                    Some(txn.id()),
+                    Some(&owner_id),
+                    Some(&ctx.bearer_token),
+                ) {
+                    Ok(crate::txn::TxnFlow::Begin(handle))
+                    | Ok(crate::txn::TxnFlow::Use(handle)) => {
+                        self.txn_server.touch(handle.id())
+                    }
+                    Err(crate::txn::TxnError::NotFound) => {
+                        return Err(tc_error::TCError::bad_request("unknown transaction id"));
+                    }
+                    Err(crate::txn::TxnError::Unauthorized) => {
+                        return Err(tc_error::TCError::unauthorized(
+                            "unauthorized transaction owner",
+                        ));
+                    }
+                };
+
+                let claim = token_claim_for_target(method, &target_str);
+                let ctx = match claim {
+                    Some(claim) => {
+                        let _ = self.txn_manager.record_claim(&txn.id(), claim.clone());
+                        self.token_verifier
+                            .grant(ctx, claim)
+                            .await
+                            .map_err(|_| tc_error::TCError::unauthorized(
+                                "invalid bearer token",
+                            ))?
+                    }
+                    None => ctx,
+                };
+
+                Some(ctx.bearer_token)
+            }
+            None => None,
+        };
+
+        let schema = library_state.schema();
+        let resolved = self.egress.resolve_target(&schema, &target_str)?;
+        let resolved = pathlink::Link::from_str(&resolved)
+            .map_err(|err| tc_error::TCError::bad_request(err.to_string()))?;
+        let outbound_txn = match bearer_token {
+            Some(token) => txn.with_bearer_token(token),
+            None => txn.clone(),
+        };
+        Ok((resolved, outbound_txn))
+    }
+}
+
+impl crate::gateway::RpcGateway for KernelTxnResolver {
+    fn get(
+        &self,
+        target: pathlink::Link,
+        txn: crate::txn::TxnHandle,
+        key: tc_value::Value,
+    ) -> BoxFuture<'static, tc_error::TCResult<tc_state::State>> {
+        let resolver = self.clone();
+        Box::pin(async move {
+            let gateway = resolver.gateway.clone().ok_or_else(|| {
+                tc_error::TCError::bad_gateway("no RPC gateway configured")
+            })?;
+            let (resolved, outbound_txn) =
+                resolver.prepare_outbound(Method::Get, &target, &txn).await?;
+            gateway.get(resolved, outbound_txn, key).await
+        })
+    }
+
+    fn put(
+        &self,
+        target: pathlink::Link,
+        txn: crate::txn::TxnHandle,
+        key: tc_value::Value,
+        value: tc_state::State,
+    ) -> BoxFuture<'static, tc_error::TCResult<()>> {
+        let resolver = self.clone();
+        Box::pin(async move {
+            let gateway = resolver.gateway.clone().ok_or_else(|| {
+                tc_error::TCError::bad_gateway("no RPC gateway configured")
+            })?;
+            let (resolved, outbound_txn) =
+                resolver.prepare_outbound(Method::Put, &target, &txn).await?;
+            gateway.put(resolved, outbound_txn, key, value).await
+        })
+    }
+
+    fn post(
+        &self,
+        target: pathlink::Link,
+        txn: crate::txn::TxnHandle,
+        params: tc_ir::Map<tc_state::State>,
+    ) -> BoxFuture<'static, tc_error::TCResult<tc_state::State>> {
+        let resolver = self.clone();
+        Box::pin(async move {
+            let gateway = resolver.gateway.clone().ok_or_else(|| {
+                tc_error::TCError::bad_gateway("no RPC gateway configured")
+            })?;
+            let (resolved, outbound_txn) =
+                resolver.prepare_outbound(Method::Post, &target, &txn).await?;
+            gateway.post(resolved, outbound_txn, params).await
+        })
+    }
+
+    fn delete(
+        &self,
+        target: pathlink::Link,
+        txn: crate::txn::TxnHandle,
+        key: tc_value::Value,
+    ) -> BoxFuture<'static, tc_error::TCResult<()>> {
+        let resolver = self.clone();
+        Box::pin(async move {
+            let gateway = resolver.gateway.clone().ok_or_else(|| {
+                tc_error::TCError::bad_gateway("no RPC gateway configured")
+            })?;
+            let (resolved, outbound_txn) =
+                resolver.prepare_outbound(Method::Delete, &target, &txn).await?;
+            gateway.delete(resolved, outbound_txn, key).await
+        })
+    }
 }
 
 impl<Request, Response> Clone for Kernel<Request, Response>
@@ -445,6 +500,8 @@ where
             library_module: self.library_module.as_ref().map(Arc::clone),
             rpc_gateway: self.rpc_gateway.as_ref().map(Arc::clone),
             token_verifier: Arc::clone(&self.token_verifier),
+            #[cfg(feature = "rjwt-token")]
+            kernel_actor: self.kernel_actor.clone(),
         }
     }
 }
@@ -462,6 +519,8 @@ pub struct KernelBuilder<Request, Response> {
     library_module: Option<Arc<LibraryRuntime<Request, Response>>>,
     rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
+    #[cfg(feature = "rjwt-token")]
+    kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
 }
 
 impl<Request: Send + 'static, Response: Send + 'static> Default
@@ -481,6 +540,8 @@ impl<Request: Send + 'static, Response: Send + 'static> Default
             library_module: None,
             rpc_gateway: None,
             token_verifier: crate::auth::default_token_verifier(),
+            #[cfg(feature = "rjwt-token")]
+            kernel_actor: None,
         }
     }
 }
@@ -551,12 +612,14 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
     }
 
     pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
-        self.txn_manager = crate::txn::TxnManager::with_host_id(host_id.into());
+        let ttl = self.txn_manager.ttl();
+        self.txn_manager = crate::txn::TxnManager::with_host_id_and_ttl(host_id.into(), ttl);
         self
     }
 
     pub fn with_txn_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.txn_server = TxnServer::new(ttl);
+        self.txn_manager.set_ttl(ttl);
         self
     }
 
@@ -587,6 +650,16 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
         V: crate::auth::TokenVerifier,
     {
         self.token_verifier = Arc::new(verifier);
+        self
+    }
+
+    #[cfg(feature = "rjwt-token")]
+    pub fn with_kernel_actor(
+        mut self,
+        host: pathlink::Link,
+        actor: crate::auth::Actor,
+    ) -> Self {
+        self.kernel_actor = Some((host, actor));
         self
     }
 
@@ -641,6 +714,8 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
             library_module: self.library_module,
             rpc_gateway: self.rpc_gateway,
             token_verifier: self.token_verifier,
+            #[cfg(feature = "rjwt-token")]
+            kernel_actor: self.kernel_actor,
         }
     }
 }
@@ -661,6 +736,7 @@ mod tests {
     use futures::FutureExt;
     use std::sync::{Arc, Mutex};
     use tc_ir::{LibrarySchema, NetworkTime};
+    use crate::resolve::Resolve;
 
     fn ok_handler() -> impl KernelHandler<(), ()> {
         |_req: ()| async {}.boxed()
@@ -829,29 +905,83 @@ mod tests {
         assert!(!kernel.txn_server().contains(&txn_id));
     }
 
+    #[test]
+    fn finalize_requires_txn_claim_in_token() {
+        let kernel: Kernel<(), ()> = Kernel::builder().with_lib_handler(ok_handler()).finish();
+
+        let begin = kernel.route_request(
+            Method::Get,
+            "/lib",
+            (),
+            None,
+            true,
+            None,
+            |_txn, _req| {},
+        );
+        assert!(begin.is_ok());
+
+        let pending = kernel.txn_manager().pending_ids();
+        assert_eq!(pending.len(), 1);
+        let txn_id = pending[0];
+
+        let token = crate::auth::TokenContext::new("owner-a", "bearer-a");
+        let finalize = kernel.route_request(
+            Method::Post,
+            "/lib",
+            (),
+            Some(txn_id),
+            true,
+            Some(&token),
+            |_txn, _req| {},
+        );
+
+        assert!(matches!(finalize, Err(crate::txn::TxnError::Unauthorized)));
+    }
+
     #[derive(Clone, Default)]
     struct MockGateway {
-        calls: Arc<Mutex<Vec<String>>>,
+        calls: Arc<Mutex<Vec<pathlink::Link>>>,
     }
 
     impl crate::gateway::RpcGateway for MockGateway {
-        fn request(
+        fn get(
             &self,
-            _method: Method,
-            uri: String,
-            _txn_id: TxnId,
-            _bearer_token: Option<String>,
-            _body: Vec<u8>,
-        ) -> BoxFuture<'static, Result<crate::gateway::RpcResponse, crate::gateway::RpcError>>
-        {
+            uri: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            _key: tc_value::Value,
+        ) -> BoxFuture<'static, tc_error::TCResult<tc_state::State>> {
             self.calls.lock().expect("calls lock").push(uri);
             Box::pin(async move {
-                Ok(crate::gateway::RpcResponse {
-                    status: 200,
-                    headers: vec![],
-                    body: vec![],
-                })
+                Ok(tc_state::State::None)
             })
+        }
+
+        fn put(
+            &self,
+            _uri: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            _key: tc_value::Value,
+            _value: tc_state::State,
+        ) -> BoxFuture<'static, tc_error::TCResult<()>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn post(
+            &self,
+            _uri: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            _params: tc_ir::Map<tc_state::State>,
+        ) -> BoxFuture<'static, tc_error::TCResult<tc_state::State>> {
+            Box::pin(async move { Ok(tc_state::State::None) })
+        }
+
+        fn delete(
+            &self,
+            _uri: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            _key: tc_value::Value,
+        ) -> BoxFuture<'static, tc_error::TCResult<()>> {
+            Box::pin(async move { Ok(()) })
         }
     }
 
@@ -876,14 +1006,147 @@ mod tests {
             .with_rpc_gateway(gateway)
             .finish();
 
-        let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0; 32]);
         let op = tc_ir::OpRef::Get((
             tc_ir::Subject::Link("http://127.0.0.1:1234/lib".parse().expect("link")),
             tc_ir::Scalar::default(),
         ));
 
-        let err = futures::executor::block_on(kernel.resolve_op(txn_id, None, op))
+        let txn = kernel.with_resolver(kernel.txn_manager().begin());
+        let err = futures::executor::block_on(op.resolve(&txn))
             .expect_err("expected unauthorized");
         assert_eq!(err.code(), tc_error::ErrorKind::Unauthorized);
+    }
+
+    #[test]
+    fn resolves_scalar_ref_using_txn_context() {
+        use tc_ir::{OpRef, Scalar, Subject, TCRef};
+        use tc_state::State;
+        use tc_value::Value;
+
+        type GatewayCall = (Method, pathlink::Link, Option<Value>);
+
+        #[derive(Clone)]
+        struct RecordingGateway {
+            calls: Arc<Mutex<Vec<GatewayCall>>>,
+            responses: Arc<Mutex<Vec<State>>>,
+        }
+
+        impl RecordingGateway {
+            fn new(responses: Vec<State>) -> Self {
+                Self {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    responses: Arc::new(Mutex::new(responses)),
+                }
+            }
+        }
+
+        impl crate::gateway::RpcGateway for RecordingGateway {
+            fn get(
+                &self,
+            uri: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            key: Value,
+        ) -> BoxFuture<'static, tc_error::TCResult<State>> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push((Method::Get, uri, Some(key)));
+
+                let response = self
+                    .responses
+                    .lock()
+                    .expect("responses lock")
+                    .remove(0);
+
+                Box::pin(async move { Ok(response) })
+            }
+
+            fn put(
+                &self,
+            _uri: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            _key: Value,
+            _value: State,
+            ) -> BoxFuture<'static, tc_error::TCResult<()>> {
+                Box::pin(async move { Ok(()) })
+            }
+
+            fn post(
+                &self,
+            _uri: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            _params: tc_ir::Map<State>,
+            ) -> BoxFuture<'static, tc_error::TCResult<State>> {
+                Box::pin(async move { Ok(State::None) })
+            }
+
+            fn delete(
+                &self,
+            _uri: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            _key: Value,
+            ) -> BoxFuture<'static, tc_error::TCResult<()>> {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        let schema = LibrarySchema::new(
+            "/lib/example-devco/example/1.0.0"
+                .parse()
+                .expect("schema id"),
+            "1.0.0",
+            vec!["/lib/example-devco/example/1.0.0"
+                .parse()
+                .expect("dependency root")],
+        );
+
+        let module = Arc::new(crate::library::LibraryRuntime::new(
+            schema, None, None, None,
+        ));
+        let handlers = crate::library::LibraryHandlers::without_route(ok_handler(), ok_handler());
+
+        let gateway = RecordingGateway::new(vec![
+            State::from(Value::from("key")),
+            State::from(Value::from("ok")),
+        ]);
+
+        let kernel: Kernel<(), ()> = Kernel::builder()
+            .with_library_module(module, handlers)
+            .with_dependency_route("/lib/example-devco/example/1.0.0", "127.0.0.1:1234")
+            .with_rpc_gateway(gateway.clone())
+            .finish();
+
+        let txn = kernel.with_resolver(kernel.txn_manager().begin());
+
+        let inner_op = OpRef::Get((
+            Subject::Link(
+                "http://127.0.0.1:1234/lib/example-devco/example/1.0.0/key"
+                    .parse()
+                    .expect("inner link"),
+            ),
+            Scalar::default(),
+        ));
+
+        let outer_op = OpRef::Get((
+            Subject::Link(
+                "http://127.0.0.1:1234/lib/example-devco/example/1.0.0/value"
+                    .parse()
+                    .expect("outer link"),
+            ),
+            Scalar::Ref(Box::new(TCRef::Op(inner_op))),
+        ));
+
+        let response =
+            futures::executor::block_on(outer_op.resolve(&txn))
+                .expect("resolve op");
+
+        assert!(matches!(
+            response,
+            State::Scalar(Scalar::Value(Value::String(ref s))) if s == "ok"
+        ));
+
+        let calls = gateway.calls.lock().expect("calls lock");
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(calls[1].2, Some(Value::String(ref s)) if s == "key"));
     }
 }

@@ -50,6 +50,9 @@ Keep the following rules in mind whenever you extend the server:
 * There is exactly one transaction semantics implementation. Do not duplicate any part of the
   claim, token chaining, begin/continue, commit, or rollback logic in adapters; they only parse
   transport cues and delegate to the kernel.
+* **Single finalize path.** Commit/rollback/finalize must flow through the kernel transaction
+  layer (no adapter-specific finalize code paths), and any new entry point must reuse the same
+  authorization checks.
 * Ownership flows exactly as in TinyChain `host`:
   - Missing `txn_id` ⇒ kernel begins a transaction and returns a handle.
   - Subsequent calls include `?txn_id=...` and the kernel reuses the pending
@@ -80,6 +83,8 @@ Keep the following rules in mind whenever you extend the server:
     canonical path by host configuration/registry rules (avoid blacklist filtering).
 * Enforce this uniformly across HTTP and PyO3: both adapters must route outbound calls through the
   same kernel gateway so dependency checks and token chaining cannot be bypassed.
+* **Single egress path.** Outbound network access must flow through the kernel RPC gateway so
+  dependency and token checks are enforced once; adapters must not introduce parallel egress code.
 
 ## When extending tc-server
 

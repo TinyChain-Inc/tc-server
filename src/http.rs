@@ -257,7 +257,9 @@ impl Service<Request<Body>> for KernelService {
 
             let bearer = parse_bearer_token(&req);
             let inbound_txn_id = txn_id;
+            let inbound_bearer = bearer.clone();
             let mut minted_txn_id: Option<TxnId> = None;
+            let mut minted_token: Option<String> = None;
             let token = match bearer {
                 Some(token) => match kernel.token_verifier().verify(token).await {
                     Ok(token) => Some(token),
@@ -283,8 +285,10 @@ impl Service<Request<Body>> for KernelService {
                 token.as_ref(),
                 |handle, req| {
                     minted_txn_id = Some(handle.id());
+                    if inbound_bearer.is_none() {
+                        minted_token = handle.raw_token().map(str::to_string);
+                    }
                     req.extensions_mut().insert(handle.clone());
-                    req.extensions_mut().insert(kernel.clone());
                 },
             ) {
                 Ok(KernelDispatch::Response(resp)) => {
@@ -294,6 +298,11 @@ impl Service<Request<Body>> for KernelService {
                         && let Ok(value) = HeaderValue::from_str(&txn_id.to_string())
                     {
                         response.headers_mut().insert("x-tc-txn-id", value);
+                        if let Some(token) = minted_token
+                            && let Ok(value) = HeaderValue::from_str(&token)
+                        {
+                            response.headers_mut().insert("x-tc-bearer-token", value);
+                        }
                     }
 
                     Ok(response)
@@ -415,6 +424,25 @@ pub fn host_handler_with_public_keys(
 
                     let Some(actor_id) = key else {
                         return bad_request_response("missing key query parameter");
+                    };
+                    let actor_id = match serde_json::from_str::<String>(&actor_id) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            use futures::stream;
+                            use tc_value::Value;
+
+                            let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(
+                                Bytes::copy_from_slice(actor_id.as_bytes()),
+                            )]);
+                            match destream_json::try_decode((), stream).await {
+                                Ok(Value::String(value)) => value,
+                                _ => {
+                                    return bad_request_response(
+                                        "invalid key query parameter",
+                                    )
+                                }
+                            }
+                        }
                     };
 
                     let Some(public_key) = keys.public_key(&actor_id) else {
@@ -729,6 +757,9 @@ mod tests {
     use pathlink::Link;
     use std::str::FromStr;
     use tc_ir::{HandleDelete, HandleGet, HandlePost, HandlePut, LibraryModule, tc_library_routes};
+    use crate::resolve::Resolve;
+    use crate::auth::TokenVerifier;
+    use tc_ir::TxnId;
 
     fn ok_handler() -> impl crate::KernelHandler<Request<Body>, Response<Body>> {
         move |_req: Request<Body>| {
@@ -743,7 +774,15 @@ mod tests {
     }
 
     fn kernel_with_lib_handler() -> HttpKernel {
-        build_http_kernel(ok_handler(), ok_handler(), ok_handler())
+        Kernel::builder()
+            .with_lib_handler(ok_handler())
+            .with_lib_put_handler(ok_handler())
+            .with_lib_route_handler(ok_handler())
+            .with_service_handler(ok_handler())
+            .with_kernel_handler(ok_handler())
+            .with_health_handler(ok_handler())
+            .with_token_verifier(TestTokenVerifier)
+            .finish()
     }
 
     fn kernel_with_ok_routing() -> HttpKernel {
@@ -754,7 +793,37 @@ mod tests {
             .with_service_handler(ok_handler())
             .with_kernel_handler(ok_handler())
             .with_health_handler(ok_handler())
+            .with_token_verifier(TestTokenVerifier)
             .finish()
+    }
+
+    #[derive(Clone)]
+    struct TestTokenVerifier;
+
+    impl TokenVerifier for TestTokenVerifier {
+        fn verify(
+            &self,
+            bearer_token: String,
+        ) -> futures::future::BoxFuture<'static, Result<crate::auth::TokenContext, crate::txn::TxnError>>
+        {
+            use std::str::FromStr;
+
+            let mut parts = bearer_token.splitn(2, '|');
+            let actor_id = parts.next().unwrap_or_default().to_string();
+            let owner_id = format!("/host::{actor_id}");
+            let txn_id = parts.next().and_then(|part| TxnId::from_str(part).ok());
+
+            let mut ctx = crate::auth::TokenContext::new(owner_id.clone(), bearer_token);
+            if let Some(txn_id) = txn_id {
+                let claim = tc_ir::Claim::new(
+                    Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim link"),
+                    umask::USER_EXEC | umask::USER_WRITE,
+                );
+                ctx.claims.push(("/host".to_string(), actor_id, claim));
+            }
+
+            futures::future::ready(Ok(ctx)).boxed()
+        }
     }
 
     #[tokio::test]
@@ -766,6 +835,7 @@ mod tests {
         let request = Request::builder()
             .method("GET")
             .uri("/lib")
+            .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
             .body(Body::empty())
             .expect("begin request");
 
@@ -779,6 +849,10 @@ mod tests {
         let commit_request = Request::builder()
             .method("POST")
             .uri(format!("/lib?txn_id={txn_id_value}"))
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer owner-a|{txn_id_value}"),
+            )
             .body(Body::empty())
             .expect("commit request");
 
@@ -789,11 +863,68 @@ mod tests {
         let retry_commit = Request::builder()
             .method("POST")
             .uri(format!("/lib?txn_id={txn_id_value}"))
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer owner-a|{txn_id_value}"),
+            )
             .body(Body::empty())
             .expect("repeat commit");
 
         let retry_response = service.call(retry_commit).await.expect("repeat response");
         assert_eq!(retry_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn returns_bearer_token_for_anonymous_txn() {
+        let kernel: HttpKernel = Kernel::builder()
+            .with_lib_handler(ok_handler())
+            .with_lib_put_handler(ok_handler())
+            .with_lib_route_handler(ok_handler())
+            .with_service_handler(ok_handler())
+            .with_kernel_handler(ok_handler())
+            .with_health_handler(ok_handler())
+            .finish();
+
+        let mut service = KernelService::new(kernel);
+
+        let begin = Request::builder()
+            .method("GET")
+            .uri("/lib")
+            .body(Body::empty())
+            .expect("begin request");
+
+        let response = service.call(begin).await.expect("begin response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let txn_id = response
+            .headers()
+            .get("x-tc-txn-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("missing x-tc-txn-id header");
+        let bearer = response
+            .headers()
+            .get("x-tc-bearer-token")
+            .and_then(|value| value.to_str().ok())
+            .expect("missing x-tc-bearer-token header");
+
+        let commit = Request::builder()
+            .method("POST")
+            .uri(format!("/lib?txn_id={txn_id}"))
+            .body(Body::empty())
+            .expect("commit request");
+
+        let commit_response = service.call(commit).await.expect("commit response");
+        assert_eq!(commit_response.status(), StatusCode::UNAUTHORIZED);
+
+        let commit = Request::builder()
+            .method("POST")
+            .uri(format!("/lib?txn_id={txn_id}"))
+            .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .expect("commit request with bearer");
+
+        let commit_response = service.call(commit).await.expect("commit response");
+        assert_eq!(commit_response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -836,6 +967,7 @@ mod tests {
         let begin = Request::builder()
             .method("GET")
             .uri("/lib")
+            .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
             .body(Body::empty())
             .expect("begin request");
 
@@ -849,6 +981,10 @@ mod tests {
         let non_root_commit = Request::builder()
             .method("POST")
             .uri(format!("/lib/hello?txn_id={txn_id_value}"))
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer owner-a|{txn_id_value}"),
+            )
             .body(Body::empty())
             .expect("non-root commit request");
 
@@ -862,6 +998,10 @@ mod tests {
         let root_commit = Request::builder()
             .method("POST")
             .uri(format!("/lib?txn_id={txn_id_value}"))
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer owner-a|{txn_id_value}"),
+            )
             .body(Body::empty())
             .expect("root commit request");
 
@@ -882,6 +1022,7 @@ mod tests {
         let begin = Request::builder()
             .method("GET")
             .uri("/lib")
+            .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
             .body(Body::empty())
             .expect("begin request");
 
@@ -895,6 +1036,10 @@ mod tests {
         let non_root = Request::builder()
             .method("POST")
             .uri(format!("/lib/acme/foo/1.0.0/echo?txn_id={txn_id_value}"))
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer owner-a|{txn_id_value}"),
+            )
             .body(Body::empty())
             .expect("non-root request");
 
@@ -905,6 +1050,10 @@ mod tests {
         let root = Request::builder()
             .method("POST")
             .uri(format!("/lib/acme/foo/1.0.0?txn_id={txn_id_value}"))
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer owner-a|{txn_id_value}"),
+            )
             .body(Body::empty())
             .expect("root request");
 
@@ -915,6 +1064,7 @@ mod tests {
         let begin = Request::builder()
             .method("GET")
             .uri("/service")
+            .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
             .body(Body::empty())
             .expect("service begin request");
 
@@ -930,6 +1080,10 @@ mod tests {
             .uri(format!(
                 "/service/acme/ns/foo/1.0.0/echo?txn_id={txn_id_value}"
             ))
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer owner-a|{txn_id_value}"),
+            )
             .body(Body::empty())
             .expect("service non-root request");
 
@@ -943,6 +1097,10 @@ mod tests {
         let root = Request::builder()
             .method("DELETE")
             .uri(format!("/service/acme/ns/foo/1.0.0?txn_id={txn_id_value}"))
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer owner-a|{txn_id_value}"),
+            )
             .body(Body::empty())
             .expect("service root request");
 
@@ -983,20 +1141,27 @@ mod tests {
             }]
         });
 
-        let install_request = Request::builder()
+        let mut install_request = Request::builder()
             .method("PUT")
             .uri("/lib")
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Body::from(install_payload.to_string()))
             .expect("install request");
+        let install_claim = tc_ir::Claim::new(
+            Link::from_str("/lib/example-devco/example/0.1.0").expect("install link"),
+            umask::USER_WRITE,
+        );
+        let install_txn = remote_kernel
+            .txn_manager()
+            .begin()
+            .with_claims(vec![install_claim]);
+        install_request.extensions_mut().insert(install_txn);
 
         let install_response = remote_kernel
             .dispatch(Method::Put, "/lib", install_request)
             .expect("install handler")
             .await;
         assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
-
-        let txn_id = remote_kernel.txn_manager().begin().id();
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
@@ -1023,17 +1188,18 @@ mod tests {
             .with_http_rpc_gateway()
             .finish();
 
+        let txn = local_kernel.with_resolver(remote_kernel.txn_manager().begin());
+
         let link =
             Link::from_str("/lib/example-devco/example/0.1.0/hello").expect("op link");
         let op = OpRef::Get((tc_ir::Subject::Link(link), tc_ir::Scalar::default()));
 
-        let response = local_kernel
-            .resolve_op(txn_id, None, op)
-            .await
-            .expect("resolve response");
+        let response = op.resolve(&txn).await.expect("resolve response");
 
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"\"hello\"");
+        assert!(matches!(
+            response,
+            crate::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::String(ref s))) if s == "hello"
+        ));
 
         server_task.abort();
     }
@@ -1204,7 +1370,8 @@ mod tests {
 
         let gateway: std::sync::Arc<dyn crate::gateway::RpcGateway> =
             std::sync::Arc::new(crate::http_client::HttpRpcGateway::new());
-        let resolver = crate::auth::RpcActorResolver::new(gateway, txn_id);
+        let txn = crate::txn::TxnManager::with_host_id("tc-http-host-keys").begin();
+        let resolver = crate::auth::RpcActorResolver::new(gateway, txn);
         let verifier = crate::auth::RjwtTokenVerifier::new(std::sync::Arc::new(resolver));
         let ctx = verifier
             .verify(signed.into_jwt())

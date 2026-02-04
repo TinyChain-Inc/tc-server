@@ -34,7 +34,7 @@ impl HandleGet<TxnHandle> for HelloHandler {
                 other => format!("{other:?}"),
             };
 
-            Ok(Value::String(format!("Hello, {name}!").into()))
+            Ok(Value::String(format!("Hello, {name}!")))
         }))
     }
 }

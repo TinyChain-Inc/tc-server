@@ -15,7 +15,8 @@ behavior of the upstream `host` crate.
 - **Continue:** Subsequent requests to transactional endpoints include `?txn_id=<id>` in the URI.
   The dispatcher
   loads the pending transaction, verifies the same `Authorization: Bearer ...` owner token (when
-  present), and stores the `TxnHandle` (plus parsed body state) in the request extensions before
+  present), and stores the `TxnHandle` (including its resolver context, plus parsed body state)
+  in the request extensions before
   invoking the kernel handler. A previously-unseen `?txn_id=...` is only accepted when a bearer
   token is present, so the kernel can pin transaction ownership before executing any handler.
 - **Finalize:** Sending an *empty* `POST` to the **canonical component root** with
@@ -144,7 +145,21 @@ only forward `txn_id`, request metadata, and an opaque bearer token.
    - When a txn expires, force rollback and delete its workspace state (idempotently).
    - Keep GC host-local and default-deny; it must not depend on any global registry.
    - v2 status: a minimal in-memory TTL tracker exists (`tc-server/src/txn_server.rs`); txfs
-     workspace cleanup is deferred until txfs is integrated.
+   workspace cleanup is deferred until txfs is integrated.
+
+7. **Harden txn ergonomics + permission checks (v1 parity).**
+   - Distinguish “system” vs “user” transactions (explicit constructors) so external callers
+     cannot mint ownerless or privileged txns by accident.
+   - Keep bearer tokens kernel-private; adapters only pass opaque strings and never expose them
+     via public `TxnHandle` accessors or Debug output.
+   - Add `TxnHandle` permission helpers (e.g., `has_permission`) backed by signed token claims,
+     including an explicit “anonymous” token with zero permissions.
+   - Enforce claim invariants in one place (kernel/txn), not per-adapter; add tests for invalid
+     owner/lock shapes and anonymous-deny behavior.
+   - Require explicit token/anonymous handling at adapter boundaries (no silent fallbacks).
+   - Gate commit/rollback on ownership/lock claims in the kernel’s finalize path (single source).
+   - Use URI builder helpers consistently (avoid hardcoded `/service`/`/lib` strings in tests/docs).
+   - Ensure internal install APIs are either gated by txn claims or clearly marked internal-only.
 
 ### HTTP verb coverage (`GET`/`PUT`/`POST`/`DELETE`)
 
@@ -161,8 +176,9 @@ Plan:
 2. **Mirror the v1 `Gateway` boundary.** Model the v2 “request executor” interface as
    `get/put/post/delete` so that local dispatch and remote HTTP proxying share one verb surface.
    - v2 status: a minimal op executor exists (`tc-server/src/resolve.rs`) which can execute
-     `tc_ir::TCRef::Op` via the kernel’s configured RPC gateway and egress gate (`Kernel::resolve_op`).
-     Payload encoding for `OpRef` parameters is still pending while the scalar/container IR surface is stabilized.
+     `tc_ir::TCRef::Op` via a transaction-bound resolver (the transaction context holds the RPC
+     gateway, egress policy, and token chaining logic). Payload encoding for `OpRef` parameters
+     is still pending while the scalar/container IR surface is stabilized.
 3. **Add minimal routing tests.** Add HTTP tests which verify that a library route can receive
    a non-`GET` request (e.g., `POST /lib/<...>/<route>`), and that a service route under
    `/service/...` is reachable with all four verbs (even if the handler returns

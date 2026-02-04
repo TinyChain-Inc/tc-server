@@ -11,6 +11,9 @@ use crate::KernelHandler;
 #[cfg(any(feature = "http-server", feature = "pyo3"))]
 use crate::library::{RouteMetadata, SchemaRoutes};
 
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
+use crate::resolve::Resolve;
+
 #[cfg(feature = "http-server")]
 use {
     crate::txn::TxnHandle,
@@ -392,7 +395,11 @@ mod http_tests {
         });
 
         let txn_manager = TxnManager::with_host_id("tc-wasm-test");
-        let txn = txn_manager.begin();
+        let install_claim = Claim::new(
+            Link::from_str("/lib/example-devco/example/0.1.0").expect("install link"),
+            umask::USER_WRITE,
+        );
+        let txn = txn_manager.begin().with_claims(vec![install_claim]);
 
         let mut install_request = Request::builder()
             .method("PUT")
@@ -649,11 +656,20 @@ mod http_tests {
             }]
         });
 
-        let install_request_b = Request::builder()
+        let mut install_request_b = Request::builder()
             .method("PUT")
             .uri("/lib")
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Body::from(install_payload_b.to_string()))?;
+        let install_claim_b = Claim::new(
+            Link::from_str(b_root)?,
+            umask::USER_WRITE,
+        );
+        let install_txn_b = b_kernel
+            .txn_manager()
+            .begin()
+            .with_claims(vec![install_claim_b]);
+        install_request_b.extensions_mut().insert(install_txn_b);
 
         let install_response_b = b_kernel
             .dispatch(Method::Put, "/lib", install_request_b)
@@ -716,11 +732,20 @@ mod http_tests {
             }]
         });
 
-        let install_request_a = Request::builder()
+        let mut install_request_a = Request::builder()
             .method("PUT")
             .uri("/lib")
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Body::from(install_payload_a.to_string()))?;
+        let install_claim_a = Claim::new(
+            Link::from_str(a_root)?,
+            umask::USER_WRITE,
+        );
+        let install_txn_a = a_kernel
+            .txn_manager()
+            .begin()
+            .with_claims(vec![install_claim_a]);
+        install_request_a.extensions_mut().insert(install_txn_a);
 
         let install_response_a = a_kernel
             .dispatch(Method::Put, "/lib", install_request_a)
@@ -747,7 +772,10 @@ mod http_tests {
         let response = Client::new().request(request).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = body::to_bytes(response.into_body()).await?;
-        assert_eq!(body.as_ref(), b"\"hello\"");
+        assert_eq!(
+            body.as_ref(),
+            br#"{"/state/scalar/value/string":"hello"}"#
+        );
 
         a_task.abort();
         b_task.abort();
@@ -806,11 +834,10 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request<Body>) ->
         Ok(header) => header,
         Err(err) => return error_response(err),
     };
-
-    let kernel = req
-        .extensions()
-        .get::<crate::Kernel<Request<Body>, Response<Body>>>()
-        .cloned();
+    let txn = match req.extensions().get::<TxnHandle>().cloned() {
+        Some(txn) => txn,
+        None => return error_response(TCError::internal("missing transaction handle")),
+    };
 
     let body = match body::to_bytes(req.into_body()).await {
         Ok(bytes) => bytes.to_vec(),
@@ -831,8 +858,8 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request<Body>) ->
 
         let normalized = if schema_rel.is_empty() {
             normalized
-        } else if normalized.starts_with(schema_rel) {
-            &normalized[schema_rel.len()..]
+        } else if let Some(normalized) = normalized.strip_prefix(schema_rel) {
+            normalized
         } else {
             return not_found(&path);
         };
@@ -848,13 +875,11 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request<Body>) ->
     match result {
         Ok(bytes) => {
             // If the WASM route returns a TinyChain ref envelope (`TCRef` or `OpRef`) as JSON,
-            // resolve it within the current transaction and return the resolved RPC response.
-            if let Some(kernel) = kernel
-                && let Some(r) = try_decode_wasm_ref(&bytes).await
-            {
+            // resolve it within the current transaction and return the resolved state.
+            if let Some(r) = try_decode_wasm_ref(&bytes).await {
                 match r {
-                    tc_ir::TCRef::Op(op) => match kernel.resolve_op(header.id(), None, op).await {
-                        Ok(rpc) => return rpc_response(rpc),
+                    tc_ir::TCRef::Op(op) => match op.resolve(&txn).await {
+                        Ok(state) => return state_response(state),
                         Err(err) => return error_response(err),
                     },
                 }
@@ -943,21 +968,19 @@ where
 }
 
 #[cfg(feature = "http-server")]
-fn rpc_response(rpc: crate::gateway::RpcResponse) -> Response<Body> {
-    let status = StatusCode::from_u16(rpc.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut builder = Response::builder().status(status);
+fn state_response(state: tc_state::State) -> Response<Body> {
+    use futures::TryStreamExt;
 
-    for (name, value) in rpc.headers {
-        if let Ok(name) = hyper::header::HeaderName::from_str(&name)
-            && let Ok(value) = hyper::header::HeaderValue::from_str(&value)
-        {
-            if let Some(headers) = builder.headers_mut() {
-                headers.insert(name, value);
-            }
-        }
+    match destream_json::encode(state) {
+        Ok(stream) => Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Body::wrap_stream(
+                stream.map_err(|err| std::io::Error::other(err.to_string())),
+            ))
+            .unwrap(),
+        Err(err) => error_response(TCError::internal(err.to_string())),
     }
-
-    builder.body(Body::from(rpc.body)).unwrap()
 }
 
 #[cfg(feature = "pyo3")]
@@ -1025,9 +1048,6 @@ async fn py_handle_route(
         return Ok(PyKernelResponse::new(404, None, None));
     };
 
-    let kernel = req.kernel();
-    let bearer_token = crate::pyo3_runtime::py_bearer_token(&req);
-
     let result = {
         let mut guard = wasm.lock().await;
         let schema_id = guard.schema().id().to_string();
@@ -1035,8 +1055,8 @@ async fn py_handle_route(
 
         let normalized = if schema_rel.is_empty() {
             normalized
-        } else if normalized.starts_with(schema_rel) {
-            &normalized[schema_rel.len()..]
+        } else if let Some(normalized) = normalized.strip_prefix(schema_rel) {
+            normalized
         } else {
             return Ok(PyKernelResponse::new(404, None, None));
         };
@@ -1051,30 +1071,23 @@ async fn py_handle_route(
         Ok(bytes) => {
             // Match the HTTP adapter behavior: if the WASM route returns a TinyChain ref envelope
             // (`TCRef`/`OpRef`) as JSON, resolve it within the current transaction and return the
-            // resolved RPC response.
-            if let Some(kernel) = kernel
-                && let Some(r) = try_decode_wasm_ref(&bytes).await
-            {
+            // resolved state.
+            if let Some(r) = try_decode_wasm_ref(&bytes).await {
                 match r {
-                    tc_ir::TCRef::Op(op) => match kernel
-                        .resolve_op(txn.id(), bearer_token.clone(), op)
-                        .await
-                    {
-                        Ok(rpc) => {
+                    tc_ir::TCRef::Op(op) => match op.resolve(&txn).await {
+                        Ok(state) => {
                             return Python::with_gil(|py| {
-                                let body = if rpc.body.is_empty() {
+                                let body_bytes =
+                                    crate::pyo3_runtime::encode_state_to_bytes(state)?;
+                                let body = if body_bytes.is_empty() {
                                     None
                                 } else {
                                     Some(crate::pyo3_runtime::PyStateHandle::new(
-                                        pyo3::types::PyBytes::new_bound(py, &rpc.body).into_py(py),
+                                        pyo3::types::PyBytes::new_bound(py, &body_bytes).into_py(py),
                                     ))
                                 };
 
-                                Ok(PyKernelResponse::new(
-                                    rpc.status,
-                                    Some(rpc.headers),
-                                    body,
-                                ))
+                                Ok(PyKernelResponse::new(200, None, body))
                             });
                         }
                         Err(err) => return Err(PyValueError::new_err(err.message().to_string())),

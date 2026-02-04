@@ -1,3 +1,8 @@
+pub(crate) const LIB_ROOT: &str = "/lib";
+pub(crate) const SERVICE_ROOT: &str = "/service";
+pub(crate) const HOST_ROOT: &str = "/host";
+pub(crate) const HEALTHZ: &str = "/healthz";
+
 pub(crate) fn normalize_path(path: &str) -> &str {
     if path.len() > 1 {
         path.trim_end_matches('/')
@@ -9,20 +14,20 @@ pub(crate) fn normalize_path(path: &str) -> &str {
 pub(crate) fn component_root(path: &str) -> Option<&str> {
     let path = normalize_path(path);
 
-    if path == "/lib" {
+    if path == LIB_ROOT {
         return Some(path);
     }
 
-    if path == "/service" {
+    if path == SERVICE_ROOT {
         return Some(path);
     }
 
     if path.starts_with("/lib/") {
-        return component_root_with_segments(path, 4).or(Some("/lib"));
+        return component_root_with_segments(path, 4).or(Some(LIB_ROOT));
     }
 
     if path.starts_with("/service/") {
-        return component_root_with_segments(path, 5).or(Some("/service"));
+        return component_root_with_segments(path, 5).or(Some(SERVICE_ROOT));
     }
 
     None

@@ -1,59 +1,116 @@
-use futures::{FutureExt, future::BoxFuture};
-use tc_ir::{OpRef, Subject, TCRef, TxnId};
+use futures::future::BoxFuture;
+use tc_error::{TCError, TCResult};
+use tc_ir::{Map, OpRef, Subject, TCRef};
+use tc_state::State;
+use tc_value::Value;
 
-use crate::{
-    Method,
-    gateway::{RpcError, RpcGateway, RpcResponse},
-};
+use crate::gateway::RpcGateway;
 
 pub trait Resolve: Send + Sync + 'static {
-    fn resolve_op(
+    fn resolve(
         &self,
-        txn_id: TxnId,
-        bearer_token: Option<String>,
-        op: OpRef,
-    ) -> BoxFuture<'static, Result<RpcResponse, RpcError>>;
+        txn: &crate::txn::TxnHandle,
+    ) -> BoxFuture<'static, TCResult<State>>;
+}
 
-    fn resolve_ref(
+impl Resolve for OpRef {
+    fn resolve(
         &self,
-        txn_id: TxnId,
-        bearer_token: Option<String>,
-        r: TCRef,
-    ) -> BoxFuture<'static, Result<RpcResponse, RpcError>> {
-        match r {
-            TCRef::Op(op) => self.resolve_op(txn_id, bearer_token, op),
+        txn: &crate::txn::TxnHandle,
+    ) -> BoxFuture<'static, TCResult<State>> {
+        let txn = txn.clone();
+        let op = self.clone();
+        Box::pin(async move {
+            match op {
+                OpRef::Get((Subject::Link(link), key)) => {
+                    let key = scalar_to_value(&txn, key).await?;
+                    txn.get(link, txn.clone(), key).await
+                }
+                OpRef::Put((Subject::Link(link), key, value)) => {
+                    let key = scalar_to_value(&txn, key).await?;
+                    let body = scalar_to_state(&txn, value).await?;
+                    txn.put(link, txn.clone(), key, body)
+                        .await
+                        .map(|()| State::default())
+                }
+                OpRef::Post((Subject::Link(link), _params)) => {
+                    let params = resolve_params(&txn, _params).await?;
+                    txn.post(link, txn.clone(), params).await
+                }
+                OpRef::Delete((Subject::Link(link), key)) => {
+                    let key = scalar_to_value(&txn, key).await?;
+                    txn.delete(link, txn.clone(), key)
+                        .await
+                        .map(|()| State::default())
+                }
+                OpRef::Get((Subject::Ref(_, _), _))
+                | OpRef::Put((Subject::Ref(_, _), _, _))
+                | OpRef::Post((Subject::Ref(_, _), _))
+                | OpRef::Delete((Subject::Ref(_, _), _)) => {
+                    Err(TCError::bad_request(
+                        "cannot resolve OpRef subject Ref without a scope",
+                    ))
+                }
+            }
+        })
+    }
+}
+
+impl Resolve for TCRef {
+    fn resolve(
+        &self,
+        txn: &crate::txn::TxnHandle,
+    ) -> BoxFuture<'static, TCResult<State>> {
+        match self {
+            TCRef::Op(op) => op.resolve(txn),
         }
     }
 }
 
-impl<G> Resolve for G
-where
-    G: RpcGateway + ?Sized,
-{
-    fn resolve_op(
-        &self,
-        txn_id: TxnId,
-        bearer_token: Option<String>,
-        op: OpRef,
-    ) -> BoxFuture<'static, Result<RpcResponse, RpcError>> {
-        let (method, uri) = match op {
-            OpRef::Get((Subject::Link(link), _key)) => (Method::Get, link.to_string()),
-            OpRef::Put((Subject::Link(link), _key, _value)) => (Method::Put, link.to_string()),
-            OpRef::Post((Subject::Link(link), _params)) => (Method::Post, link.to_string()),
-            OpRef::Delete((Subject::Link(link), _key)) => (Method::Delete, link.to_string()),
-            OpRef::Get((Subject::Ref(_, _), _))
-            | OpRef::Put((Subject::Ref(_, _), _, _))
-            | OpRef::Post((Subject::Ref(_, _), _))
-            | OpRef::Delete((Subject::Ref(_, _), _)) => {
-                return futures::future::ready(Err(RpcError::InvalidTarget(
-                    "cannot resolve OpRef subject Ref without a scope".to_string(),
-                )))
-                .boxed();
+async fn scalar_to_value(
+    txn: &crate::txn::TxnHandle,
+    scalar: tc_ir::Scalar,
+) -> TCResult<Value> {
+    match scalar {
+        tc_ir::Scalar::Value(value) => Ok(value),
+        tc_ir::Scalar::Ref(r) => {
+            let response = r.resolve(txn).await?;
+            match response {
+                State::None => Ok(Value::None),
+                State::Scalar(tc_ir::Scalar::Value(value)) => Ok(value),
+                State::Scalar(tc_ir::Scalar::Ref(_)) => Err(TCError::bad_request(
+                    "resolved ref returned scalar ref; expected value".to_string(),
+                )),
+                _ => Err(TCError::bad_request(
+                    "resolved ref returned non-scalar state".to_string(),
+                )),
             }
-        };
-
-        self.request(method, uri, txn_id, bearer_token, Vec::new())
+        }
     }
+}
+
+async fn scalar_to_state(
+    txn: &crate::txn::TxnHandle,
+    scalar: tc_ir::Scalar,
+) -> TCResult<State> {
+    match scalar {
+        tc_ir::Scalar::Value(value) => Ok(State::from(value)),
+        tc_ir::Scalar::Ref(r) => {
+            r.resolve(txn).await
+        }
+    }
+}
+
+async fn resolve_params(
+    txn: &crate::txn::TxnHandle,
+    params: Map<tc_ir::Scalar>,
+) -> TCResult<Map<State>> {
+    let mut resolved = Map::new();
+    for (key, value) in params {
+        let value = scalar_to_state(txn, value).await?;
+        resolved.insert(key, value);
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -61,61 +118,79 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use std::sync::{Arc, Mutex};
-    use tc_ir::NetworkTime;
+    use tc_state::State;
+    use tc_value::Value;
 
-    type GatewayCall = (Method, String, TxnId, Option<String>, Vec<u8>);
+    type GatewayCall = (pathlink::Link, crate::txn::TxnHandle, Value);
 
     #[derive(Clone, Default)]
     struct MockGateway {
         calls: Arc<Mutex<Vec<GatewayCall>>>,
     }
 
-    impl RpcGateway for MockGateway {
-        fn request(
+    impl crate::gateway::RpcGateway for MockGateway {
+        fn get(
             &self,
-            method: Method,
-            uri: String,
-            txn_id: TxnId,
-            bearer_token: Option<String>,
-            body: Vec<u8>,
-        ) -> BoxFuture<'static, Result<RpcResponse, RpcError>> {
+            target: pathlink::Link,
+            txn: crate::txn::TxnHandle,
+            key: Value,
+        ) -> BoxFuture<'static, TCResult<State>> {
             self.calls
                 .lock()
                 .expect("calls lock")
-                .push((method, uri, txn_id, bearer_token, body));
-            futures::future::ready(Ok(RpcResponse {
-                status: 200,
-                headers: vec![],
-                body: vec![],
-            }))
-            .boxed()
+                .push((target, txn, key));
+            futures::future::ready(Ok(State::None)).boxed()
+        }
+
+        fn put(
+            &self,
+            _target: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            _key: Value,
+            _value: State,
+        ) -> BoxFuture<'static, TCResult<()>> {
+            futures::future::ready(Ok(())).boxed()
+        }
+
+        fn post(
+            &self,
+            _target: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            _params: Map<State>,
+        ) -> BoxFuture<'static, TCResult<State>> {
+            futures::future::ready(Ok(State::None)).boxed()
+        }
+
+        fn delete(
+            &self,
+            _target: pathlink::Link,
+            _txn: crate::txn::TxnHandle,
+            _key: Value,
+        ) -> BoxFuture<'static, TCResult<()>> {
+            futures::future::ready(Ok(())).boxed()
         }
     }
 
     #[test]
     fn resolves_opref_via_gateway() {
         let gateway = MockGateway::default();
-        let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0; 32]);
-
         let op = OpRef::Get((
             Subject::Link("/lib/acme/foo/1.0.0".parse().expect("link")),
             tc_ir::Scalar::Value(tc_value::Value::None),
         ));
 
-        futures::executor::block_on((&gateway as &dyn RpcGateway).resolve_op(
-            txn_id,
-            Some("tok".into()),
-            op,
-        ))
-        .expect("resolve");
+        let txn = crate::txn::TxnManager::with_host_id("test-host")
+            .begin_with_owner(Some("owner"), Some("tok"));
+        let txn = txn.with_resolver(Arc::new(gateway.clone()));
+
+        futures::executor::block_on(op.resolve(&txn)).expect("resolve");
 
         let calls = gateway.calls.lock().expect("calls lock").clone();
         assert_eq!(calls.len(), 1);
-        let (method, uri, id, token, body) = &calls[0];
-        assert_eq!(*method, Method::Get);
-        assert_eq!(uri, "/lib/acme/foo/1.0.0");
-        assert_eq!(*id, txn_id);
-        assert_eq!(token.as_deref(), Some("tok"));
-        assert!(body.is_empty());
+        let (uri, txn_call, key) = &calls[0];
+        assert_eq!(uri.to_string(), "/lib/acme/foo/1.0.0");
+        assert_eq!(txn_call.id(), txn.id());
+        assert_eq!(txn_call.authorization_header(), Some("Bearer tok".to_string()));
+        assert_eq!(key, &Value::None);
     }
 }

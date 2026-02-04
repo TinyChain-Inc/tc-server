@@ -14,6 +14,7 @@ use url::form_urlencoded;
 
 use crate::{
     Kernel, KernelDispatch, KernelHandler, Method, State,
+    resolve::Resolve,
     library::{
         InstallError, InstallRequest, LibraryHandlers, LibraryRouteFactory, LibraryRoutes,
         LibraryRuntime, LibraryState, decode_install_request_bytes,
@@ -171,6 +172,8 @@ pub struct PyKernelRequest {
     headers: Vec<(String, String)>,
     body: Option<PyStateHandle>,
     txn: Option<crate::txn::TxnHandle>,
+    // Retained for future Python adapter hooks; kept in-sync with the HTTP kernel path.
+    #[allow(dead_code)]
     kernel: Option<Arc<PyKernel>>,
 }
 
@@ -241,10 +244,14 @@ impl PyKernelRequest {
         self.txn.clone()
     }
 
+    // Reserved for upcoming Python adapter integration; not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn bind_kernel(&mut self, kernel: Arc<PyKernel>) {
         self.kernel = Some(kernel);
     }
 
+    // Reserved for upcoming Python adapter integration; not wired yet.
+    #[allow(dead_code)]
     pub(crate) fn kernel(&self) -> Option<Arc<PyKernel>> {
         self.kernel.clone()
     }
@@ -545,6 +552,7 @@ impl KernelHandle {
                 .begin_with_owner(Some(&token.owner_id), Some(&token.bearer_token)),
             None => self.txn_manager.begin(),
         };
+        let txn = self.inner.with_resolver(txn_handle.clone());
         let txn_id = txn_handle.id();
 
         let scalar = if let Some(body) = body.clone() {
@@ -563,7 +571,7 @@ impl KernelHandle {
             scalar,
         ));
 
-        let resolved = self.block_on(self.inner.resolve_op(txn_id, bearer_token.clone(), op));
+        let resolved = self.block_on(op.resolve(&txn));
 
         let rollback_op = OpRef::Delete((
             Subject::Link(
@@ -574,22 +582,30 @@ impl KernelHandle {
         ));
 
         let response = match resolved {
-            Ok(response) => Python::with_gil(|py| {
-                let body = if response.body.is_empty() {
+            Ok(state) => Python::with_gil(|py| {
+                let body_bytes = encode_state_to_bytes(state)?;
+                let body = if body_bytes.is_empty() {
                     None
                 } else {
                     Some(PyStateHandle::new(
-                        PyBytes::new_bound(py, &response.body).into_py(py),
+                        PyBytes::new_bound(py, &body_bytes).into_py(py),
                     ))
                 };
 
-                Ok(PyKernelResponse::new(
-                    response.status,
-                    Some(response.headers),
-                    body,
-                ))
+                Ok(PyKernelResponse::new(200, None, body))
             }),
             Err(err) if err.message().starts_with("no egress route for ") => {
+                let local_token = match token.as_ref() {
+                    Some(token) => Some(token.clone()),
+                    None => match txn_handle.raw_token() {
+                        Some(raw) => Some(
+                            self.block_on(self.inner.token_verifier().verify(raw.to_string()))
+                                .map_err(|_| PyValueError::new_err("invalid bearer token"))?,
+                        ),
+                        None => None,
+                    },
+                };
+
                 // If this target is not routed for egress, fall back to local dispatch within the
                 // same transaction and still rollback afterwards. This keeps per-call ergonomics
                 // stable: a GET either hits a local installed handler or routes through the RPC
@@ -609,10 +625,9 @@ impl KernelHandle {
                     request,
                     Some(txn_id),
                     true,
-                    token.as_ref(),
+                    local_token.as_ref(),
                     |handle, req| {
                         req.bind_txn_handle(handle.clone());
-                        req.bind_kernel(Arc::clone(&self.inner));
                     },
                 ) {
                     Ok(KernelDispatch::Response(resp)) => self.block_on(resp),
@@ -630,7 +645,7 @@ impl KernelHandle {
             Err(err) => Err(PyValueError::new_err(err.message().to_string())),
         };
 
-    let _ = self.block_on(self.inner.resolve_op(txn_id, bearer_token, rollback_op));
+    let _ = self.block_on(rollback_op.resolve(&txn));
     let _ = self.txn_manager.rollback(txn_id);
 
     response
@@ -642,6 +657,7 @@ impl KernelHandle {
         let (route_path, txn_id) = parse_path_and_txn_id(&raw_path)?;
         let body_is_none = py_body_is_none(request.body());
         let bearer = py_bearer_token(&request);
+        let inbound_bearer = bearer.clone();
         let token = match bearer {
             Some(token) => Some(
                 self.block_on(self.inner.token_verifier().verify(token))
@@ -651,6 +667,7 @@ impl KernelHandle {
         };
         let inbound_txn_id = txn_id;
         let mut minted_txn_id: Option<TxnId> = None;
+        let mut minted_token: Option<String> = None;
 
         match self.inner.route_request(
             method,
@@ -661,8 +678,10 @@ impl KernelHandle {
             token.as_ref(),
             |handle, req| {
                 minted_txn_id = Some(handle.id());
+                if inbound_bearer.is_none() {
+                    minted_token = handle.raw_token().map(str::to_string);
+                }
                 req.bind_txn_handle(handle.clone());
-                req.bind_kernel(Arc::clone(&self.inner));
             },
         ) {
             Ok(KernelDispatch::Response(resp)) => {
@@ -673,6 +692,11 @@ impl KernelHandle {
                     response
                         .headers
                         .push(("x-tc-txn-id".to_string(), txn_id.to_string()));
+                    if let Some(token) = minted_token {
+                        response
+                            .headers
+                            .push(("x-tc-bearer-token".to_string(), token));
+                    }
                 }
                 Ok(response)
             }
@@ -997,7 +1021,7 @@ mod tests {
             .with_health_handler(ok_py_handler())
             .finish();
 
-        let txn_id = remote_kernel.txn_manager().begin().id();
+        let txn = local_kernel.with_resolver(remote_kernel.txn_manager().begin());
         let op = OpRef::Get((
             tc_ir::Subject::Link(
                 Link::from_str("/lib/example-devco/example/0.1.0/hello").unwrap(),
@@ -1005,13 +1029,12 @@ mod tests {
             tc_ir::Scalar::default(),
         ));
 
-        let response = local_kernel
-            .resolve_op(txn_id, None, op)
-            .await
-            .expect("resolve response");
+        let state = op.resolve(&txn).await.expect("resolve response");
 
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"\"hello\"");
+        assert!(matches!(
+            state,
+            tc_state::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::String(ref s))) if s == "hello"
+        ));
 
         server_task.abort();
     }
@@ -1038,16 +1061,13 @@ mod tests {
             .with_health_handler(ok_py_handler())
             .finish();
 
-        let txn_id = local_kernel.txn_manager().begin().id();
+        let txn = local_kernel.with_resolver(local_kernel.txn_manager().begin());
         let op = OpRef::Get((
             tc_ir::Subject::Link(Link::from_str("/service").unwrap()),
             tc_ir::Scalar::default(),
         ));
 
-        let err = local_kernel
-            .resolve_op(txn_id, None, op)
-            .await
-            .expect_err("unauthorized");
+        let err = op.resolve(&txn).await.expect_err("unauthorized");
 
         assert_eq!(err.code(), tc_error::ErrorKind::Unauthorized);
     }
@@ -1232,7 +1252,7 @@ fn try_extract_state(any: &Bound<'_, PyAny>) -> PyResult<Option<State>> {
     }
 }
 
-fn encode_state_to_bytes(state: State) -> PyResult<Vec<u8>> {
+pub(crate) fn encode_state_to_bytes(state: State) -> PyResult<Vec<u8>> {
     match state {
         State::None | State::Scalar(Scalar::Value(Value::None)) => Ok(Vec::new()),
         other => encode_state_via_destream(other),
