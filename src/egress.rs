@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 
 use tc_error::TCError;
 use tc_ir::LibrarySchema;
@@ -38,10 +39,10 @@ impl EgressPolicy {
     pub fn route_dependency(
         &mut self,
         dependency_root: impl Into<String>,
-        authority: impl Into<String>,
+        authority: SocketAddr,
     ) {
         let dependency_root = dependency_root.into();
-        let authority = authority.into();
+        let authority = authority.to_string();
         let rule = self.deps.entry(dependency_root).or_default();
 
         rule.default_authority = Some(authority.clone());

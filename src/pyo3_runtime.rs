@@ -497,6 +497,9 @@ impl KernelHandle {
         authority: &str,
         data_dir: Option<PathBuf>,
     ) -> PyResult<Self> {
+        let authority = authority
+            .parse()
+            .map_err(|_| PyValueError::new_err("invalid dependency route authority"))?;
         let schema = decode_schema_from_json(schema_json)?;
         let storage = data_dir.map(LibraryDir::new);
         let module = http_library::build_http_library_module(schema, storage);
@@ -524,6 +527,9 @@ impl KernelHandle {
     ) -> PyResult<Self> {
         use std::str::FromStr;
 
+        let authority = authority
+            .parse()
+            .map_err(|_| PyValueError::new_err("invalid dependency route authority"))?;
         let schema = decode_schema_from_json(schema_json)?;
         let storage = data_dir.map(LibraryDir::new);
         let module = http_library::build_http_library_module(schema, storage);
@@ -1194,7 +1200,7 @@ mod tests {
         let local_kernel: PyKernel = crate::Kernel::builder()
             .with_host_id("tc-py-local")
             .with_library_module(local_module, local_handlers)
-            .with_dependency_route(dependency_root, addr.to_string())
+            .with_dependency_route(dependency_root, addr)
             .with_http_rpc_gateway()
             .with_service_handler(ok_py_handler())
             .with_kernel_handler(ok_py_handler())
@@ -1246,7 +1252,7 @@ mod tests {
         let local_kernel: PyKernel = crate::Kernel::builder()
             .with_host_id("tc-py-local")
             .with_library_module(local_module, local_handlers)
-            .with_dependency_route("/lib", "127.0.0.1:1")
+            .with_dependency_route("/lib", "127.0.0.1:1".parse().expect("addr"))
             .with_http_rpc_gateway()
             .with_service_handler(ok_py_handler())
             .with_kernel_handler(ok_py_handler())

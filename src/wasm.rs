@@ -696,7 +696,7 @@ mod http_tests {
         let a_kernel = Kernel::builder()
             .with_host_id("tc-http-a")
             .with_library_module(a_module, a_handlers)
-            .with_dependency_route(b_root, b_addr.to_string())
+            .with_dependency_route(b_root, b_addr)
             .with_http_rpc_gateway()
             .with_service_handler(|_req| async { Response::new(Body::empty()) })
             .with_kernel_handler(|_req| async { Response::new(Body::empty()) })

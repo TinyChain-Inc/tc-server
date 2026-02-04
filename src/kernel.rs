@@ -622,7 +622,7 @@ impl KernelBuilder {
     pub fn with_dependency_route(
         mut self,
         dependency_root: impl Into<String>,
-        authority: impl Into<String>,
+        authority: std::net::SocketAddr,
     ) -> Self {
         self.egress.route_dependency(dependency_root, authority);
         self
@@ -995,7 +995,7 @@ mod tests {
 
         let kernel = Kernel::builder()
             .with_library_module(module, handlers)
-            .with_dependency_route("/lib", "127.0.0.1:1234")
+            .with_dependency_route("/lib", "127.0.0.1:1234".parse().expect("addr"))
             .with_rpc_gateway(gateway)
             .finish();
 
@@ -1105,7 +1105,10 @@ mod tests {
 
         let kernel = Kernel::builder()
             .with_library_module(module, handlers)
-            .with_dependency_route("/lib/example-devco/example/1.0.0", "127.0.0.1:1234")
+            .with_dependency_route(
+                "/lib/example-devco/example/1.0.0",
+                "127.0.0.1:1234".parse().expect("addr"),
+            )
             .with_rpc_gateway(gateway.clone())
             .finish();
 

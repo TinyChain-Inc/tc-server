@@ -1208,7 +1208,7 @@ mod tests {
 
         let local_kernel: HttpKernel = crate::Kernel::builder()
             .with_library_module(module, handlers)
-            .with_dependency_route("/lib/example-devco/example/0.1.0", addr.to_string())
+            .with_dependency_route("/lib/example-devco/example/0.1.0", addr)
             .with_http_rpc_gateway()
             .finish();
 
