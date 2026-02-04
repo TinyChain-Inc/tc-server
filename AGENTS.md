@@ -53,6 +53,11 @@ Keep the following rules in mind whenever you extend the server:
 * **Single finalize path.** Commit/rollback/finalize must flow through the kernel transaction
   layer (no adapter-specific finalize code paths), and any new entry point must reuse the same
   authorization checks.
+* **Single transaction trait.** The only transaction trait lives in `tc-ir::Transaction`. Do not
+  introduce adapter- or crate-specific transaction traits or context structs.
+* **State decoding context.** `tc-state` decodes against `Arc<dyn tc_ir::Transaction>`. Adapters
+  must pass the active `TxnHandle` (or a null transaction) instead of inventing ad-hoc decode
+  contexts or parsing JSON manually.
 * Ownership flows exactly as in TinyChain `host`:
   - Missing `txn_id` ⇒ kernel begins a transaction and returns a handle.
   - Subsequent calls include `?txn_id=...` and the kernel reuses the pending

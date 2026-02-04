@@ -1,5 +1,4 @@
 use std::sync::Arc;
-
 use tc_ir::Claim;
 
 use crate::txn::TxnError;
@@ -45,6 +44,23 @@ impl TokenContext {
     }
 }
 
+impl<T> TokenVerifier for Arc<T>
+where
+    T: TokenVerifier + ?Sized,
+{
+    fn verify(&self, bearer_token: String) -> BoxFuture<'static, Result<TokenContext, TxnError>> {
+        (**self).verify(bearer_token)
+    }
+
+    fn grant(
+        &self,
+        token: TokenContext,
+        claim: Claim,
+    ) -> BoxFuture<'static, Result<TokenContext, TxnError>> {
+        (**self).grant(token, claim)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct OpaqueBearerTokenVerifier;
 
@@ -66,7 +82,6 @@ pub(crate) fn default_token_verifier() -> Arc<dyn TokenVerifier> {
     Arc::new(OpaqueBearerTokenVerifier)
 }
 
-#[cfg(feature = "rjwt-token")]
 mod rjwt_token {
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -279,11 +294,10 @@ mod rjwt_token {
     }
 }
 
-#[cfg(feature = "rjwt-token")]
 pub use rjwt_token::{
     ActorResolver as RjwtActorResolver, ActorV1 as Actor, KeyringActorResolver, PublicKeyStore,
     RjwtTokenVerifier, SignedTokenV1 as SignedToken, TokenV1 as Token,
 };
 
-#[cfg(all(feature = "rjwt-token", feature = "http-client"))]
+#[cfg(feature = "http-client")]
 pub use rjwt_token::RpcActorResolver;

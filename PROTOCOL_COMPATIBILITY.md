@@ -65,10 +65,8 @@ touches additional components.
 - **Transaction-owned token verification/chaining hooks.** Adapters treat the bearer token as
   opaque and forward it into the kernel. The transaction resolver resolves a stable owner identity
   via its configured `TokenVerifier` and uses the same hook to extend/chains tokens for outbound
-  RPC as a transaction touches additional components. The default verifier is currently opaque;
-  signature verification and claim-chain encoding are still pending. The `rjwt-token` feature
-  enables an RJWT-backed verifier (same bearer token format as v1) once the host can resolve actor
-  keys:
+  RPC as a transaction touches additional components. The default verifier is now RJWT-backed
+  (same bearer token format as v1) once the host can resolve actor keys:
   - in-process via an in-memory keyring resolver (`KeyringActorResolver`);
   - over HTTP (with `http-client`) via `RpcActorResolver`, which fetches actor public keys from the
     issuer host using `GET /host/public_key?key=<actor-id>` (response body is a JSON string

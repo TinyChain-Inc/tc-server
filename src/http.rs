@@ -10,7 +10,11 @@ use std::{
 
 use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, future::BoxFuture, stream};
-use hyper::{Body, Request, Response, StatusCode, body::to_bytes, header::HeaderValue};
+pub use hyper::{Body, StatusCode, header};
+pub use hyper::Method as HttpMethod;
+pub type Request = hyper::Request<hyper::Body>;
+pub type Response = hyper::Response<hyper::Body>;
+use hyper::{body::to_bytes, header::HeaderValue};
 use tc_ir::{LibrarySchema, Route, TxnId, parse_route_path};
 use tower::Service;
 use url::form_urlencoded;
@@ -27,7 +31,7 @@ use crate::{
 use tc_error::{ErrorKind, TCError, TCResult};
 use tc_value::Value;
 
-pub type HttpKernel = Kernel<Request<Body>, Response<Body>>;
+pub type HttpKernel = Kernel;
 
 /// Configuration options for building an HTTP kernel instance.
 #[derive(Clone, Debug)]
@@ -72,9 +76,9 @@ pub fn build_http_kernel_with_config<S, K, H>(
     health_handler: H,
 ) -> HttpKernel
 where
-    S: KernelHandler<Request<Body>, Response<Body>>,
-    K: KernelHandler<Request<Body>, Response<Body>>,
-    H: KernelHandler<Request<Body>, Response<Body>>,
+    S: KernelHandler,
+    K: KernelHandler,
+    H: KernelHandler,
 {
     let storage = config
         .data_dir
@@ -99,9 +103,9 @@ pub fn build_http_kernel<S, K, H>(
     health_handler: H,
 ) -> HttpKernel
 where
-    S: KernelHandler<Request<Body>, Response<Body>>,
-    K: KernelHandler<Request<Body>, Response<Body>>,
-    H: KernelHandler<Request<Body>, Response<Body>>,
+    S: KernelHandler,
+    K: KernelHandler,
+    H: KernelHandler,
 {
     build_http_kernel_with_config(
         HttpKernelConfig::default(),
@@ -119,9 +123,9 @@ pub fn build_http_kernel_with_native_library<H, S, K, He>(
 ) -> HttpKernel
 where
     H: NativeLibraryHandler,
-    S: KernelHandler<Request<Body>, Response<Body>>,
-    K: KernelHandler<Request<Body>, Response<Body>>,
-    He: KernelHandler<Request<Body>, Response<Body>>,
+    S: KernelHandler,
+    K: KernelHandler,
+    He: KernelHandler,
 {
     build_http_kernel_with_native_library_and_config(
         library,
@@ -141,9 +145,9 @@ pub fn build_http_kernel_with_native_library_and_config<H, S, K, He>(
 ) -> HttpKernel
 where
     H: NativeLibraryHandler,
-    S: KernelHandler<Request<Body>, Response<Body>>,
-    K: KernelHandler<Request<Body>, Response<Body>>,
-    He: KernelHandler<Request<Body>, Response<Body>>,
+    S: KernelHandler,
+    K: KernelHandler,
+    He: KernelHandler,
 {
     let native = Arc::new(library);
     let schema_handler = native_schema_get_handler(native.schema().clone());
@@ -222,8 +226,8 @@ impl KernelService {
     }
 }
 
-impl Service<Request<Body>> for KernelService {
-    type Response = Response<Body>;
+impl Service<Request> for KernelService {
+    type Response = Response;
     type Error = hyper::Error;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -231,7 +235,7 @@ impl Service<Request<Body>> for KernelService {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&mut self, req: Request) -> Self::Future {
         let uri = req.uri().clone();
         let method = req.method().clone();
         let path = uri.path().to_owned();
@@ -264,7 +268,7 @@ impl Service<Request<Body>> for KernelService {
                 Some(token) => match kernel.token_verifier().verify(token).await {
                     Ok(token) => Some(token),
                     Err(crate::txn::TxnError::Unauthorized) => {
-                        return Ok(Response::builder()
+                        return Ok(http::Response::builder()
                             .status(StatusCode::UNAUTHORIZED)
                             .body(Body::empty())
                             .expect("unauthorized response"));
@@ -314,7 +318,7 @@ impl Service<Request<Body>> for KernelService {
                 Err(crate::txn::TxnError::NotFound) => {
                     Ok(bad_request_response("unknown transaction id"))
                 }
-                Err(crate::txn::TxnError::Unauthorized) => Ok(Response::builder()
+                Err(crate::txn::TxnError::Unauthorized) => Ok(http::Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .body(Body::empty())
                     .expect("unauthorized response")),
@@ -333,15 +337,15 @@ fn to_kernel_method(method: &hyper::Method) -> Option<Method> {
     }
 }
 
-fn method_not_allowed() -> Response<Body> {
-    Response::builder()
+fn method_not_allowed() -> Response {
+    http::Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
         .body(Body::empty())
         .expect("method not allowed response")
 }
 
-fn not_found() -> Response<Body> {
-    Response::builder()
+fn not_found() -> Response {
+    http::Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Body::empty())
         .expect("not found response")
@@ -362,7 +366,7 @@ impl tower::Service<()> for KernelService {
     }
 }
 
-fn parse_txn_id(req: &Request<Body>) -> Result<Option<TxnId>, TxnParseError> {
+fn parse_txn_id(req: &Request) -> Result<Option<TxnId>, TxnParseError> {
     use std::str::FromStr;
 
     let query = req.uri().query().unwrap_or("");
@@ -383,7 +387,7 @@ enum TxnParseError {
     Invalid,
 }
 
-fn parse_bearer_token(req: &Request<Body>) -> Option<String> {
+fn parse_bearer_token(req: &Request) -> Option<String> {
     use hyper::header::AUTHORIZATION;
 
     let header = req.headers().get(AUTHORIZATION)?;
@@ -401,15 +405,14 @@ fn parse_bearer_token(req: &Request<Body>) -> Option<String> {
     Some(token.to_string())
 }
 
-#[cfg(feature = "rjwt-token")]
 pub fn host_handler_with_public_keys(
     keys: crate::auth::PublicKeyStore,
-) -> impl KernelHandler<Request<Body>, Response<Body>> {
-    move |req: Request<Body>| {
+) -> impl KernelHandler {
+    move |req: Request| {
         let keys = keys.clone();
         async move {
             match req.uri().path() {
-                "/host/metrics" => Response::builder()
+                "/host/metrics" => http::Response::builder()
                     .status(StatusCode::OK)
                     .body(Body::empty())
                     .expect("metrics response"),
@@ -456,7 +459,7 @@ pub fn host_handler_with_public_keys(
                         Err(_) => return internal_error_response("failed to encode public key"),
                     };
 
-                    Response::builder()
+                    http::Response::builder()
                         .status(StatusCode::OK)
                         .header(hyper::header::CONTENT_TYPE, "application/json")
                         .body(Body::from(body))
@@ -469,39 +472,39 @@ pub fn host_handler_with_public_keys(
     }
 }
 
-fn handle_finalize_result(result: Result<(), crate::txn::TxnError>) -> Response<Body> {
+fn handle_finalize_result(result: Result<(), crate::txn::TxnError>) -> Response {
     match result {
         Ok(()) => no_content(),
         Err(crate::txn::TxnError::NotFound) => bad_request_response("unknown transaction id"),
-        Err(crate::txn::TxnError::Unauthorized) => Response::builder()
+        Err(crate::txn::TxnError::Unauthorized) => http::Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .body(Body::empty())
             .expect("unauthorized response"),
     }
 }
 
-fn bad_request_response(msg: &str) -> Response<Body> {
-    Response::builder()
+fn bad_request_response(msg: &str) -> Response {
+    http::Response::builder()
         .status(StatusCode::BAD_REQUEST)
         .body(Body::from(msg.to_string()))
         .expect("bad request response")
 }
 
-fn internal_error_response(msg: &str) -> Response<Body> {
-    Response::builder()
+fn internal_error_response(msg: &str) -> Response {
+    http::Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(Body::from(msg.to_string()))
         .expect("internal error response")
 }
 
-fn no_content() -> Response<Body> {
-    Response::builder()
+fn no_content() -> Response {
+    http::Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
         .expect("no content response")
 }
 
-async fn parse_body(req: Request<Body>) -> Result<(Request<Body>, bool), Response<Body>> {
+async fn parse_body(req: Request) -> Result<(Request, bool), Response> {
     let (parts, body) = req.into_parts();
     let body_bytes = to_bytes(body)
         .await
@@ -516,17 +519,17 @@ async fn parse_body(req: Request<Body>) -> Result<(Request<Body>, bool), Respons
 
 fn native_schema_get_handler(
     schema: LibrarySchema,
-) -> impl KernelHandler<Request<Body>, Response<Body>> {
-    move |_req: Request<Body>| {
+) -> impl KernelHandler {
+    move |_req: Request| {
         let schema = schema.clone();
         async move { schema_response(schema) }.boxed()
     }
 }
 
-fn native_install_not_supported_handler() -> impl KernelHandler<Request<Body>, Response<Body>> {
-    |_req: Request<Body>| {
+fn native_install_not_supported_handler() -> impl KernelHandler {
+    |_req: Request| {
         async move {
-            Response::builder()
+            http::Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
                 .body(Body::from(
                     "native libraries must be installed at compile time",
@@ -539,11 +542,11 @@ fn native_install_not_supported_handler() -> impl KernelHandler<Request<Body>, R
 
 fn http_native_routes_handler<H>(
     library: Arc<NativeLibrary<H>>,
-) -> impl KernelHandler<Request<Body>, Response<Body>> + 'static
+) -> impl KernelHandler + 'static
 where
     H: NativeLibraryHandler,
 {
-    move |req: Request<Body>| {
+    move |req: Request| {
         let library = library.clone();
         async move {
             let path = req.uri().path().to_string();
@@ -633,7 +636,7 @@ where
             };
 
             match encode_value_body(response_value).await {
-                Ok(body) => Response::builder()
+                Ok(body) => http::Response::builder()
                     .status(StatusCode::OK)
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(body)
@@ -658,7 +661,7 @@ async fn encode_value_body(value: Value) -> TCResult<Body> {
     Ok(Body::from(bytes))
 }
 
-fn tc_error_response(err: TCError) -> Response<Body> {
+fn tc_error_response(err: TCError) -> Response {
     let status = match err.code() {
         ErrorKind::BadGateway | ErrorKind::BadRequest => StatusCode::BAD_REQUEST,
         ErrorKind::Conflict => StatusCode::CONFLICT,
@@ -668,7 +671,7 @@ fn tc_error_response(err: TCError) -> Response<Body> {
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
-    Response::builder()
+    http::Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "text/plain")
         .body(Body::from(err.message().to_string()))
@@ -697,10 +700,9 @@ impl RequestBody {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn decode_request_body_with_txn<T>(req: &Request<Body>) -> TCResult<Option<T>>
+pub(crate) async fn decode_request_body_with_txn<T>(req: &Request) -> TCResult<Option<T>>
 where
-    T: destream::de::FromStream,
-    T::Context: From<TxnHandle>,
+    T: destream::de::FromStream<Context = Arc<dyn tc_ir::Transaction>>,
 {
     let body = match req.extensions().get::<RequestBody>() {
         Some(body) if !body.is_empty() => body.clone_bytes(),
@@ -715,19 +717,41 @@ where
 
     let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body)]);
 
-    destream_json::try_decode(T::Context::from(txn), stream)
+    let context: Arc<dyn tc_ir::Transaction> = Arc::new(txn);
+    destream_json::try_decode(context, stream)
         .await
         .map(Some)
         .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
-async fn decode_value_body(req: &Request<Body>) -> TCResult<Option<Value>> {
-    let body = match req.extensions().get::<RequestBody>() {
-        Some(body) if !body.is_empty() => body.clone_bytes(),
-        _ => return Ok(None),
+async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> {
+    if let Some(body) = req.extensions().get::<RequestBody>()
+        && !body.is_empty()
+    {
+        let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body.clone_bytes())]);
+        return destream_json::try_decode((), stream)
+            .await
+            .map(Some)
+            .map_err(|err| TCError::bad_request(err.to_string()));
+    }
+
+    let query = req.uri().query().unwrap_or("");
+    let key = form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .find(|(k, _)| k.eq_ignore_ascii_case("key"))
+        .map(|(_, v)| v);
+
+    let Some(raw) = key else {
+        return Ok(None);
     };
 
-    let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body)]);
+    if raw.trim().is_empty() {
+        return Ok(Some(Value::None));
+    }
+
+    let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+        raw.into_bytes(),
+    ))]);
 
     destream_json::try_decode((), stream)
         .await
@@ -735,11 +759,11 @@ async fn decode_value_body(req: &Request<Body>) -> TCResult<Option<Value>> {
         .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
-fn schema_response(schema: LibrarySchema) -> Response<Body> {
+fn schema_response(schema: LibrarySchema) -> Response {
     match destream_json::encode(schema) {
         Ok(stream) => {
             let body = Body::wrap_stream(stream.map_err(|err| io::Error::other(err.to_string())));
-            Response::builder()
+            http::Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::CONTENT_TYPE, "application/json")
                 .body(body)
@@ -761,10 +785,10 @@ mod tests {
     use crate::auth::TokenVerifier;
     use tc_ir::TxnId;
 
-    fn ok_handler() -> impl crate::KernelHandler<Request<Body>, Response<Body>> {
-        move |_req: Request<Body>| {
+    fn ok_handler() -> impl crate::KernelHandler {
+        move |_req: Request| {
             async {
-                Response::builder()
+                http::Response::builder()
                     .status(StatusCode::OK)
                     .body(Body::from("ok"))
                     .expect("ok response")
@@ -832,7 +856,7 @@ mod tests {
         let txn_manager = kernel.txn_manager().clone();
         let mut service = KernelService::new(kernel);
 
-        let request = Request::builder()
+        let request = http::Request::builder()
             .method("GET")
             .uri("/lib")
             .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
@@ -846,7 +870,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         let txn_id_value = pending[0];
 
-        let commit_request = Request::builder()
+        let commit_request = http::Request::builder()
             .method("POST")
             .uri(format!("/lib?txn_id={txn_id_value}"))
             .header(
@@ -860,7 +884,7 @@ mod tests {
         assert_eq!(commit_response.status(), StatusCode::NO_CONTENT);
 
         // committing again should fail with 400
-        let retry_commit = Request::builder()
+        let retry_commit = http::Request::builder()
             .method("POST")
             .uri(format!("/lib?txn_id={txn_id_value}"))
             .header(
@@ -887,7 +911,7 @@ mod tests {
 
         let mut service = KernelService::new(kernel);
 
-        let begin = Request::builder()
+        let begin = http::Request::builder()
             .method("GET")
             .uri("/lib")
             .body(Body::empty())
@@ -907,7 +931,7 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("missing x-tc-bearer-token header");
 
-        let commit = Request::builder()
+        let commit = http::Request::builder()
             .method("POST")
             .uri(format!("/lib?txn_id={txn_id}"))
             .body(Body::empty())
@@ -916,7 +940,7 @@ mod tests {
         let commit_response = service.call(commit).await.expect("commit response");
         assert_eq!(commit_response.status(), StatusCode::UNAUTHORIZED);
 
-        let commit = Request::builder()
+        let commit = http::Request::builder()
             .method("POST")
             .uri(format!("/lib?txn_id={txn_id}"))
             .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
@@ -932,7 +956,7 @@ mod tests {
         let kernel = kernel_with_lib_handler();
         let mut service = KernelService::new(kernel);
 
-        let begin = Request::builder()
+        let begin = http::Request::builder()
             .method("GET")
             .uri("/lib")
             .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
@@ -947,7 +971,7 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("missing x-tc-txn-id header");
 
-        let continue_req = Request::builder()
+        let continue_req = http::Request::builder()
             .method("GET")
             .uri(format!("/lib?txn_id={txn_id}"))
             .header(hyper::header::AUTHORIZATION, "Bearer owner-b")
@@ -964,7 +988,7 @@ mod tests {
         let txn_manager = kernel.txn_manager().clone();
         let mut service = KernelService::new(kernel);
 
-        let begin = Request::builder()
+        let begin = http::Request::builder()
             .method("GET")
             .uri("/lib")
             .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
@@ -978,7 +1002,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         let txn_id_value = pending[0];
 
-        let non_root_commit = Request::builder()
+        let non_root_commit = http::Request::builder()
             .method("POST")
             .uri(format!("/lib/hello?txn_id={txn_id_value}"))
             .header(
@@ -995,7 +1019,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(txn_manager.pending_ids(), vec![txn_id_value]);
 
-        let root_commit = Request::builder()
+        let root_commit = http::Request::builder()
             .method("POST")
             .uri(format!("/lib?txn_id={txn_id_value}"))
             .header(
@@ -1019,7 +1043,7 @@ mod tests {
         let txn_manager = kernel.txn_manager().clone();
         let mut service = KernelService::new(kernel);
 
-        let begin = Request::builder()
+        let begin = http::Request::builder()
             .method("GET")
             .uri("/lib")
             .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
@@ -1033,7 +1057,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         let txn_id_value = pending[0];
 
-        let non_root = Request::builder()
+        let non_root = http::Request::builder()
             .method("POST")
             .uri(format!("/lib/acme/foo/1.0.0/echo?txn_id={txn_id_value}"))
             .header(
@@ -1047,7 +1071,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(txn_manager.pending_ids(), vec![txn_id_value]);
 
-        let root = Request::builder()
+        let root = http::Request::builder()
             .method("POST")
             .uri(format!("/lib/acme/foo/1.0.0?txn_id={txn_id_value}"))
             .header(
@@ -1061,7 +1085,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(txn_manager.pending_ids().is_empty());
 
-        let begin = Request::builder()
+        let begin = http::Request::builder()
             .method("GET")
             .uri("/service")
             .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
@@ -1075,7 +1099,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         let txn_id_value = pending[0];
 
-        let non_root = Request::builder()
+        let non_root = http::Request::builder()
             .method("DELETE")
             .uri(format!(
                 "/service/acme/ns/foo/1.0.0/echo?txn_id={txn_id_value}"
@@ -1094,7 +1118,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(txn_manager.pending_ids(), vec![txn_id_value]);
 
-        let root = Request::builder()
+        let root = http::Request::builder()
             .method("DELETE")
             .uri(format!("/service/acme/ns/foo/1.0.0?txn_id={txn_id_value}"))
             .header(
@@ -1141,7 +1165,7 @@ mod tests {
             }]
         });
 
-        let mut install_request = Request::builder()
+        let mut install_request = http::Request::builder()
             .method("PUT")
             .uri("/lib")
             .header(hyper::header::CONTENT_TYPE, "application/json")
@@ -1206,7 +1230,7 @@ mod tests {
 
     #[tokio::test]
     async fn decodes_body_with_txn_context() {
-        let request = Request::builder()
+        let request = http::Request::builder()
             .method("PUT")
             .uri("/lib")
             .body(Body::from("{}"))
@@ -1294,7 +1318,7 @@ mod tests {
 
         let txn = kernel.txn_manager().begin();
 
-        let mut request = Request::builder()
+        let mut request = http::Request::builder()
             .method("GET")
             .uri("/lib/hello")
             .body(Body::empty())
@@ -1316,7 +1340,6 @@ mod tests {
         assert_eq!(value, Value::from(42_u64));
     }
 
-    #[cfg(feature = "rjwt-token")]
     #[tokio::test]
     async fn verifies_rjwt_using_host_public_key_endpoint() {
         use crate::auth::TokenVerifier as _;

@@ -8,6 +8,7 @@ use crate::egress::EgressPolicy;
 use crate::library::{LibraryHandlers, LibraryRuntime};
 use crate::txn_server::TxnServer;
 use crate::uri::{component_root, normalize_path};
+use crate::{Request, Response};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Method {
@@ -34,11 +35,11 @@ impl fmt::Display for Method {
     }
 }
 
-pub trait KernelHandler<Request, Response>: Send + Sync + 'static {
+pub trait KernelHandler: Send + Sync + 'static {
     fn call(&self, req: Request) -> BoxFuture<'static, Response>;
 }
 
-impl<F, Fut, Request, Response> KernelHandler<Request, Response> for F
+impl<F, Fut> KernelHandler for F
 where
     F: Fn(Request) -> Fut + Send + Sync + 'static,
     Fut: futures::Future<Output = Response> + Send + 'static,
@@ -48,29 +49,24 @@ where
     }
 }
 
-pub struct Kernel<Request, Response> {
-    lib_get_handler: Arc<dyn KernelHandler<Request, Response>>,
-    lib_put_handler: Arc<dyn KernelHandler<Request, Response>>,
-    lib_route_handler: Option<Arc<dyn KernelHandler<Request, Response>>>,
-    service_handler: Arc<dyn KernelHandler<Request, Response>>,
-    kernel_handler: Arc<dyn KernelHandler<Request, Response>>,
-    health_handler: Arc<dyn KernelHandler<Request, Response>>,
+pub struct Kernel {
+    lib_get_handler: Arc<dyn KernelHandler>,
+    lib_put_handler: Arc<dyn KernelHandler>,
+    lib_route_handler: Option<Arc<dyn KernelHandler>>,
+    service_handler: Arc<dyn KernelHandler>,
+    kernel_handler: Arc<dyn KernelHandler>,
+    health_handler: Arc<dyn KernelHandler>,
     txn_manager: crate::txn::TxnManager,
     txn_server: TxnServer,
     egress: EgressPolicy,
-    library_module: Option<Arc<LibraryRuntime<Request, Response>>>,
+    library_module: Option<Arc<LibraryRuntime>>,
     rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
-    #[cfg(feature = "rjwt-token")]
     kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
 }
 
-impl<Request, Response> Kernel<Request, Response>
-where
-    Request: Send + 'static,
-    Response: Send + 'static,
-{
-    pub fn builder() -> KernelBuilder<Request, Response> {
+impl Kernel {
+    pub fn builder() -> KernelBuilder {
         KernelBuilder::new()
     }
 
@@ -158,7 +154,7 @@ where
         body_is_none: bool,
         token: Option<&crate::auth::TokenContext>,
         mut bind_txn: F,
-    ) -> Result<KernelDispatch<Response>, crate::txn::TxnError>
+    ) -> Result<KernelDispatch, crate::txn::TxnError>
     where
         F: FnMut(&crate::txn::TxnHandle, &mut Request),
     {
@@ -303,16 +299,16 @@ fn token_claim_for_target(method: Method, target: &str) -> Option<tc_ir::Claim> 
     Some(tc_ir::Claim::new(link, mask))
 }
 
-fn dispatch_or_not_found<Response>(
+fn dispatch_or_not_found(
     fut: Option<BoxFuture<'static, Response>>,
-) -> KernelDispatch<Response> {
+) -> KernelDispatch {
     match fut {
         Some(fut) => KernelDispatch::Response(fut),
         None => KernelDispatch::NotFound,
     }
 }
 
-pub enum KernelDispatch<Response> {
+pub enum KernelDispatch {
     Response(BoxFuture<'static, Response>),
     Finalize {
         commit: bool,
@@ -360,29 +356,33 @@ impl KernelTxnResolver {
                         .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?
                 };
 
-                match self.txn_manager.interpret_request(
-                    Some(txn.id()),
-                    Some(&owner_id),
-                    Some(&ctx.bearer_token),
-                ) {
-                    Ok(crate::txn::TxnFlow::Begin(handle))
-                    | Ok(crate::txn::TxnFlow::Use(handle)) => {
-                        self.txn_server.touch(handle.id())
-                    }
-                    Err(crate::txn::TxnError::NotFound) => {
-                        return Err(tc_error::TCError::bad_request("unknown transaction id"));
-                    }
-                    Err(crate::txn::TxnError::Unauthorized) => {
-                        return Err(tc_error::TCError::unauthorized(
-                            "unauthorized transaction owner",
-                        ));
-                    }
-                };
+                if self.txn_manager.get(&txn.id()).is_some() {
+                    match self.txn_manager.interpret_request(
+                        Some(txn.id()),
+                        Some(&owner_id),
+                        Some(&ctx.bearer_token),
+                    ) {
+                        Ok(crate::txn::TxnFlow::Begin(handle))
+                        | Ok(crate::txn::TxnFlow::Use(handle)) => {
+                            self.txn_server.touch(handle.id())
+                        }
+                        Err(crate::txn::TxnError::NotFound) => {
+                            return Err(tc_error::TCError::bad_request("unknown transaction id"));
+                        }
+                        Err(crate::txn::TxnError::Unauthorized) => {
+                            return Err(tc_error::TCError::unauthorized(
+                                "unauthorized transaction owner",
+                            ));
+                        }
+                    };
+                }
 
                 let claim = token_claim_for_target(method, &target_str);
                 let ctx = match claim {
                     Some(claim) => {
-                        let _ = self.txn_manager.record_claim(&txn.id(), claim.clone());
+                        if self.txn_manager.get(&txn.id()).is_some() {
+                            let _ = self.txn_manager.record_claim(&txn.id(), claim.clone());
+                        }
                         self.token_verifier
                             .grant(ctx, claim)
                             .await
@@ -481,11 +481,7 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
     }
 }
 
-impl<Request, Response> Clone for Kernel<Request, Response>
-where
-    Request: Send + 'static,
-    Response: Send + 'static,
-{
+impl Clone for Kernel {
     fn clone(&self) -> Self {
         Self {
             lib_get_handler: Arc::clone(&self.lib_get_handler),
@@ -500,32 +496,28 @@ where
             library_module: self.library_module.as_ref().map(Arc::clone),
             rpc_gateway: self.rpc_gateway.as_ref().map(Arc::clone),
             token_verifier: Arc::clone(&self.token_verifier),
-            #[cfg(feature = "rjwt-token")]
             kernel_actor: self.kernel_actor.clone(),
         }
     }
 }
 
-pub struct KernelBuilder<Request, Response> {
-    lib_get_handler: Option<Arc<dyn KernelHandler<Request, Response>>>,
-    lib_put_handler: Option<Arc<dyn KernelHandler<Request, Response>>>,
-    lib_route_handler: Option<Arc<dyn KernelHandler<Request, Response>>>,
-    service_handler: Option<Arc<dyn KernelHandler<Request, Response>>>,
-    kernel_handler: Option<Arc<dyn KernelHandler<Request, Response>>>,
-    health_handler: Option<Arc<dyn KernelHandler<Request, Response>>>,
+pub struct KernelBuilder {
+    lib_get_handler: Option<Arc<dyn KernelHandler>>,
+    lib_put_handler: Option<Arc<dyn KernelHandler>>,
+    lib_route_handler: Option<Arc<dyn KernelHandler>>,
+    service_handler: Option<Arc<dyn KernelHandler>>,
+    kernel_handler: Option<Arc<dyn KernelHandler>>,
+    health_handler: Option<Arc<dyn KernelHandler>>,
     txn_manager: crate::txn::TxnManager,
     txn_server: TxnServer,
     egress: EgressPolicy,
-    library_module: Option<Arc<LibraryRuntime<Request, Response>>>,
+    library_module: Option<Arc<LibraryRuntime>>,
     rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
-    #[cfg(feature = "rjwt-token")]
     kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
 }
 
-impl<Request: Send + 'static, Response: Send + 'static> Default
-    for KernelBuilder<Request, Response>
-{
+impl Default for KernelBuilder {
     fn default() -> Self {
         Self {
             lib_get_handler: None,
@@ -540,20 +532,19 @@ impl<Request: Send + 'static, Response: Send + 'static> Default
             library_module: None,
             rpc_gateway: None,
             token_verifier: crate::auth::default_token_verifier(),
-            #[cfg(feature = "rjwt-token")]
             kernel_actor: None,
         }
     }
 }
 
-impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, Response> {
+impl KernelBuilder {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn with_lib_handler<H>(mut self, handler: H) -> Self
     where
-        H: KernelHandler<Request, Response>,
+        H: KernelHandler,
     {
         self.lib_get_handler = Some(Arc::new(handler));
         self
@@ -561,7 +552,7 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
 
     pub fn with_lib_put_handler<H>(mut self, handler: H) -> Self
     where
-        H: KernelHandler<Request, Response>,
+        H: KernelHandler,
     {
         self.lib_put_handler = Some(Arc::new(handler));
         self
@@ -569,7 +560,7 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
 
     pub fn with_service_handler<H>(mut self, handler: H) -> Self
     where
-        H: KernelHandler<Request, Response>,
+        H: KernelHandler,
     {
         self.service_handler = Some(Arc::new(handler));
         self
@@ -577,7 +568,7 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
 
     pub fn with_lib_route_handler<H>(mut self, handler: H) -> Self
     where
-        H: KernelHandler<Request, Response>,
+        H: KernelHandler,
     {
         self.lib_route_handler = Some(Arc::new(handler));
         self
@@ -585,7 +576,7 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
 
     pub fn with_kernel_handler<H>(mut self, handler: H) -> Self
     where
-        H: KernelHandler<Request, Response>,
+        H: KernelHandler,
     {
         self.kernel_handler = Some(Arc::new(handler));
         self
@@ -593,7 +584,7 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
 
     pub fn with_health_handler<H>(mut self, handler: H) -> Self
     where
-        H: KernelHandler<Request, Response>,
+        H: KernelHandler,
     {
         self.health_handler = Some(Arc::new(handler));
         self
@@ -601,8 +592,8 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
 
     pub fn with_library_module(
         mut self,
-        module: Arc<LibraryRuntime<Request, Response>>,
-        handlers: LibraryHandlers<Request, Response>,
+        module: Arc<LibraryRuntime>,
+        handlers: LibraryHandlers,
     ) -> Self {
         self.library_module = Some(module);
         self.lib_get_handler = Some(handlers.get_handler());
@@ -653,7 +644,6 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
         self
     }
 
-    #[cfg(feature = "rjwt-token")]
     pub fn with_kernel_actor(
         mut self,
         host: pathlink::Link,
@@ -663,7 +653,6 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
         self
     }
 
-    #[cfg(feature = "rjwt-token")]
     pub fn with_rjwt_token_verifier(
         self,
         resolver: Arc<dyn crate::auth::RjwtActorResolver>,
@@ -671,7 +660,6 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
         self.with_token_verifier(crate::auth::RjwtTokenVerifier::new(resolver))
     }
 
-    #[cfg(feature = "rjwt-token")]
     pub fn with_rjwt_keyring_token_verifier(
         self,
         keyring: crate::auth::KeyringActorResolver,
@@ -684,7 +672,7 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
         self.with_rpc_gateway(crate::http_client::HttpRpcGateway::new())
     }
 
-    pub fn finish(self) -> Kernel<Request, Response> {
+    pub fn finish(self) -> Kernel {
         if let Some(module) = &self.library_module
             && let Err(err) = module.hydrate_from_storage()
         {
@@ -714,15 +702,12 @@ impl<Request: Send + 'static, Response: Send + 'static> KernelBuilder<Request, R
             library_module: self.library_module,
             rpc_gateway: self.rpc_gateway,
             token_verifier: self.token_verifier,
-            #[cfg(feature = "rjwt-token")]
             kernel_actor: self.kernel_actor,
         }
     }
 }
 
-fn stub_handler<Request: Send + 'static, Response: Send + 'static>(
-    label: &str,
-) -> Arc<dyn KernelHandler<Request, Response>> {
+fn stub_handler(label: &str) -> Arc<dyn KernelHandler> {
     let label = label.to_string();
     Arc::new(move |_req: Request| {
         let label = label.clone();
@@ -733,13 +718,14 @@ fn stub_handler<Request: Send + 'static, Response: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Body;
     use futures::FutureExt;
     use std::sync::{Arc, Mutex};
     use tc_ir::{LibrarySchema, NetworkTime};
     use crate::resolve::Resolve;
 
-    fn ok_handler() -> impl KernelHandler<(), ()> {
-        |_req: ()| async {}.boxed()
+    fn ok_handler() -> impl KernelHandler {
+        |_req: Request| async { Response::new(Body::empty()) }.boxed()
     }
 
     #[test]
@@ -749,7 +735,7 @@ mod tests {
         use tc_ir::Claim;
         use umask::USER_EXEC;
 
-        let kernel: Kernel<(), ()> = Kernel::builder().with_lib_handler(ok_handler()).finish();
+        let kernel = Kernel::builder().with_lib_handler(ok_handler()).finish();
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0; 32]);
         let txn_claim = Claim::new(
             pathlink::Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim link"),
@@ -776,7 +762,7 @@ mod tests {
             .route_request(
                 Method::Get,
                 "/lib",
-                (),
+                Request::new(Body::empty()),
                 Some(txn_id),
                 true,
                 Some(&token_a),
@@ -787,7 +773,7 @@ mod tests {
         let result = kernel.route_request(
             Method::Get,
             "/lib",
-            (),
+            Request::new(Body::empty()),
             Some(txn_id),
             true,
             Some(&token_b),
@@ -796,7 +782,6 @@ mod tests {
         assert!(matches!(result, Err(crate::txn::TxnError::Unauthorized)));
     }
 
-    #[cfg(feature = "rjwt-token")]
     #[test]
     fn verifies_rjwt_and_pins_owner_by_txn_claim() {
         use std::str::FromStr;
@@ -807,7 +792,7 @@ mod tests {
         use tc_value::Value;
         use umask::USER_EXEC;
 
-        let kernel: Kernel<(), ()> = Kernel::builder().with_lib_handler(ok_handler()).finish();
+        let kernel = Kernel::builder().with_lib_handler(ok_handler()).finish();
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0; 32]);
 
         let host = pathlink::Link::from_str("/host").expect("host link");
@@ -836,7 +821,7 @@ mod tests {
         let result = kernel.route_request(
             Method::Get,
             "/lib",
-            (),
+            Request::new(Body::empty()),
             Some(txn_id),
             true,
             Some(&token_ctx),
@@ -867,7 +852,7 @@ mod tests {
         let result = kernel.route_request(
             Method::Get,
             "/lib",
-            (),
+            Request::new(Body::empty()),
             Some(txn_id),
             true,
             Some(&token_ctx_b),
@@ -878,13 +863,21 @@ mod tests {
 
     #[test]
     fn tracks_active_txns_and_expires_them() {
-        let kernel: Kernel<(), ()> = Kernel::builder()
+        let kernel = Kernel::builder()
             .with_txn_ttl(std::time::Duration::from_secs(10))
             .with_lib_handler(ok_handler())
             .finish();
 
         let dispatch = kernel
-            .route_request(Method::Get, "/lib", (), None, true, None, |_txn, _req| {})
+            .route_request(
+                Method::Get,
+                "/lib",
+                Request::new(Body::empty()),
+                None,
+                true,
+                None,
+                |_txn, _req| {},
+            )
             .expect("dispatch");
 
         if let KernelDispatch::Response(fut) = dispatch {
@@ -907,12 +900,12 @@ mod tests {
 
     #[test]
     fn finalize_requires_txn_claim_in_token() {
-        let kernel: Kernel<(), ()> = Kernel::builder().with_lib_handler(ok_handler()).finish();
+        let kernel = Kernel::builder().with_lib_handler(ok_handler()).finish();
 
         let begin = kernel.route_request(
             Method::Get,
             "/lib",
-            (),
+            Request::new(Body::empty()),
             None,
             true,
             None,
@@ -928,7 +921,7 @@ mod tests {
         let finalize = kernel.route_request(
             Method::Post,
             "/lib",
-            (),
+            Request::new(Body::empty()),
             Some(txn_id),
             true,
             Some(&token),
@@ -1000,7 +993,7 @@ mod tests {
 
         let gateway = MockGateway::default();
 
-        let kernel: Kernel<(), ()> = Kernel::builder()
+        let kernel = Kernel::builder()
             .with_library_module(module, handlers)
             .with_dependency_route("/lib", "127.0.0.1:1234")
             .with_rpc_gateway(gateway)
@@ -1110,7 +1103,7 @@ mod tests {
             State::from(Value::from("ok")),
         ]);
 
-        let kernel: Kernel<(), ()> = Kernel::builder()
+        let kernel = Kernel::builder()
             .with_library_module(module, handlers)
             .with_dependency_route("/lib/example-devco/example/1.0.0", "127.0.0.1:1234")
             .with_rpc_gateway(gateway.clone())

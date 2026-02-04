@@ -17,17 +17,10 @@ use crate::resolve::Resolve;
 #[cfg(feature = "http-server")]
 use {
     crate::txn::TxnHandle,
-    hyper::{Body, Request, Response, StatusCode, body},
+    crate::http::{Body, Request, Response, StatusCode},
+    hyper::body,
     tc_error::ErrorKind,
     tokio::sync::Mutex,
-};
-
-#[cfg(feature = "pyo3")]
-use {
-    crate::pyo3_runtime::{PyKernelRequest, PyKernelResponse, request_body_bytes},
-    crate::txn::TxnHandle,
-    futures::lock::Mutex as AsyncMutex,
-    pyo3::{exceptions::PyValueError, prelude::*},
 };
 
 /// Loads a TinyChain-compatible Library embedded in a WASM module.
@@ -353,7 +346,8 @@ mod http_tests {
         txn::TxnManager,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-    use hyper::{Body, Client, Request, StatusCode, body};
+    use crate::http::{Body, StatusCode};
+    use hyper::{Client, body};
     use pathlink::Link;
     use std::net::TcpListener;
     use std::str::FromStr;
@@ -373,7 +367,7 @@ mod http_tests {
         let module = build_http_library_module(initial, None);
         let handlers = http_library_handlers(&module);
 
-        let kernel = Kernel::<Request<Body>, Response<Body>>::builder()
+        let kernel = Kernel::builder()
             .with_host_id("tc-wasm-test")
             .with_library_module(module, handlers)
             .with_service_handler(|_req| async { Response::new(Body::empty()) })
@@ -401,10 +395,10 @@ mod http_tests {
         );
         let txn = txn_manager.begin().with_claims(vec![install_claim]);
 
-        let mut install_request = Request::builder()
+        let mut install_request = http::Request::builder()
             .method("PUT")
             .uri("/lib")
-            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(crate::http::header::CONTENT_TYPE, "application/json")
             .body(Body::from(install_payload.to_string()))
             .expect("install request");
         install_request.extensions_mut().insert(txn.clone());
@@ -415,7 +409,7 @@ mod http_tests {
             .await;
         assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
 
-        let mut request = Request::builder()
+        let mut request = http::Request::builder()
             .method("GET")
             .uri("/lib/example-devco/example/0.1.0/hello")
             .body(Body::empty())
@@ -631,7 +625,7 @@ mod http_tests {
         let b_module = build_http_library_module(initial_schema, None);
         let b_handlers = http_library_handlers(&b_module);
 
-        let b_kernel: Kernel<Request<Body>, Response<Body>> = Kernel::builder()
+        let b_kernel = Kernel::builder()
             .with_host_id("tc-http-b")
             .with_library_module(b_module, b_handlers)
             .with_service_handler(|_req| async { Response::new(Body::empty()) })
@@ -656,10 +650,10 @@ mod http_tests {
             }]
         });
 
-        let mut install_request_b = Request::builder()
+        let mut install_request_b = http::Request::builder()
             .method("PUT")
             .uri("/lib")
-            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(crate::http::header::CONTENT_TYPE, "application/json")
             .body(Body::from(install_payload_b.to_string()))?;
         let install_claim_b = Claim::new(
             Link::from_str(b_root)?,
@@ -699,7 +693,7 @@ mod http_tests {
         let a_module = build_http_library_module(a_schema.clone(), None);
         let a_handlers = http_library_handlers(&a_module);
 
-        let a_kernel: Kernel<Request<Body>, Response<Body>> = Kernel::builder()
+        let a_kernel = Kernel::builder()
             .with_host_id("tc-http-a")
             .with_library_module(a_module, a_handlers)
             .with_dependency_route(b_root, b_addr.to_string())
@@ -732,10 +726,10 @@ mod http_tests {
             }]
         });
 
-        let mut install_request_a = Request::builder()
+        let mut install_request_a = http::Request::builder()
             .method("PUT")
             .uri("/lib")
-            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(crate::http::header::CONTENT_TYPE, "application/json")
             .body(Body::from(install_payload_a.to_string()))?;
         let install_claim_a = Claim::new(
             Link::from_str(a_root)?,
@@ -763,7 +757,7 @@ mod http_tests {
             })
         };
 
-        let request = Request::builder()
+        let request = http::Request::builder()
             .method("GET")
             .uri(format!("http://{a_addr}{a_from_b}"))
             .header(hyper::header::AUTHORIZATION, "Bearer demo-user")
@@ -787,7 +781,7 @@ mod http_tests {
 pub fn http_wasm_route_handler_from_bytes(
     bytes: Vec<u8>,
 ) -> TCResult<(
-    impl KernelHandler<Request<Body>, Response<Body>>,
+    impl KernelHandler,
     LibrarySchema,
     SchemaRoutes,
 )> {
@@ -809,7 +803,7 @@ pub fn http_wasm_route_handler_from_bytes(
     let schema_routes = SchemaRoutes::from_entries(metadata_entries)?;
     let shared = Arc::new(Mutex::new(wasm));
 
-    let handler = move |req: Request<Body>| {
+    let handler = move |req: Request| {
         let wasm = shared.clone();
         async move { http_handle_route(wasm, req).await }
     };
@@ -818,7 +812,7 @@ pub fn http_wasm_route_handler_from_bytes(
 }
 
 #[cfg(feature = "http-server")]
-async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request<Body>) -> Response<Body> {
+async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
@@ -826,7 +820,7 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request<Body>) ->
         return not_found(&path);
     }
 
-    if method != hyper::Method::GET {
+    if method != crate::http::HttpMethod::GET {
         return method_not_allowed(&method, &path);
     }
 
@@ -885,9 +879,9 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request<Body>) ->
                 }
             }
 
-            Response::builder()
+            http::Response::builder()
                 .status(StatusCode::OK)
-                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .header(crate::http::header::CONTENT_TYPE, "application/json")
                 .body(Body::from(bytes))
                 .unwrap()
         }
@@ -896,7 +890,7 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request<Body>) ->
 }
 
 #[cfg(feature = "http-server")]
-fn txn_header(req: &Request<Body>) -> TCResult<TxnHeader> {
+fn txn_header(req: &Request) -> TCResult<TxnHeader> {
     req.extensions()
         .get::<TxnHandle>()
         .cloned()
@@ -905,7 +899,7 @@ fn txn_header(req: &Request<Body>) -> TCResult<TxnHeader> {
 }
 
 #[cfg(feature = "http-server")]
-fn method_not_allowed(method: &hyper::Method, path: &str) -> Response<Body> {
+fn method_not_allowed(method: &crate::http::HttpMethod, path: &str) -> Response {
     error_response(TCError::method_not_allowed(
         method.clone(),
         path.to_string(),
@@ -913,12 +907,12 @@ fn method_not_allowed(method: &hyper::Method, path: &str) -> Response<Body> {
 }
 
 #[cfg(feature = "http-server")]
-fn not_found(path: &str) -> Response<Body> {
+fn not_found(path: &str) -> Response {
     error_response(TCError::not_found(path))
 }
 
 #[cfg(feature = "http-server")]
-fn error_response(err: TCError) -> Response<Body> {
+fn error_response(err: TCError) -> Response {
     let status = match err.code() {
         ErrorKind::BadGateway | ErrorKind::BadRequest => StatusCode::BAD_REQUEST,
         ErrorKind::Conflict => StatusCode::CONFLICT,
@@ -928,9 +922,9 @@ fn error_response(err: TCError) -> Response<Body> {
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
-    Response::builder()
+    http::Response::builder()
         .status(status)
-        .header(hyper::header::CONTENT_TYPE, "text/plain")
+        .header(crate::http::header::CONTENT_TYPE, "text/plain")
         .body(Body::from(err.message().to_string()))
         .unwrap()
 }
@@ -968,154 +962,17 @@ where
 }
 
 #[cfg(feature = "http-server")]
-fn state_response(state: tc_state::State) -> Response<Body> {
+fn state_response(state: tc_state::State) -> Response {
     use futures::TryStreamExt;
 
     match destream_json::encode(state) {
-        Ok(stream) => Response::builder()
+        Ok(stream) => http::Response::builder()
             .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(crate::http::header::CONTENT_TYPE, "application/json")
             .body(Body::wrap_stream(
                 stream.map_err(|err| std::io::Error::other(err.to_string())),
             ))
             .unwrap(),
         Err(err) => error_response(TCError::internal(err.to_string())),
     }
-}
-
-#[cfg(feature = "pyo3")]
-pub fn pyo3_wasm_route_handler_from_bytes(
-    bytes: Vec<u8>,
-) -> TCResult<(
-    impl KernelHandler<PyKernelRequest, PyResult<PyKernelResponse>>,
-    LibrarySchema,
-    SchemaRoutes,
-)> {
-    let engine = Engine::default();
-    let wasm = WasmLibrary::from_bytes(&engine, &bytes)?;
-    let schema = wasm.schema().clone();
-    let metadata_entries = wasm
-        .bindings()
-        .iter()
-        .map(|binding| {
-            (
-                binding.path.clone(),
-                RouteMetadata {
-                    export: Some(binding.export.clone()),
-                },
-            )
-        })
-        .collect();
-    let schema_routes = SchemaRoutes::from_entries(metadata_entries)?;
-    let shared = Arc::new(AsyncMutex::new(wasm));
-
-    let handler = move |req: PyKernelRequest| {
-        let wasm = shared.clone();
-        async move { py_handle_route(wasm, req).await }
-    };
-
-    Ok((handler, schema, schema_routes))
-}
-
-#[cfg(feature = "pyo3")]
-async fn py_handle_route(
-    wasm: Arc<AsyncMutex<WasmLibrary>>,
-    req: PyKernelRequest,
-) -> PyResult<PyKernelResponse> {
-    let method = req.method_enum();
-    if method != crate::Method::Get {
-        return Err(PyValueError::new_err(format!(
-            "method {method} not supported for wasm routes"
-        )));
-    }
-
-    let txn = req
-        .txn_handle()
-        .ok_or_else(|| PyValueError::new_err("missing transaction handle"))?;
-    let header = txn.header();
-
-    let path = req.path_owned();
-    if !path.starts_with("/lib/") {
-        return Ok(PyKernelResponse::new(404, None, None));
-    }
-
-    let body = request_body_bytes(req.body())?;
-
-    let relative = &path["/lib".len()..];
-    let normalized = if relative.starts_with('/') {
-        relative
-    } else {
-        return Ok(PyKernelResponse::new(404, None, None));
-    };
-
-    let result = {
-        let mut guard = wasm.lock().await;
-        let schema_id = guard.schema().id().to_string();
-        let schema_rel = schema_id.strip_prefix("/lib").unwrap_or(&schema_id);
-
-        let normalized = if schema_rel.is_empty() {
-            normalized
-        } else if let Some(normalized) = normalized.strip_prefix(schema_rel) {
-            normalized
-        } else {
-            return Ok(PyKernelResponse::new(404, None, None));
-        };
-
-        let segments = parse_route_path(normalized)
-            .map_err(|err| PyValueError::new_err(err.message().to_string()))?;
-
-        guard.call_route(&segments, &header, &body)
-    };
-
-    match result {
-        Ok(bytes) => {
-            // Match the HTTP adapter behavior: if the WASM route returns a TinyChain ref envelope
-            // (`TCRef`/`OpRef`) as JSON, resolve it within the current transaction and return the
-            // resolved state.
-            if let Some(r) = try_decode_wasm_ref(&bytes).await {
-                match r {
-                    tc_ir::TCRef::Op(op) => match op.resolve(&txn).await {
-                        Ok(state) => {
-                            return Python::with_gil(|py| {
-                                let body_bytes =
-                                    crate::pyo3_runtime::encode_state_to_bytes(state)?;
-                                let body = if body_bytes.is_empty() {
-                                    None
-                                } else {
-                                    Some(crate::pyo3_runtime::PyStateHandle::new(
-                                        pyo3::types::PyBytes::new_bound(py, &body_bytes).into_py(py),
-                                    ))
-                                };
-
-                                Ok(PyKernelResponse::new(200, None, body))
-                            });
-                        }
-                        Err(err) => return Err(PyValueError::new_err(err.message().to_string())),
-                    },
-                }
-            }
-
-            py_wasm_response(bytes, txn).await
-        }
-        Err(err) => Err(PyValueError::new_err(err.message().to_string())),
-    }
-}
-
-#[cfg(feature = "pyo3")]
-async fn py_wasm_response(bytes: Vec<u8>, _txn: TxnHandle) -> PyResult<PyKernelResponse> {
-    if bytes.is_empty() {
-        return Ok(PyKernelResponse::new(200, None, None));
-    }
-
-    Python::with_gil(|py| {
-        let body = match std::str::from_utf8(&bytes) {
-            Ok(text) => crate::pyo3_runtime::PyStateHandle::new(
-                pyo3::types::PyString::new_bound(py, text).into_py(py),
-            ),
-            Err(_) => crate::pyo3_runtime::PyStateHandle::new(
-                pyo3::types::PyBytes::new_bound(py, &bytes).into_py(py),
-            ),
-        };
-        Ok(PyKernelResponse::new(200, None, Some(body)))
-    })
 }

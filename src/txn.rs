@@ -15,13 +15,12 @@ use pathlink::Link;
 use sha2::{Digest, Sha256};
 use tc_error::TCError;
 use tc_ir::{Claim, NetworkTime, Transaction, TxnHeader, TxnId};
-use tc_state::{State, StateContext};
+use tc_state::State;
 use tc_value::Value;
 use umask::Mode;
 
-use crate::gateway::RpcGateway;
-#[cfg(feature = "rjwt-token")]
 use crate::auth::{Actor, SignedToken, Token};
+use crate::gateway::RpcGateway;
 
 #[derive(Clone)]
 pub struct TxnHandle {
@@ -32,7 +31,6 @@ pub struct TxnHandle {
     bearer_token: Option<String>,
     resolver: Option<Arc<dyn RpcGateway>>,
     ttl: Duration,
-    #[cfg(feature = "rjwt-token")]
     token: Option<Arc<SignedToken>>,
 }
 
@@ -46,7 +44,6 @@ impl TxnHandle {
             bearer_token: self.bearer_token.clone(),
             resolver: Some(resolver),
             ttl: self.ttl,
-            #[cfg(feature = "rjwt-token")]
             token: self.token.clone(),
         }
     }
@@ -92,7 +89,6 @@ impl TxnHandle {
             bearer_token: Some(bearer_token),
             resolver: self.resolver.clone(),
             ttl: self.ttl,
-            #[cfg(feature = "rjwt-token")]
             token: self.token.clone(),
         }
     }
@@ -110,12 +106,9 @@ impl TxnHandle {
             bearer_token: self.bearer_token.clone(),
             resolver: self.resolver.clone(),
             ttl: self.ttl,
-            #[cfg(feature = "rjwt-token")]
             token: self.token.clone(),
         }
     }
-
-    #[cfg(feature = "rjwt-token")]
     pub fn with_signed_token(&self, token: SignedToken) -> tc_error::TCResult<Self> {
         let canonical_claim = self.validate_token(&token)?;
         let bearer_token = token.clone().into_jwt();
@@ -136,7 +129,6 @@ impl TxnHandle {
         })
     }
 
-    #[cfg(feature = "rjwt-token")]
     pub fn grant(
         &self,
         actor: &Actor,
@@ -163,7 +155,6 @@ impl TxnHandle {
         self.with_signed_token(signed)
     }
 
-    #[cfg(feature = "rjwt-token")]
     pub fn has_permission(
         &self,
         actor: &Actor,
@@ -183,7 +174,6 @@ impl TxnHandle {
         Ok(false)
     }
 
-    #[cfg(feature = "rjwt-token")]
     fn validate_token(&self, token: &SignedToken) -> tc_error::TCResult<Claim> {
         let txn_link = Link::from_str(&format!("/txn/{}", self.id))
             .map_err(|err| TCError::bad_request(err.to_string()))?;
@@ -270,7 +260,6 @@ struct TxnRecord {
     owner_id: Option<String>,
     bearer_token: Option<String>,
     claims: Vec<Claim>,
-    #[cfg(feature = "rjwt-token")]
     token: Option<Arc<SignedToken>>,
 }
 
@@ -375,7 +364,6 @@ impl TxnManager {
                 owner_id,
                 bearer_token,
                 claims: claims.clone(),
-                #[cfg(feature = "rjwt-token")]
                 token: None,
             },
         );
@@ -387,7 +375,6 @@ impl TxnManager {
             bearer_token: handle_bearer,
             resolver: None,
             ttl: self.ttl,
-            #[cfg(feature = "rjwt-token")]
             token: None,
         }
     }
@@ -419,7 +406,6 @@ impl TxnManager {
             bearer_token: record.bearer_token,
             resolver: None,
             ttl: self.ttl,
-            #[cfg(feature = "rjwt-token")]
             token: record.token,
         })
     }
@@ -528,7 +514,6 @@ impl TxnManager {
                 owner_id: owner_id.clone(),
                 bearer_token: bearer_token.clone(),
                 claims: claims.clone(),
-                #[cfg(feature = "rjwt-token")]
                 token: None,
             },
         );
@@ -540,7 +525,6 @@ impl TxnManager {
             bearer_token,
             resolver: None,
             ttl: self.ttl,
-            #[cfg(feature = "rjwt-token")]
             token: None,
         }
     }
@@ -642,12 +626,6 @@ impl Transaction for TxnHandle {
     }
 }
 
-impl From<TxnHandle> for StateContext {
-    fn from(txn: TxnHandle) -> Self {
-        StateContext::with_data(txn)
-    }
-}
-
 impl fmt::Debug for TxnHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TxnHandle")
@@ -734,7 +712,6 @@ mod tests {
         assert!(handle.has_claim(&txn_link, umask::USER_WRITE));
     }
 
-    #[cfg(feature = "rjwt-token")]
     #[test]
     fn enforces_canonical_claim_position() {
         use std::time::{Duration, SystemTime};

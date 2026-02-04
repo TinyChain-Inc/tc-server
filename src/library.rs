@@ -22,7 +22,7 @@ use crate::{
     txn::TxnHandle,
 };
 
-type HandlerArc<Request, Response> = Arc<dyn KernelHandler<Request, Response>>;
+type HandlerArc = Arc<dyn KernelHandler>;
 
 #[derive(Clone, Debug, Default)]
 pub struct RouteMetadata {
@@ -262,11 +262,11 @@ pub fn decode_install_request_bytes(bytes: &[u8]) -> Result<InstallRequest, Inst
     }))
 }
 
-pub fn apply_wasm_install<Request, Response>(
+pub fn apply_wasm_install(
     state: &LibraryState,
-    routes: &LibraryRoutes<Request, Response>,
+    routes: &LibraryRoutes,
     storage: Option<&LibraryDir>,
-    route_factory: Option<&LibraryRouteFactory<Request, Response>>,
+    route_factory: Option<&LibraryRouteFactory>,
     payload: InstallArtifacts,
 ) -> Result<(), InstallError> {
     let artifact = payload
@@ -303,11 +303,11 @@ pub fn apply_wasm_install<Request, Response>(
     Ok(())
 }
 
-pub fn apply_ir_install<Request, Response>(
+pub fn apply_ir_install(
     state: &LibraryState,
-    routes: &LibraryRoutes<Request, Response>,
+    routes: &LibraryRoutes,
     storage: Option<&LibraryDir>,
-    route_factory: Option<&LibraryRouteFactory<Request, Response>>,
+    route_factory: Option<&LibraryRouteFactory>,
     payload: InstallArtifacts,
 ) -> Result<(), InstallError> {
     let artifact = payload
@@ -342,12 +342,12 @@ pub fn apply_ir_install<Request, Response>(
     Ok(())
 }
 
-pub fn apply_install<Request, Response>(
+pub fn apply_install(
     state: &LibraryState,
-    routes: &LibraryRoutes<Request, Response>,
+    routes: &LibraryRoutes,
     storage: Option<&LibraryDir>,
-    wasm_factory: Option<&LibraryRouteFactory<Request, Response>>,
-    ir_factory: Option<&LibraryRouteFactory<Request, Response>>,
+    wasm_factory: Option<&LibraryRouteFactory>,
+    ir_factory: Option<&LibraryRouteFactory>,
     payload: InstallArtifacts,
 ) -> Result<(), InstallError> {
     if payload
@@ -462,17 +462,15 @@ fn decode_install_payload(bytes: &[u8]) -> Result<InstallPayloadRaw, InstallErro
     })
 }
 
-pub type LibraryRouteFactory<Request, Response> = Arc<
-    dyn Fn(Vec<u8>) -> TCResult<(LibrarySchema, SchemaRoutes, HandlerArc<Request, Response>)>
-        + Send
-        + Sync,
+pub type LibraryRouteFactory = Arc<
+    dyn Fn(Vec<u8>) -> TCResult<(LibrarySchema, SchemaRoutes, HandlerArc)> + Send + Sync,
 >;
 
-pub struct LibraryRoutes<Request, Response> {
-    inner: Arc<RwLock<Option<HandlerArc<Request, Response>>>>,
+pub struct LibraryRoutes {
+    inner: Arc<RwLock<Option<HandlerArc>>>,
 }
 
-impl<Request, Response> Default for LibraryRoutes<Request, Response> {
+impl Default for LibraryRoutes {
     fn default() -> Self {
         Self {
             inner: Arc::new(RwLock::new(None)),
@@ -480,21 +478,19 @@ impl<Request, Response> Default for LibraryRoutes<Request, Response> {
     }
 }
 
-impl<Request, Response> LibraryRoutes<Request, Response> {
+impl LibraryRoutes {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn replace<H>(&self, handler: H)
     where
-        H: KernelHandler<Request, Response>,
-        Request: Send + 'static,
-        Response: Send + 'static,
+        H: KernelHandler,
     {
         self.replace_arc(Arc::new(handler));
     }
 
-    pub fn replace_arc(&self, handler: HandlerArc<Request, Response>) {
+    pub fn replace_arc(&self, handler: HandlerArc) {
         self.inner
             .write()
             .expect("library routes write lock")
@@ -508,12 +504,12 @@ impl<Request, Response> LibraryRoutes<Request, Response> {
             .take();
     }
 
-    pub fn current_handler(&self) -> Option<HandlerArc<Request, Response>> {
+    pub fn current_handler(&self) -> Option<HandlerArc> {
         self.inner.read().expect("library routes read lock").clone()
     }
 }
 
-impl<Request, Response> Clone for LibraryRoutes<Request, Response> {
+impl Clone for LibraryRoutes {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -521,22 +517,18 @@ impl<Request, Response> Clone for LibraryRoutes<Request, Response> {
     }
 }
 
-pub struct LibraryHandlers<Request, Response> {
-    get: HandlerArc<Request, Response>,
-    put: HandlerArc<Request, Response>,
-    route: Option<HandlerArc<Request, Response>>,
+pub struct LibraryHandlers {
+    get: HandlerArc,
+    put: HandlerArc,
+    route: Option<HandlerArc>,
 }
 
-impl<Request, Response> LibraryHandlers<Request, Response>
-where
-    Request: Send + 'static,
-    Response: Send + 'static,
-{
+impl LibraryHandlers {
     pub fn with_route<G, P, R>(get: G, put: P, route: R) -> Self
     where
-        G: KernelHandler<Request, Response>,
-        P: KernelHandler<Request, Response>,
-        R: KernelHandler<Request, Response>,
+        G: KernelHandler,
+        P: KernelHandler,
+        R: KernelHandler,
     {
         Self {
             get: Arc::new(get),
@@ -547,8 +539,8 @@ where
 
     pub fn without_route<G, P>(get: G, put: P) -> Self
     where
-        G: KernelHandler<Request, Response>,
-        P: KernelHandler<Request, Response>,
+        G: KernelHandler,
+        P: KernelHandler,
     {
         Self {
             get: Arc::new(get),
@@ -557,20 +549,20 @@ where
         }
     }
 
-    pub fn get_handler(&self) -> HandlerArc<Request, Response> {
+    pub fn get_handler(&self) -> HandlerArc {
         Arc::clone(&self.get)
     }
 
-    pub fn put_handler(&self) -> HandlerArc<Request, Response> {
+    pub fn put_handler(&self) -> HandlerArc {
         Arc::clone(&self.put)
     }
 
-    pub fn route_handler(&self) -> Option<HandlerArc<Request, Response>> {
+    pub fn route_handler(&self) -> Option<HandlerArc> {
         self.route.as_ref().map(Arc::clone)
     }
 }
 
-impl<Request, Response> Clone for LibraryHandlers<Request, Response> {
+impl Clone for LibraryHandlers {
     fn clone(&self) -> Self {
         Self {
             get: Arc::clone(&self.get),
@@ -653,24 +645,20 @@ impl<T> NativeLibraryHandler for T where
 {
 }
 
-pub struct LibraryRuntime<Request, Response> {
+pub struct LibraryRuntime {
     state: LibraryState,
-    routes: LibraryRoutes<Request, Response>,
+    routes: LibraryRoutes,
     storage: Option<crate::storage::LibraryDir>,
-    wasm_factory: Option<LibraryRouteFactory<Request, Response>>,
-    ir_factory: Option<LibraryRouteFactory<Request, Response>>,
+    wasm_factory: Option<LibraryRouteFactory>,
+    ir_factory: Option<LibraryRouteFactory>,
 }
 
-impl<Request, Response> LibraryRuntime<Request, Response>
-where
-    Request: Send + 'static,
-    Response: Send + 'static,
-{
+impl LibraryRuntime {
     pub fn new(
         initial_schema: LibrarySchema,
         storage: Option<crate::storage::LibraryDir>,
-        wasm_factory: Option<LibraryRouteFactory<Request, Response>>,
-        ir_factory: Option<LibraryRouteFactory<Request, Response>>,
+        wasm_factory: Option<LibraryRouteFactory>,
+        ir_factory: Option<LibraryRouteFactory>,
     ) -> Self {
         Self {
             state: LibraryState::new(initial_schema),
@@ -685,7 +673,7 @@ where
         self.state.clone()
     }
 
-    pub fn routes(&self) -> LibraryRoutes<Request, Response> {
+    pub fn routes(&self) -> LibraryRoutes {
         self.routes.clone()
     }
 
@@ -693,11 +681,11 @@ where
         self.storage.clone()
     }
 
-    pub fn wasm_factory(&self) -> Option<LibraryRouteFactory<Request, Response>> {
+    pub fn wasm_factory(&self) -> Option<LibraryRouteFactory> {
         self.wasm_factory.clone()
     }
 
-    pub fn ir_factory(&self) -> Option<LibraryRouteFactory<Request, Response>> {
+    pub fn ir_factory(&self) -> Option<LibraryRouteFactory> {
         self.ir_factory.clone()
     }
 
@@ -797,11 +785,7 @@ where
     }
 }
 
-impl<Request, Response> Clone for LibraryRuntime<Request, Response>
-where
-    Request: Send + 'static,
-    Response: Send + 'static,
-{
+impl Clone for LibraryRuntime {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
@@ -813,12 +797,13 @@ where
     }
 }
 
-#[cfg(feature = "http-server")]
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
 pub mod http {
     use std::{io, sync::Arc};
 
     use futures::{FutureExt, TryStreamExt};
-    use hyper::{Body, Request, Response, StatusCode, body};
+    use crate::http::{Body, Request, Response, StatusCode, header};
+    use hyper::body;
     use tc_ir::LibrarySchema;
 
     use crate::{
@@ -835,16 +820,16 @@ pub mod http {
     pub fn build_http_library_module(
         initial_schema: LibrarySchema,
         storage: Option<LibraryDir>,
-    ) -> Arc<LibraryRuntime<Request<Body>, Response<Body>>> {
-        let wasm_factory: LibraryRouteFactory<_, _> = Arc::new(|bytes: Vec<u8>| {
+    ) -> Arc<LibraryRuntime> {
+        let wasm_factory: LibraryRouteFactory = Arc::new(|bytes: Vec<u8>| {
             let (handler, schema, schema_routes) = http_wasm_route_handler_from_bytes(bytes)?;
-            let handler: Arc<dyn KernelHandler<Request<Body>, Response<Body>>> = Arc::new(handler);
+            let handler: Arc<dyn KernelHandler> = Arc::new(handler);
             Ok((schema, schema_routes, handler))
         });
 
-        let ir_factory: LibraryRouteFactory<_, _> = Arc::new(|bytes: Vec<u8>| {
+        let ir_factory: LibraryRouteFactory = Arc::new(|bytes: Vec<u8>| {
             let (handler, schema, schema_routes) = http_ir_route_handler_from_bytes(bytes)?;
-            let handler: Arc<dyn KernelHandler<Request<Body>, Response<Body>>> = Arc::new(handler);
+            let handler: Arc<dyn KernelHandler> = Arc::new(handler);
             Ok((schema, schema_routes, handler))
         });
 
@@ -857,8 +842,8 @@ pub mod http {
     }
 
     pub fn http_library_handlers(
-        module: &Arc<LibraryRuntime<Request<Body>, Response<Body>>>,
-    ) -> LibraryHandlers<Request<Body>, Response<Body>> {
+        module: &Arc<LibraryRuntime>,
+    ) -> LibraryHandlers {
         let state = module.state();
         let routes = module.routes();
         let storage = module.storage();
@@ -872,8 +857,8 @@ pub mod http {
 
     pub fn schema_get_handler(
         state: LibraryState,
-    ) -> impl KernelHandler<Request<Body>, Response<Body>> {
-        move |_req: Request<Body>| {
+    ) -> impl KernelHandler {
+        move |_req: Request| {
             let state = state.clone();
             async move { respond_with_schema(state.schema()) }.boxed()
         }
@@ -881,12 +866,12 @@ pub mod http {
 
     pub fn schema_put_handler(
         state: LibraryState,
-        routes: LibraryRoutes<Request<Body>, Response<Body>>,
+        routes: LibraryRoutes,
         storage: Option<LibraryDir>,
-        wasm_factory: Option<LibraryRouteFactory<Request<Body>, Response<Body>>>,
-        ir_factory: Option<LibraryRouteFactory<Request<Body>, Response<Body>>>,
-    ) -> impl KernelHandler<Request<Body>, Response<Body>> {
-        move |req: Request<Body>| {
+        wasm_factory: Option<LibraryRouteFactory>,
+        ir_factory: Option<LibraryRouteFactory>,
+    ) -> impl KernelHandler {
+        move |req: Request| {
             let state = state.clone();
             let routes = routes.clone();
             let storage = storage.clone();
@@ -936,14 +921,14 @@ pub mod http {
         }
     }
 
-    fn respond_with_schema(schema: LibrarySchema) -> Response<Body> {
+    fn respond_with_schema(schema: LibrarySchema) -> Response {
         match destream_json::encode(schema) {
             Ok(stream) => {
                 let body =
                     Body::wrap_stream(stream.map_err(|err| io::Error::other(err.to_string())));
-                Response::builder()
+                http::Response::builder()
                     .status(StatusCode::OK)
-                    .header(hyper::header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_TYPE, "application/json")
                     .body(body)
                     .expect("library schema response")
             }
@@ -951,7 +936,7 @@ pub mod http {
         }
     }
 
-    async fn decode_body(req: Request<Body>) -> Result<InstallRequest, InstallError> {
+    async fn decode_body(req: Request) -> Result<InstallRequest, InstallError> {
         let body_bytes = body::to_bytes(req.into_body())
             .await
             .map_err(|err| InstallError::internal(err.to_string()))?;
@@ -959,35 +944,35 @@ pub mod http {
     }
 
 
-    fn bad_request(message: String) -> Response<Body> {
-        Response::builder()
+    fn bad_request(message: String) -> Response {
+        http::Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from(message))
             .expect("bad request response")
     }
 
-    fn internal_error(message: String) -> Response<Body> {
-        Response::builder()
+    fn internal_error(message: String) -> Response {
+        http::Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::from(message))
             .expect("internal error response")
     }
 
-    fn unauthorized_response(message: impl Into<String>) -> Response<Body> {
-        Response::builder()
+    fn unauthorized_response(message: impl Into<String>) -> Response {
+        http::Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .body(Body::from(message.into()))
             .expect("unauthorized response")
     }
 
-    fn no_content_response() -> Response<Body> {
-        Response::builder()
+    fn no_content_response() -> Response {
+        http::Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(Body::empty())
             .expect("library install response")
     }
 
-    fn install_error_response(error: InstallError) -> Response<Body> {
+    fn install_error_response(error: InstallError) -> Response {
         match error {
             InstallError::BadRequest(message) => bad_request(message),
             InstallError::Internal(message) => internal_error(message),
@@ -995,16 +980,16 @@ pub mod http {
     }
 
     pub fn routes_handler(
-        routes: &LibraryRoutes<Request<Body>, Response<Body>>,
-    ) -> impl KernelHandler<Request<Body>, Response<Body>> + '_ {
+        routes: &LibraryRoutes,
+    ) -> impl KernelHandler + '_ {
         let routes = routes.clone();
-        move |req: Request<Body>| {
+        move |req: Request| {
             let handler = routes.current_handler();
             async move {
                 if let Some(handler) = handler {
                     handler.call(req).await
                 } else {
-                    Response::builder()
+                    http::Response::builder()
                         .status(StatusCode::NOT_FOUND)
                         .body(Body::empty())
                         .expect("missing route")
@@ -1018,7 +1003,8 @@ pub mod http {
     mod tests {
         use super::*;
         use crate::{Method, kernel::Kernel};
-        use hyper::{Body, Request, body::to_bytes};
+        use crate::http::{Body, header};
+        use hyper::body::to_bytes;
         use pathlink::Link;
         use serde_json::Value as JsonValue;
         use std::str::FromStr;
@@ -1039,7 +1025,7 @@ pub mod http {
                 .with_library_module(module, handlers)
                 .finish();
 
-            let request = Request::builder()
+            let request = http::Request::builder()
                 .method("GET")
                 .uri("/lib")
                 .body(Body::empty())
@@ -1082,10 +1068,10 @@ pub mod http {
                 "dependencies": [],
             });
 
-            let mut put_request = Request::builder()
+            let mut put_request = http::Request::builder()
                 .method("PUT")
                 .uri("/lib")
-                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(new_schema.to_string()))
                 .expect("install request");
             let install_claim = Claim::new(
@@ -1105,7 +1091,7 @@ pub mod http {
 
             assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
 
-            let get_request = Request::builder()
+            let get_request = http::Request::builder()
                 .method("GET")
                 .uri("/lib")
                 .body(Body::empty())

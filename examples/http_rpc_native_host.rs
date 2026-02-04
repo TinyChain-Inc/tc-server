@@ -1,12 +1,12 @@
 use std::{env, io::Write, net::TcpListener, str::FromStr};
 
 use futures::FutureExt;
-use hyper::{Body, Request, Response, StatusCode};
 use pathlink::Link;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Dir, HandleDelete, HandleGet, HandlePost, HandlePut, LibraryModule, parse_route_path};
 use tc_value::Value;
 use tinychain::{HttpKernelConfig, HttpServer};
+use tinychain::http::{Body, HttpMethod, Request, Response, StatusCode};
 use tinychain::library::NativeLibrary;
 use tinychain::http::build_http_kernel_with_native_library_and_config;
 use tinychain::txn::TxnHandle;
@@ -39,7 +39,7 @@ impl HandleGet<TxnHandle> for HelloHandler {
     }
 }
 
-fn method_not_allowed(method: hyper::Method, path: &'static str) -> TCError {
+fn method_not_allowed(method: HttpMethod, path: &'static str) -> TCError {
     TCError::method_not_allowed(method, path.to_string())
 }
 
@@ -54,7 +54,7 @@ impl HandlePut<TxnHandle> for HelloHandler {
 
     fn put<'a>(&'a self, _txn: &'a TxnHandle, _request: Self::Request) -> TCResult<Self::Fut<'a>> {
         Ok(Box::pin(async move {
-            Err(method_not_allowed(hyper::Method::PUT, "/hello"))
+            Err(method_not_allowed(HttpMethod::PUT, "/hello"))
         }))
     }
 }
@@ -70,7 +70,7 @@ impl HandlePost<TxnHandle> for HelloHandler {
 
     fn post<'a>(&'a self, _txn: &'a TxnHandle, _request: Self::Request) -> TCResult<Self::Fut<'a>> {
         Ok(Box::pin(async move {
-            Err(method_not_allowed(hyper::Method::POST, "/hello"))
+            Err(method_not_allowed(HttpMethod::POST, "/hello"))
         }))
     }
 }
@@ -86,14 +86,14 @@ impl HandleDelete<TxnHandle> for HelloHandler {
 
     fn delete<'a>(&'a self, _txn: &'a TxnHandle, _request: Self::Request) -> TCResult<Self::Fut<'a>> {
         Ok(Box::pin(async move {
-            Err(method_not_allowed(hyper::Method::DELETE, "/hello"))
+            Err(method_not_allowed(HttpMethod::DELETE, "/hello"))
         }))
     }
 }
 
-fn ok_handler(_req: Request<Body>) -> futures::future::BoxFuture<'static, Response<Body>> {
+fn ok_handler(_req: Request) -> futures::future::BoxFuture<'static, Response> {
     async move {
-        Response::builder()
+        http::Response::builder()
             .status(StatusCode::OK)
             .body(Body::empty())
             .expect("ok response")

@@ -101,8 +101,8 @@ only forward `txn_id`, request metadata, and an opaque bearer token.
   per-component claims.
 - `tc-server/src/kernel.rs` (`KernelBuilder::with_token_verifier`) allows swapping in a real JWT
   verifier/resolver without pushing transaction semantics into adapters.
-- `tc-server` has an optional `rjwt-token` feature which wires in an RJWT-compatible verifier (same
-  bearer token format as v1) once the host can resolve actor keys.
+- `tc-server` now wires in an RJWT-compatible verifier (same bearer token format as v1) once the
+  host can resolve actor keys.
 
 **Work items**
 

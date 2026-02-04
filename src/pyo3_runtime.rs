@@ -2,6 +2,8 @@
 
 use std::{fmt, io, marker::PhantomData, path::PathBuf, sync::Arc};
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, executor, stream};
 use pathlink::Link;
@@ -13,20 +15,16 @@ use tc_ir::{LibrarySchema, OpRef, Scalar, Subject, TxnId};
 use url::form_urlencoded;
 
 use crate::{
-    Kernel, KernelDispatch, KernelHandler, Method, State,
+    Body, Kernel, KernelDispatch, KernelHandler, Method, Request, Response, State, StatusCode,
     resolve::Resolve,
-    library::{
-        InstallError, InstallRequest, LibraryHandlers, LibraryRouteFactory, LibraryRoutes,
-        LibraryRuntime, LibraryState, decode_install_request_bytes,
-        default_library_schema,
-    },
+    library::{default_library_schema, http as http_library},
     storage::LibraryDir,
     txn::{TxnError, TxnManager},
 };
-use tc_state::{Collection, Tensor};
+use tc_state::{Collection, Tensor, null_transaction};
 use tc_value::Value;
 
-pub type PyKernel = Kernel<PyKernelRequest, PyResult<PyKernelResponse>>;
+pub type PyKernel = Kernel;
 
 #[derive(Clone)]
 pub struct PyKernelConfig {
@@ -171,7 +169,6 @@ pub struct PyKernelRequest {
     path: String,
     headers: Vec<(String, String)>,
     body: Option<PyStateHandle>,
-    txn: Option<crate::txn::TxnHandle>,
     // Retained for future Python adapter hooks; kept in-sync with the HTTP kernel path.
     #[allow(dead_code)]
     kernel: Option<Arc<PyKernel>>,
@@ -201,7 +198,6 @@ impl PyKernelRequest {
             path: path.to_string(),
             headers: headers.unwrap_or_default(),
             body,
-            txn: None,
             kernel: None,
         })
     }
@@ -234,14 +230,6 @@ impl PyKernelRequest {
 
     pub(crate) fn path_owned(&self) -> String {
         self.path.clone()
-    }
-
-    pub(crate) fn bind_txn_handle(&mut self, handle: crate::txn::TxnHandle) {
-        self.txn = Some(handle);
-    }
-
-    pub(crate) fn txn_handle(&self) -> Option<crate::txn::TxnHandle> {
-        self.txn.clone()
     }
 
     // Reserved for upcoming Python adapter integration; not wired yet.
@@ -313,8 +301,8 @@ pub(crate) fn python_kernel_builder_with_config(
         .data_dir
         .as_ref()
         .map(|dir| LibraryDir::new(dir.clone()));
-    let module = build_pyo3_library_module(config.initial_schema.clone(), storage);
-    let library_handlers = pyo3_library_handlers(&module);
+    let module = http_library::build_http_library_module(config.initial_schema.clone(), storage);
+    let library_handlers = http_library::http_library_handlers(&module);
 
     let mut builder = Kernel::builder()
         .with_host_id(config.host_id.clone())
@@ -331,80 +319,44 @@ pub(crate) fn python_kernel_builder_with_config(
     builder.finish()
 }
 
-fn build_pyo3_library_module(
-    initial_schema: LibrarySchema,
-    storage: Option<LibraryDir>,
-) -> Arc<LibraryRuntime<PyKernelRequest, PyResult<PyKernelResponse>>> {
-    let wasm_factory: LibraryRouteFactory<_, _> = Arc::new(|bytes: Vec<u8>| {
-        let (handler, schema, schema_routes) =
-            crate::wasm::pyo3_wasm_route_handler_from_bytes(bytes)?;
-        let handler: Arc<dyn KernelHandler<PyKernelRequest, PyResult<PyKernelResponse>>> =
-            Arc::new(handler);
-        Ok((schema, schema_routes, handler))
-    });
 
-    let ir_factory: LibraryRouteFactory<_, _> = Arc::new(|bytes: Vec<u8>| {
-        let (handler, schema, schema_routes) =
-            crate::ir::pyo3_ir_route_handler_from_bytes(bytes)?;
-        let handler: Arc<dyn KernelHandler<PyKernelRequest, PyResult<PyKernelResponse>>> =
-            Arc::new(handler);
-        Ok((schema, schema_routes, handler))
-    });
-
-    Arc::new(LibraryRuntime::new(
-        initial_schema,
-        storage,
-        Some(wasm_factory),
-        Some(ir_factory),
-    ))
-}
-
-fn pyo3_library_handlers(
-    module: &Arc<LibraryRuntime<PyKernelRequest, PyResult<PyKernelResponse>>>,
-) -> LibraryHandlers<PyKernelRequest, PyResult<PyKernelResponse>> {
-    let state = module.state();
-    let routes = module.routes();
-    let storage = module.storage();
-    let wasm_factory = module.wasm_factory();
-    let ir_factory = module.ir_factory();
-    let get = py_library_get_handler(state.clone());
-    let put = py_library_put_handler(
-        state,
-        routes.clone(),
-        storage,
-        wasm_factory.clone(),
-        ir_factory.clone(),
-    );
-
-    if wasm_factory.is_some() || ir_factory.is_some() {
-        let route = py_routes_handler(&routes);
-        LibraryHandlers::with_route(get, put, route)
-    } else {
-        LibraryHandlers::without_route(get, put)
-    }
-}
-
-pub(crate) fn python_handler(
-    callback: Py<PyAny>,
-) -> impl KernelHandler<PyKernelRequest, PyResult<PyKernelResponse>> {
-    move |req: PyKernelRequest| {
+pub(crate) fn python_handler(callback: Py<PyAny>) -> impl KernelHandler {
+    move |req: Request| {
         let callback = callback.clone();
         async move {
-            Python::with_gil(|py| -> PyResult<PyKernelResponse> {
+            let py_req = match py_request_from_http(req).await {
+                Ok(req) => req,
+                Err(err) => return py_error_response(err),
+            };
+
+            let py_response = match Python::with_gil(|py| -> PyResult<PyKernelResponse> {
                 let callable = callback.bind(py);
-                let arg = Py::new(py, req.clone())?;
+                let arg = Py::new(py, py_req.clone())?;
                 let raw = callable.call1((arg,))?;
                 let response: Py<PyKernelResponse> = raw.extract()?;
                 Ok(response.borrow(py).clone_inner())
-            })
+            }) {
+                Ok(response) => response,
+                Err(err) => return py_error_response(err),
+            };
+
+            match py_response_to_http(py_response).await {
+                Ok(response) => response,
+                Err(err) => py_error_response(err),
+            }
         }
         .boxed()
     }
 }
 
-pub(crate) fn python_health_handler()
--> impl KernelHandler<PyKernelRequest, PyResult<PyKernelResponse>> {
-    move |_req: PyKernelRequest| async move { Ok(PyKernelResponse::new(200, None, None)) }.boxed()
+pub(crate) fn python_health_handler() -> impl KernelHandler {
+    move |_req: Request| async move {
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .expect("health response")
+    }
+    .boxed()
 }
 
 pub(crate) fn stub_py_handler() -> Py<PyAny> {
@@ -494,11 +446,44 @@ impl KernelHandle {
     #[classmethod]
     pub fn with_library_schema(_cls: &Bound<'_, PyType>, schema_json: &str) -> PyResult<Self> {
         let schema = decode_schema_from_json(schema_json)?;
-        let module = build_pyo3_library_module(schema, None);
-        let handlers = pyo3_library_handlers(&module);
+        let module = http_library::build_http_library_module(schema, None);
+        let handlers = http_library::http_library_handlers(&module);
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
             .with_library_module(module, handlers)
+            .finish();
+        Ok(Self::from_kernel(kernel))
+    }
+
+    #[classmethod]
+    #[pyo3(signature = (schema_json, token_host, actor_id, public_key_b64, data_dir=None))]
+    pub fn with_library_schema_rjwt(
+        _cls: &Bound<'_, PyType>,
+        schema_json: &str,
+        token_host: &str,
+        actor_id: &str,
+        public_key_b64: &str,
+        data_dir: Option<PathBuf>,
+    ) -> PyResult<Self> {
+        use std::str::FromStr;
+
+        let schema = decode_schema_from_json(schema_json)?;
+        let storage = data_dir.map(LibraryDir::new);
+        let module = http_library::build_http_library_module(schema, storage);
+        let handlers = http_library::http_library_handlers(&module);
+        let host = Link::from_str(token_host)
+            .map_err(|_| PyValueError::new_err("invalid token host"))?;
+        let key_bytes = STANDARD
+            .decode(public_key_b64)
+            .map_err(|_| PyValueError::new_err("invalid public key base64"))?;
+        let verifying_key = rjwt::VerifyingKey::try_from(key_bytes.as_slice())
+            .map_err(|_| PyValueError::new_err("invalid public key"))?;
+        let actor = crate::auth::Actor::with_public_key(Value::from(actor_id), verifying_key);
+        let keyring = crate::auth::KeyringActorResolver::default().with_actor(host, actor);
+        let kernel = Kernel::builder()
+            .with_host_id("tc-py-kernel")
+            .with_library_module(module, handlers)
+            .with_rjwt_keyring_token_verifier(keyring)
             .finish();
         Ok(Self::from_kernel(kernel))
     }
@@ -514,13 +499,50 @@ impl KernelHandle {
     ) -> PyResult<Self> {
         let schema = decode_schema_from_json(schema_json)?;
         let storage = data_dir.map(LibraryDir::new);
-        let module = build_pyo3_library_module(schema, storage);
-        let handlers = pyo3_library_handlers(&module);
+        let module = http_library::build_http_library_module(schema, storage);
+        let handlers = http_library::http_library_handlers(&module);
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
             .with_library_module(module, handlers)
             .with_dependency_route(dependency_root, authority)
             .with_http_rpc_gateway()
+            .finish();
+        Ok(Self::from_kernel(kernel))
+    }
+
+    #[classmethod]
+    #[pyo3(signature = (schema_json, dependency_root, authority, token_host, actor_id, public_key_b64, data_dir=None))]
+    pub fn with_library_schema_and_dependency_route_rjwt(
+        _cls: &Bound<'_, PyType>,
+        schema_json: &str,
+        dependency_root: &str,
+        authority: &str,
+        token_host: &str,
+        actor_id: &str,
+        public_key_b64: &str,
+        data_dir: Option<PathBuf>,
+    ) -> PyResult<Self> {
+        use std::str::FromStr;
+
+        let schema = decode_schema_from_json(schema_json)?;
+        let storage = data_dir.map(LibraryDir::new);
+        let module = http_library::build_http_library_module(schema, storage);
+        let handlers = http_library::http_library_handlers(&module);
+        let host = Link::from_str(token_host)
+            .map_err(|_| PyValueError::new_err("invalid token host"))?;
+        let key_bytes = STANDARD
+            .decode(public_key_b64)
+            .map_err(|_| PyValueError::new_err("invalid public key base64"))?;
+        let verifying_key = rjwt::VerifyingKey::try_from(key_bytes.as_slice())
+            .map_err(|_| PyValueError::new_err("invalid public key"))?;
+        let actor = crate::auth::Actor::with_public_key(Value::from(actor_id), verifying_key);
+        let keyring = crate::auth::KeyringActorResolver::default().with_actor(host, actor);
+        let kernel = Kernel::builder()
+            .with_host_id("tc-py-kernel")
+            .with_library_module(module, handlers)
+            .with_dependency_route(dependency_root, authority)
+            .with_http_rpc_gateway()
+            .with_rjwt_keyring_token_verifier(keyring)
             .finish();
         Ok(Self::from_kernel(kernel))
     }
@@ -618,6 +640,7 @@ impl KernelHandle {
                         .map(|token| vec![("authorization".to_string(), format!("Bearer {token}"))]),
                     body,
                 )?;
+                let request = http_request_from_py(&request)?;
 
                 match self.inner.route_request(
                     Method::Get,
@@ -627,10 +650,12 @@ impl KernelHandle {
                     true,
                     local_token.as_ref(),
                     |handle, req| {
-                        req.bind_txn_handle(handle.clone());
+                        req.extensions_mut().insert(handle.clone());
                     },
                 ) {
-                    Ok(KernelDispatch::Response(resp)) => self.block_on(resp),
+                    Ok(KernelDispatch::Response(resp)) => {
+                        self.block_on(async move { py_response_from_http(resp.await).await })
+                    }
                     Ok(KernelDispatch::Finalize { commit: _, result }) => {
                         let status = if result.is_ok() { 204 } else { 400 };
                         Ok(PyKernelResponse::new(status, None, None))
@@ -668,6 +693,7 @@ impl KernelHandle {
         let inbound_txn_id = txn_id;
         let mut minted_txn_id: Option<TxnId> = None;
         let mut minted_token: Option<String> = None;
+        let request = http_request_from_py(&request)?;
 
         match self.inner.route_request(
             method,
@@ -681,11 +707,12 @@ impl KernelHandle {
                 if inbound_bearer.is_none() {
                     minted_token = handle.raw_token().map(str::to_string);
                 }
-                req.bind_txn_handle(handle.clone());
+                req.extensions_mut().insert(handle.clone());
             },
         ) {
             Ok(KernelDispatch::Response(resp)) => {
-                let mut response = self.block_on(resp)?;
+                let mut response =
+                    self.block_on(async move { py_response_from_http(resp.await).await })?;
                 if inbound_txn_id.is_none()
                     && let Some(txn_id) = minted_txn_id
                 {
@@ -774,6 +801,126 @@ fn parse_method(method: &str) -> PyResult<Method> {
     }
 }
 
+fn http_request_from_py(request: &PyKernelRequest) -> PyResult<Request> {
+    let method = match request.method_enum() {
+        Method::Get => crate::HttpMethod::GET,
+        Method::Put => crate::HttpMethod::PUT,
+        Method::Post => crate::HttpMethod::POST,
+        Method::Delete => crate::HttpMethod::DELETE,
+    };
+
+    let mut builder = http::Request::builder().method(method).uri(request.path());
+    for (name, value) in request.headers() {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+
+    let body_bytes = request_body_bytes(request.body())?;
+    builder
+        .body(Body::from(body_bytes))
+        .map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+async fn py_request_from_http(req: Request) -> PyResult<PyKernelRequest> {
+    let (parts, body) = req.into_parts();
+    let method = parse_method(parts.method.as_str())?;
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+
+    let headers = parts
+        .headers
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+        })
+        .collect::<Vec<_>>();
+
+    let body_bytes = hyper::body::to_bytes(body)
+        .await
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let body = if body_bytes.is_empty() {
+        None
+    } else {
+        let state = decode_state_from_bytes(body_bytes.to_vec())?;
+        Some(py_state_handle_from_state(state)?)
+    };
+
+    Ok(PyKernelRequest {
+        method,
+        path,
+        headers,
+        body,
+        kernel: None,
+    })
+}
+
+async fn py_response_from_http(response: Response) -> PyResult<PyKernelResponse> {
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+        })
+        .collect::<Vec<_>>();
+
+    let body_bytes = hyper::body::to_bytes(response.into_body())
+        .await
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let body = if body_bytes.is_empty() {
+        None
+    } else {
+        let state = decode_state_from_bytes(body_bytes.to_vec())?;
+        Some(py_state_handle_from_state(state)?)
+    };
+
+    Ok(PyKernelResponse::new(status, Some(headers), body))
+}
+
+async fn py_response_to_http(response: PyKernelResponse) -> PyResult<Response> {
+    let mut builder = http::Response::builder().status(response.status());
+    for (name, value) in response.headers() {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+
+    let body_bytes = request_body_bytes(response.body())?;
+    if !body_bytes.is_empty() {
+        builder = builder.header(crate::header::CONTENT_TYPE, "application/json");
+    }
+
+    builder
+        .body(Body::from(body_bytes))
+        .map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+fn py_state_handle_from_state(state: State) -> PyResult<PyStateHandle> {
+    Python::with_gil(|py| {
+        let initializer = PyState::initializer_from_state(state);
+        let py_state = Py::new(py, initializer)?;
+        Ok(PyStateHandle::new(py_state.into_py(py)))
+    })
+}
+
+async fn decode_state_from_bytes_async(bytes: Vec<u8>) -> Result<State, String> {
+    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(bytes))]);
+    destream_json::try_decode(null_transaction(), stream)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+fn decode_state_from_bytes(bytes: Vec<u8>) -> PyResult<State> {
+    executor::block_on(decode_state_from_bytes_async(bytes)).map_err(PyValueError::new_err)
+}
+
+fn py_error_response(err: PyErr) -> Response {
+    http::Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Body::from(err.to_string()))
+        .expect("python error response")
+}
+
 pub(crate) fn py_bearer_token(request: &PyKernelRequest) -> Option<String> {
     request.headers.iter().find_map(|(key, value)| {
         if !key.eq_ignore_ascii_case("authorization") {
@@ -799,7 +946,8 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use futures::FutureExt;
-    use hyper::{Body, Request, Response, StatusCode, body::to_bytes};
+    use crate::{Body, Request, Response, StatusCode};
+    use hyper::body::to_bytes;
     use pathlink::Link;
     use std::{net::TcpListener, str::FromStr};
     use tower::Service;
@@ -816,8 +964,8 @@ mod tests {
         }
     }
 
-    impl Service<Request<Body>> for KernelService {
-        type Response = Response<Body>;
+    impl Service<Request> for KernelService {
+        type Response = Response;
         type Error = hyper::Error;
         type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -828,7 +976,7 @@ mod tests {
             std::task::Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, req: Request<Body>) -> Self::Future {
+        fn call(&mut self, req: Request) -> Self::Future {
             let uri = req.uri().clone();
             let method = req.method().clone();
             let path = uri.path().to_owned();
@@ -836,12 +984,12 @@ mod tests {
 
             Box::pin(async move {
                 let method = match method {
-                    hyper::Method::GET => crate::Method::Get,
-                    hyper::Method::PUT => crate::Method::Put,
-                    hyper::Method::POST => crate::Method::Post,
-                    hyper::Method::DELETE => crate::Method::Delete,
+                    crate::HttpMethod::GET => crate::Method::Get,
+                    crate::HttpMethod::PUT => crate::Method::Put,
+                    crate::HttpMethod::POST => crate::Method::Post,
+                    crate::HttpMethod::DELETE => crate::Method::Delete,
                     _ => {
-                        return Ok(Response::builder()
+                        return Ok(http::Response::builder()
                             .status(StatusCode::METHOD_NOT_ALLOWED)
                             .body(Body::empty())
                             .expect("method not allowed"));
@@ -856,11 +1004,38 @@ mod tests {
                 let txn_id = match parse_txn_id(&req) {
                     Ok(id) => id,
                     Err(()) => {
-                        return Ok(Response::builder()
+                        return Ok(http::Response::builder()
                             .status(StatusCode::BAD_REQUEST)
                             .body(Body::from("invalid transaction id"))
                             .expect("bad request"));
                     }
+                };
+
+                let bearer = req
+                    .headers()
+                    .get(crate::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|auth| auth.split_once(' '))
+                    .and_then(|(scheme, token)| {
+                        if scheme.eq_ignore_ascii_case("bearer") {
+                            Some(token.trim().to_string())
+                        } else {
+                            None
+                        }
+                    });
+
+                let token = match bearer {
+                    Some(token) => match kernel.token_verifier().verify(token).await {
+                        Ok(token) => Some(token),
+                        Err(crate::txn::TxnError::Unauthorized) => {
+                            return Ok(http::Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .body(Body::empty())
+                                .expect("unauthorized"));
+                        }
+                        Err(crate::txn::TxnError::NotFound) => None,
+                    },
+                    None => None,
                 };
 
                 match kernel.route_request(
@@ -869,7 +1044,7 @@ mod tests {
                     req,
                     txn_id,
                     body_is_none,
-                    None,
+                    token.as_ref(),
                     |handle, req| {
                         req.extensions_mut().insert(handle.clone());
                     },
@@ -881,20 +1056,20 @@ mod tests {
                         } else {
                             StatusCode::BAD_REQUEST
                         };
-                        Ok(Response::builder()
+                        Ok(http::Response::builder()
                             .status(status)
                             .body(Body::empty())
                             .expect("finalize response"))
                     }
-                    Ok(crate::KernelDispatch::NotFound) => Ok(Response::builder()
+                    Ok(crate::KernelDispatch::NotFound) => Ok(http::Response::builder()
                         .status(StatusCode::NOT_FOUND)
                         .body(Body::empty())
                         .expect("not found")),
-                    Err(crate::txn::TxnError::NotFound) => Ok(Response::builder()
+                    Err(crate::txn::TxnError::NotFound) => Ok(http::Response::builder()
                         .status(StatusCode::BAD_REQUEST)
                         .body(Body::from("unknown transaction id"))
                         .expect("bad request")),
-                    Err(crate::txn::TxnError::Unauthorized) => Ok(Response::builder()
+                    Err(crate::txn::TxnError::Unauthorized) => Ok(http::Response::builder()
                         .status(StatusCode::UNAUTHORIZED)
                         .body(Body::empty())
                         .expect("unauthorized")),
@@ -903,10 +1078,10 @@ mod tests {
         }
     }
 
-    async fn parse_body(req: Request<Body>) -> Result<(Request<Body>, bool), Response<Body>> {
+    async fn parse_body(req: Request) -> Result<(Request, bool), Response> {
         let (parts, body) = req.into_parts();
         let body_bytes = to_bytes(body).await.map_err(|_| {
-            Response::builder()
+            http::Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from("failed to read request body"))
                 .expect("internal error")
@@ -918,7 +1093,7 @@ mod tests {
         ))
     }
 
-    fn parse_txn_id(req: &Request<Body>) -> Result<Option<tc_ir::TxnId>, ()> {
+    fn parse_txn_id(req: &Request) -> Result<Option<tc_ir::TxnId>, ()> {
         let query = req.uri().query().unwrap_or("");
         let txn_id_param = form_urlencoded::parse(query.as_bytes())
             .into_owned()
@@ -931,12 +1106,8 @@ mod tests {
         }
     }
 
-    fn ok_py_response() -> PyResult<PyKernelResponse> {
-        Ok(PyKernelResponse::new(200, None, None))
-    }
-
-    fn ok_py_handler() -> impl KernelHandler<PyKernelRequest, PyResult<PyKernelResponse>> {
-        |_req: PyKernelRequest| async move { ok_py_response() }.boxed()
+    fn ok_py_handler() -> impl KernelHandler {
+        |_req: Request| async move { Response::new(Body::empty()) }.boxed()
     }
 
     fn wasm_module() -> Vec<u8> {
@@ -957,7 +1128,7 @@ mod tests {
             .with_host_id("tc-remote-test")
             .with_library_module(module, handlers)
             .with_service_handler(|_req| async move {
-                Response::builder()
+                http::Response::builder()
                     .status(StatusCode::OK)
                     .body(Body::from("service"))
                     .expect("service response")
@@ -979,12 +1150,21 @@ mod tests {
             }]
         });
 
-        let install_request = Request::builder()
+        let mut install_request = http::Request::builder()
             .method("PUT")
             .uri("/lib")
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Body::from(install_payload.to_string()))
             .expect("install request");
+        let install_claim = tc_ir::Claim::new(
+            Link::from_str("/lib/example-devco/example/0.1.0").unwrap(),
+            umask::USER_WRITE,
+        );
+        let install_txn = remote_kernel
+            .txn_manager()
+            .begin()
+            .with_claims(vec![install_claim]);
+        install_request.extensions_mut().insert(install_txn);
 
         let install_response = remote_kernel
             .dispatch(crate::Method::Put, "/lib", install_request)
@@ -1008,8 +1188,8 @@ mod tests {
             "0.1.0",
             vec![Link::from_str(dependency_root).unwrap()],
         );
-        let local_module = build_pyo3_library_module(local_schema, None);
-        let local_handlers = pyo3_library_handlers(&local_module);
+        let local_module = crate::library::http::build_http_library_module(local_schema, None);
+        let local_handlers = crate::library::http::http_library_handlers(&local_module);
 
         let local_kernel: PyKernel = crate::Kernel::builder()
             .with_host_id("tc-py-local")
@@ -1021,7 +1201,19 @@ mod tests {
             .with_health_handler(ok_py_handler())
             .finish();
 
-        let txn = local_kernel.with_resolver(remote_kernel.txn_manager().begin());
+        let remote_txn = remote_kernel.txn_manager().begin();
+        let owner_id = remote_txn
+            .owner_id()
+            .expect("remote txn owner");
+        let bearer = remote_txn
+            .raw_token()
+            .expect("remote txn bearer token");
+        let _ = local_kernel.txn_manager().interpret_request(
+            Some(remote_txn.id()),
+            Some(owner_id),
+            Some(bearer),
+        );
+        let txn = local_kernel.with_resolver(remote_txn);
         let op = OpRef::Get((
             tc_ir::Subject::Link(
                 Link::from_str("/lib/example-devco/example/0.1.0/hello").unwrap(),
@@ -1048,8 +1240,8 @@ mod tests {
             "0.1.0",
             vec![Link::from_str("/lib").unwrap()],
         );
-        let local_module = build_pyo3_library_module(local_schema, None);
-        let local_handlers = pyo3_library_handlers(&local_module);
+        let local_module = crate::library::http::build_http_library_module(local_schema, None);
+        let local_handlers = crate::library::http::http_library_handlers(&local_module);
 
         let local_kernel: PyKernel = crate::Kernel::builder()
             .with_host_id("tc-py-local")
@@ -1094,102 +1286,6 @@ fn parse_path_and_txn_id(path: &str) -> PyResult<(String, Option<TxnId>)> {
     } else {
         Ok((path.to_string(), None))
     }
-}
-
-fn py_library_get_handler(
-    state: LibraryState,
-) -> impl KernelHandler<PyKernelRequest, PyResult<PyKernelResponse>> {
-    move |_req: PyKernelRequest| {
-        let state = state.clone();
-        async move {
-            let schema = state.schema();
-            let json = schema_to_json_string_async(schema)
-                .await
-                .map_err(PyValueError::new_err)?;
-            Python::with_gil(|py| {
-                let body = PyStateHandle::new(PyString::new_bound(py, &json).into_py(py));
-                Ok(PyKernelResponse::new(200, None, Some(body)))
-            })
-        }
-        .boxed()
-    }
-}
-
-fn py_routes_handler(
-    routes: &LibraryRoutes<PyKernelRequest, PyResult<PyKernelResponse>>,
-) -> impl KernelHandler<PyKernelRequest, PyResult<PyKernelResponse>> {
-    let routes = routes.clone();
-    move |req: PyKernelRequest| {
-        let handler = routes.current_handler();
-        async move {
-            if let Some(handler) = handler {
-                handler.call(req).await
-            } else {
-                Ok(PyKernelResponse::new(404, None, None))
-            }
-        }
-        .boxed()
-    }
-}
-
-fn install_error_to_py(err: InstallError) -> PyErr {
-    PyValueError::new_err(err.message().to_string())
-}
-
-fn py_library_put_handler(
-    state: LibraryState,
-    routes: LibraryRoutes<PyKernelRequest, PyResult<PyKernelResponse>>,
-    storage: Option<LibraryDir>,
-    wasm_factory: Option<LibraryRouteFactory<PyKernelRequest, PyResult<PyKernelResponse>>>,
-    ir_factory: Option<LibraryRouteFactory<PyKernelRequest, PyResult<PyKernelResponse>>>,
-) -> impl KernelHandler<PyKernelRequest, PyResult<PyKernelResponse>> {
-    move |req: PyKernelRequest| {
-        let state = state.clone();
-        let routes = routes.clone();
-        let storage = storage.clone();
-        let wasm_factory = wasm_factory.clone();
-        let ir_factory = ir_factory.clone();
-        async move {
-            let bytes = request_body_bytes(req.body())?;
-            match decode_install_request_bytes(&bytes).map_err(install_error_to_py)? {
-                InstallRequest::SchemaOnly(schema) => {
-                    state.replace_schema(schema);
-                    routes.clear();
-                    if let Some(storage) = &storage {
-                        storage
-                            .persist_schema(&state.schema())
-                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                    }
-                    Ok(PyKernelResponse::new(204, None, None))
-                }
-                InstallRequest::WithArtifacts(payload) => {
-                    crate::library::apply_install(
-                        &state,
-                        &routes,
-                        storage.as_ref(),
-                        wasm_factory.as_ref(),
-                        ir_factory.as_ref(),
-                        payload,
-                    )
-                    .map_err(install_error_to_py)?;
-                    Ok(PyKernelResponse::new(204, None, None))
-                }
-            }
-        }
-        .boxed()
-    }
-}
-
-async fn schema_to_json_string_async(schema: LibrarySchema) -> Result<String, String> {
-    let stream = destream_json::encode(schema).map_err(|err| err.to_string())?;
-    let bytes = stream
-        .map_err(|err| err.to_string())
-        .try_fold(Vec::new(), |mut acc, chunk| async move {
-            acc.extend_from_slice(&chunk);
-            Ok(acc)
-        })
-        .await?;
-    String::from_utf8(bytes).map_err(|err| err.to_string())
 }
 
 async fn decode_schema_from_bytes_async(bytes: Vec<u8>) -> Result<LibrarySchema, String> {

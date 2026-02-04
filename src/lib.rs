@@ -8,6 +8,10 @@ pub mod txn_server;
 pub mod uri;
 
 pub use kernel::{Kernel, KernelBuilder, KernelDispatch, KernelHandler, Method};
+pub use hyper::{Body, StatusCode, header};
+pub use hyper::Method as HttpMethod;
+pub type Request = hyper::Request<hyper::Body>;
+pub type Response = hyper::Response<hyper::Body>;
 pub use gateway::RpcGateway as RpcClient;
 pub use tc_ir::{
     Dir, HandleDelete, HandleGet, HandlePost, HandlePut, Handler, Route, Transaction,
@@ -33,7 +37,7 @@ pub use tc_value::Value;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-#[cfg(feature = "http-server")]
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
 pub mod http;
 
 #[cfg(feature = "http-client")]

@@ -9,10 +9,10 @@ name = "tinychain"
 [dependencies]
 bytes = "1"
 futures = "0.3"
-pathlink = "0.4"
+pathlink = { version = "0.4", features = ["serialize"] }
 tc-ir = { path = "../tc-ir" }
 tc-error = "0.13"
-tc-value = { path = "../tc-value" }
+tc-value = { path = "../tc-value", features = ["serialize"] }
 tc-state = { path = "../tc-state" }
 umask = "2.1"
 parking_lot = "0.12"
@@ -25,7 +25,7 @@ serde_json = "1"
 base64 = "0.22"
 getrandom = "0.2"
 sha2 = "0.10"
-rjwt = { version = "0.6", optional = true }
+rjwt = { version = "0.6" }
 
 [dependencies.destream_json]
 version = "0.15"
@@ -44,7 +44,6 @@ optional = true
 [dependencies.hyper]
 version = "0.14"
 features = ["full"]
-optional = true
 
 [dependencies.tokio]
 version = "1"
@@ -59,13 +58,12 @@ optional = true
 [features]
 default = ["http-server", "wasm"]
 # Outbound HTTP client support (for proxying requests to remote hosts).
-http-client = ["dep:http", "dep:hyper", "dep:tokio"]
+http-client = ["dep:http", "dep:tokio"]
 # Inbound HTTP server support (Hyper server + tower make_service wiring).
 http-server = ["http-client", "dep:tower", "dep:destream_json"]
-pyo3 = ["http-client", "dep:pyo3", "dep:destream_json", "tc-ir/pyo3-conversions"]
+pyo3 = ["http-server", "dep:pyo3", "dep:destream_json", "tc-ir/pyo3-conversions"]
 pyo3-extension = ["pyo3", "pyo3/extension-module"]
 wasm = ["dep:wasmtime"]
-rjwt-token = ["dep:rjwt", "pathlink/serialize", "tc-value/serialize"]
 
 [dev-dependencies]
 serde_json = "1"
@@ -75,3 +73,6 @@ tc-wasm = { path = "../tc-wasm" }
 [[example]]
 name = "http_rpc_native_host"
 required-features = ["http-server"]
+
+[[example]]
+name = "rjwt_install_token"
