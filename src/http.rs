@@ -1138,7 +1138,7 @@ mod tests {
         use base64::Engine as _;
         use tc_ir::OpRef;
 
-        let bytes = crate::test_utils::wasm_hello_world_module();
+        let bytes = crate::test_utils::wasm_echo_request_module();
         let initial =
             tc_ir::LibrarySchema::new(Link::from_str("/lib/initial").unwrap(), "0.0.1", vec![]);
         let module = crate::library::http::build_http_library_module(initial, None);
@@ -1216,13 +1216,16 @@ mod tests {
 
         let link =
             Link::from_str("/lib/example-devco/example/0.1.0/hello").expect("op link");
-        let op = OpRef::Get((tc_ir::Subject::Link(link), tc_ir::Scalar::default()));
+        let op = OpRef::Get((
+            tc_ir::Subject::Link(link),
+            tc_ir::Scalar::Value(tc_value::Value::from("World")),
+        ));
 
         let response = op.resolve(&txn).await.expect("resolve response");
 
         assert!(matches!(
             response,
-            crate::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::String(ref s))) if s == "hello"
+            crate::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::String(ref s))) if s == "World"
         ));
 
         server_task.abort();

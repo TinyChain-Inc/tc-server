@@ -45,8 +45,12 @@ impl RpcGateway for HttpRpcGateway {
             Err(err) => return futures::future::ready(Err(err)).boxed(),
         };
 
-        let request = match build_request(Method::Get, uri, txn.authorization_header(), Vec::new())
-        {
+        let body = match encode_value_body(&key) {
+            Ok(bytes) => bytes,
+            Err(err) => return futures::future::ready(Err(err)).boxed(),
+        };
+
+        let request = match build_request(Method::Get, uri, txn.authorization_header(), body) {
             Ok(req) => req,
             Err(err) => return futures::future::ready(Err(err)).boxed(),
         };
@@ -275,6 +279,27 @@ fn encode_params_body(params: Map<State>) -> TCResult<Vec<u8>> {
     use futures::TryStreamExt;
 
     let stream = destream_json::encode(params)
+        .map_err(|err| TCError::bad_request(err.to_string()))?;
+    futures::executor::block_on(async move {
+        stream
+            .map_err(|err| std::io::Error::other(err.to_string()))
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await
+            .map_err(|err| TCError::bad_request(err.to_string()))
+    })
+}
+
+fn encode_value_body(value: &Value) -> TCResult<Vec<u8>> {
+    use futures::TryStreamExt;
+
+    if matches!(value, Value::None) {
+        return Ok(Vec::new());
+    }
+
+    let stream = destream_json::encode(value.clone())
         .map_err(|err| TCError::bad_request(err.to_string()))?;
     futures::executor::block_on(async move {
         stream
