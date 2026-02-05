@@ -18,13 +18,11 @@ use crate::{
     Body, Kernel, KernelDispatch, KernelHandler, Method, Request, Response, State, StatusCode,
     resolve::Resolve,
     library::{default_library_schema, http as http_library},
-    storage::LibraryDir,
+    storage::load_library_root,
     txn::{TxnError, TxnManager},
 };
 use tc_state::{Collection, Tensor, null_transaction};
 use tc_value::Value;
-
-pub type PyKernel = Kernel;
 
 #[derive(Clone)]
 pub struct PyKernelConfig {
@@ -171,7 +169,7 @@ pub struct PyKernelRequest {
     body: Option<PyStateHandle>,
     // Retained for future Python adapter hooks; kept in-sync with the HTTP kernel path.
     #[allow(dead_code)]
-    kernel: Option<Arc<PyKernel>>,
+    kernel: Option<Arc<Kernel>>,
 }
 
 impl fmt::Debug for PyKernelRequest {
@@ -234,13 +232,13 @@ impl PyKernelRequest {
 
     // Reserved for upcoming Python adapter integration; not wired yet.
     #[allow(dead_code)]
-    pub(crate) fn bind_kernel(&mut self, kernel: Arc<PyKernel>) {
+    pub(crate) fn bind_kernel(&mut self, kernel: Arc<Kernel>) {
         self.kernel = Some(kernel);
     }
 
     // Reserved for upcoming Python adapter integration; not wired yet.
     #[allow(dead_code)]
-    pub(crate) fn kernel(&self) -> Option<Arc<PyKernel>> {
+    pub(crate) fn kernel(&self) -> Option<Arc<Kernel>> {
         self.kernel.clone()
     }
 }
@@ -295,13 +293,32 @@ pub(crate) fn python_kernel_builder_with_config(
     service: Py<PyAny>,
     metrics: Option<Py<PyAny>>,
     config: PyKernelConfig,
-) -> PyKernel {
+) -> Kernel {
     let _ = lib; // /lib is managed by the Rust kernel.
-    let storage = config
-        .data_dir
-        .as_ref()
-        .map(|dir| LibraryDir::new(dir.clone()));
-    let module = http_library::build_http_library_module(config.initial_schema.clone(), storage);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let storage_root = config.data_dir.clone();
+    // PyO3 boundary is synchronous; block here by design to build the library module.
+    let module = match storage_root {
+        Some(root) => {
+            let root_dir = runtime.block_on(load_library_root(root))
+                .expect("library root");
+            runtime.block_on(http_library::build_http_library_module_with_store(
+                config.initial_schema.clone(),
+                Some(crate::storage::LibraryStore::from_root(root_dir)),
+            ))
+            .expect("library module")
+        }
+        None => runtime.block_on(http_library::build_http_library_module(
+            config.initial_schema.clone(),
+            None,
+        ))
+        .expect("library module"),
+    };
+    // PyO3 boundary is synchronous; hydrate storage by blocking here.
+    runtime.block_on(module.hydrate_from_storage()).expect("library hydrate");
     let library_handlers = http_library::http_library_handlers(&module);
 
     let mut builder = Kernel::builder()
@@ -317,6 +334,17 @@ pub(crate) fn python_kernel_builder_with_config(
     }
 
     builder.finish()
+}
+
+fn block_on_tokio<F>(fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(fut)
 }
 
 
@@ -376,7 +404,7 @@ pub(crate) fn stub_py_handler() -> Py<PyAny> {
 
 #[pyclass(name = "KernelHandle")]
 pub struct KernelHandle {
-    inner: Arc<PyKernel>,
+    inner: Arc<Kernel>,
     txn_manager: TxnManager,
     runtime: Arc<tokio::runtime::Runtime>,
 }
@@ -392,7 +420,7 @@ impl Clone for KernelHandle {
 }
 
 impl KernelHandle {
-    fn from_kernel(kernel: PyKernel) -> Self {
+    fn from_kernel(kernel: Kernel) -> Self {
         let txn_manager = kernel.txn_manager().clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -405,6 +433,7 @@ impl KernelHandle {
         }
     }
 
+    // PyO3 boundary is synchronous; block on async work within the dedicated single-thread runtime.
     fn block_on<F>(&self, fut: F) -> F::Output
     where
         F: std::future::Future,
@@ -446,7 +475,8 @@ impl KernelHandle {
     #[classmethod]
     pub fn with_library_schema(_cls: &Bound<'_, PyType>, schema_json: &str) -> PyResult<Self> {
         let schema = decode_schema_from_json(schema_json)?;
-        let module = http_library::build_http_library_module(schema, None);
+        let module = block_on_tokio(http_library::build_http_library_module(schema, None))
+            .expect("module");
         let handlers = http_library::http_library_handlers(&module);
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
@@ -468,8 +498,12 @@ impl KernelHandle {
         use std::str::FromStr;
 
         let schema = decode_schema_from_json(schema_json)?;
-        let storage = data_dir.map(LibraryDir::new);
-        let module = http_library::build_http_library_module(schema, storage);
+        let storage_root = data_dir.clone();
+        let module = block_on_tokio(http_library::build_http_library_module(
+            schema,
+            storage_root,
+        ))
+        .expect("module");
         let handlers = http_library::http_library_handlers(&module);
         let host = Link::from_str(token_host)
             .map_err(|_| PyValueError::new_err("invalid token host"))?;
@@ -501,8 +535,12 @@ impl KernelHandle {
             .parse()
             .map_err(|_| PyValueError::new_err("invalid dependency route authority"))?;
         let schema = decode_schema_from_json(schema_json)?;
-        let storage = data_dir.map(LibraryDir::new);
-        let module = http_library::build_http_library_module(schema, storage);
+        let storage_root = data_dir.clone();
+        let module = block_on_tokio(http_library::build_http_library_module(
+            schema,
+            storage_root,
+        ))
+        .expect("module");
         let handlers = http_library::http_library_handlers(&module);
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
@@ -515,6 +553,7 @@ impl KernelHandle {
 
     #[classmethod]
     #[pyo3(signature = (schema_json, dependency_root, authority, token_host, actor_id, public_key_b64, data_dir=None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_library_schema_and_dependency_route_rjwt(
         _cls: &Bound<'_, PyType>,
         schema_json: &str,
@@ -531,8 +570,12 @@ impl KernelHandle {
             .parse()
             .map_err(|_| PyValueError::new_err("invalid dependency route authority"))?;
         let schema = decode_schema_from_json(schema_json)?;
-        let storage = data_dir.map(LibraryDir::new);
-        let module = http_library::build_http_library_module(schema, storage);
+        let storage_root = data_dir.clone();
+        let module = block_on_tokio(http_library::build_http_library_module(
+            schema,
+            storage_root,
+        ))
+        .expect("module");
         let handlers = http_library::http_library_handlers(&module);
         let host = Link::from_str(token_host)
             .map_err(|_| PyValueError::new_err("invalid token host"))?;
@@ -875,7 +918,7 @@ async fn py_response_from_http(response: Response) -> PyResult<PyKernelResponse>
     let body_bytes = hyper::body::to_bytes(response.into_body())
         .await
         .map_err(|err| PyValueError::new_err(err.to_string()))?;
-    let body = if body_bytes.is_empty() {
+    let body = if body_bytes.is_empty() || status >= 400 {
         None
     } else {
         let state = decode_state_from_bytes(body_bytes.to_vec())?;
@@ -950,7 +993,6 @@ pub(crate) fn py_bearer_token(request: &PyKernelRequest) -> Option<String> {
 #[cfg(all(test, feature = "pyo3", feature = "http-server", feature = "wasm"))]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use futures::FutureExt;
     use crate::{Body, Request, Response, StatusCode};
     use hyper::body::to_bytes;
@@ -961,11 +1003,11 @@ mod tests {
 
     #[derive(Clone)]
     struct KernelService {
-        kernel: crate::HttpKernel,
+        kernel: crate::Kernel,
     }
 
     impl KernelService {
-        fn new(kernel: crate::HttpKernel) -> Self {
+        fn new(kernel: crate::Kernel) -> Self {
             Self { kernel }
         }
     }
@@ -1127,10 +1169,13 @@ mod tests {
         let bytes = wasm_module();
         let initial =
             tc_ir::LibrarySchema::new(Link::from_str("/lib/initial").unwrap(), "0.0.1", vec![]);
-        let module = crate::library::http::build_http_library_module(initial, None);
+        let module =
+            crate::library::http::build_http_library_module(initial, None)
+                .await
+                .expect("module");
         let handlers = crate::library::http::http_library_handlers(&module);
 
-        let remote_kernel: crate::HttpKernel = crate::Kernel::builder()
+        let remote_kernel: crate::Kernel = crate::Kernel::builder()
             .with_host_id("tc-remote-test")
             .with_library_module(module, handlers)
             .with_service_handler(|_req| async move {
@@ -1194,10 +1239,13 @@ mod tests {
             "0.1.0",
             vec![Link::from_str(dependency_root).unwrap()],
         );
-        let local_module = crate::library::http::build_http_library_module(local_schema, None);
+        let local_module =
+            crate::library::http::build_http_library_module(local_schema, None)
+                .await
+                .expect("module");
         let local_handlers = crate::library::http::http_library_handlers(&local_module);
 
-        let local_kernel: PyKernel = crate::Kernel::builder()
+        let local_kernel: Kernel = crate::Kernel::builder()
             .with_host_id("tc-py-local")
             .with_library_module(local_module, local_handlers)
             .with_dependency_route(dependency_root, addr)
@@ -1246,10 +1294,13 @@ mod tests {
             "0.1.0",
             vec![Link::from_str("/lib").unwrap()],
         );
-        let local_module = crate::library::http::build_http_library_module(local_schema, None);
+        let local_module =
+            crate::library::http::build_http_library_module(local_schema, None)
+                .await
+                .expect("module");
         let local_handlers = crate::library::http::http_library_handlers(&local_module);
 
-        let local_kernel: PyKernel = crate::Kernel::builder()
+        let local_kernel: Kernel = crate::Kernel::builder()
             .with_host_id("tc-py-local")
             .with_library_module(local_module, local_handlers)
             .with_dependency_route("/lib", "127.0.0.1:1".parse().expect("addr"))
@@ -1336,7 +1387,15 @@ pub(crate) fn request_body_bytes(body: Option<PyStateHandle>) -> PyResult<Vec<u8
         if let Ok(bytes) = any.downcast::<PyBytes>() {
             Ok(bytes.as_bytes().to_vec())
         } else if let Ok(string) = any.downcast::<PyString>() {
-            Ok(string.to_string().into_bytes())
+            let text = string.to_string();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok(Vec::new())
+            } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                Ok(text.into_bytes())
+            } else {
+                encode_state_to_bytes(State::from(Value::from(text)))
+            }
         } else {
             Err(PyValueError::new_err(
                 "request body must be a str or bytes-like object",

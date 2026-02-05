@@ -11,13 +11,24 @@ the kernel is compiled, every adapter clones the same instance so `/lib`,
 - `kernel` – the transport-agnostic dispatcher plus helpers for binding
   transactions to requests.
 - `http` – Hyper-based kernel plumbing, including helpers to hydrate
-  `LibraryDir`, serve `/lib` installs, and expose health/service metrics.
+  per-library storage, serve `/lib` installs, and expose health/service metrics.
 - `library` – tooling for `NativeLibrary` installers, `tc_library_routes!`,
   and route registries shared with WASM loaders.
 - `txn`, `storage`, `pyo3_runtime`, and optional `wasm` support modules (including
   transaction-bound RPC resolution for `OpRef`/`Scalar::Ref` without adapter types).
 - Reference docs: see `AGENTS.md` for design guardrails and
   `PROTOCOL_COMPATIBILITY.md` for adapter expectations.
+
+## Library discovery & export scope
+
+Library discovery is served as a directory listing at the library root and at
+any library namespace prefix. Each listing maps the immediate child segment to
+a boolean flag indicating whether that child is a namespace (true) or a leaf
+library (false). Requests that resolve to a leaf return the library schema.
+
+Replication exports are always leaf-scoped: the export endpoint checks for a
+claim on the concrete library ID (publisher + name + version) and returns only
+that library’s payload. There is no global export of all libraries.
 
 ## Building & testing
 
@@ -38,6 +49,24 @@ cargo test -p tc-server --all-features
 When developing the PyO3 adapter, also run the TinyChain Python client
 integration tests (if available in your environment) to keep the shared
 transaction flow in sync.
+
+## Node binary (tc-server)
+
+The repo ships a standalone `tc-server` binary for node operators. It exposes
+the HTTP adapter and optional discovery at startup.
+
+```bash
+cargo build --bin tc-server --features \"http-server mdns k8s\"
+```
+
+Environment configuration:
+
+- `TC_BIND` (default `0.0.0.0:8702`)
+- `TC_DATA_DIR` (default `/tmp/tinychain`)
+- `TC_PSK_HEX` (comma-separated hex keys)
+- `TC_PEERS` (comma-separated `host:port` entries)
+- `TC_K8S_DNS` / `TC_K8S_PORT` (headless service discovery)
+- `TC_MDNS` (set to `1` to enable mDNS discovery)
 
 ## Examples
 
@@ -61,7 +90,7 @@ use tc_server::http::{
 };
 
 #[tokio::main]
-async fn main() -> hyper::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Point at a library data dir if you ship persisted WASM installs.
     let kernel = build_http_kernel_with_config(
         HttpKernelConfig::default().with_data_dir("./data"),
@@ -74,17 +103,46 @@ async fn main() -> hyper::Result<()> {
         |_req: Request<Body>| async {
             Ok::<_, Infallible>(Response::new(Body::from("healthy")))
         },
-    );
+    ).await?;
 
     HttpServer::new(kernel)
         .serve(([127, 0, 0, 1], 8700).into())
-        .await
+        .await?;
+
+    Ok(())
 }
 ```
 
 Handlers only need to implement `Fn(Request<Body>) -> impl Future<Output =
 Response<Body>>`. The kernel takes care of parsing transaction IDs and routing
 top-level paths (`/lib`, `/service`, `/healthz`, etc.).
+
+## Testnet CI and Kubernetes (node-only)
+
+The testnet CI assets live in the monorepo root (not inside the `tc-server`
+submodule). Run testnet commands from the repo root; see
+`../ci/testnet/README.md` and `../k8s/README.md` for the Kind smoke test and
+cloud deploy instructions.
+
+## Discovery feature flags (node-only)
+
+Peer discovery is feature-flagged to keep the default build minimal:
+
+- `mdns`: LAN discovery for local/dev clusters.
+- `k8s`: headless-service DNS discovery for Kubernetes clusters.
+
+Once these flags land, build with them explicitly (example):
+
+```bash
+cargo build --features "http-server mdns"
+```
+
+### PSK security note (node-only)
+
+PSKs protect the encrypted token exchange used for bootstrap replication. Use
+TLS for any non-local deployment and rotate PSKs regularly. Treat the library
+export path as high-value and keep it gated behind private networks or explicit
+allowlists.
 
 ## Native `Library` example
 

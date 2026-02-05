@@ -13,7 +13,7 @@ Keep the following rules in mind whenever you extend the server:
   the same handler wiring is shared between HTTP and Python builds.
 * When you need disk-backed libraries, call `build_http_kernel_with_config` or
   `build_python_kernel_with_config` and pass a `data_dir`. This hydrates the
-  shared `LibraryDir` (layout: `<data-dir>/lib/<id>/<version>/...`) and
+  per-library storage directories (layout: `<data-dir>/lib/<id>/<version>/...`) and
   registers all persisted WASM routes before any adapter handles requests.
 * Every `tc-server` binary owns **exactly one** `data_dir`. `txfs` assumes the
   on-disk layout mirrors URI segments (`<data-dir>/lib/foo` ↔ `/lib/foo`);
@@ -104,3 +104,20 @@ Keep the following rules in mind whenever you extend the server:
 4. When exposing new `State` variants (e.g., tensors/collections) or handler
    verbs to Python, extend the PyO3 bindings in `tc-server/src/pyo3_runtime.rs`
    so `PyState`/`PyKernelHandle` can deserialize them via destream.
+
+## Persistence delegation
+
+* Delegate persistence to the owning component (e.g., each `Library` should read
+  versions from its own `freqfs::Dir`/txfs directory, as in v1). Avoid central
+  storage helpers or kernel/main orchestration that re-implements per-library
+  persistence in aggregate; keep the registry/router thin.
+
+## v1 lessons worth preserving
+
+* Delegate recursively: directories own traversal, leaves own persistence and route logic; the
+  registry should only index and route.
+* Keep claims leaf-scoped (`/lib/.../version`), and authorize at the concrete component root.
+* Token chaining and txn lifecycle live only in the kernel; adapters/clients never mint or extend.
+* Default-deny egress must remain kernel-enforced and manifest-driven.
+* Replication should stay leaf-scoped and idempotent: discover via listings, request tokens per
+  library path, and export/install per library (no global exports).

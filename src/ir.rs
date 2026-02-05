@@ -15,6 +15,7 @@ use crate::{
 use crate::txn::TxnHandle;
 
 pub const IR_ARTIFACT_CONTENT_TYPE: &str = "application/tinychain+json";
+pub const WASM_ARTIFACT_CONTENT_TYPE: &str = "application/wasm";
 
 #[cfg(feature = "http-server")]
 pub fn http_ir_route_handler_from_bytes(

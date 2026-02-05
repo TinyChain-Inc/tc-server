@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     str::FromStr,
     sync::{Arc, RwLock},
 };
@@ -6,23 +7,25 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use destream::de;
 use pathlink::{Link, PathSegment};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tc_error::{TCError, TCResult};
 use tc_ir::{
     Dir, HandleDelete, HandleGet, HandlePost, HandlePut, Library, LibraryModule, LibrarySchema,
-    Route,
+    Map, Route,
 };
 use tc_value::Value;
 use umask::Mode;
 
 use crate::{
     KernelHandler,
-    ir::IR_ARTIFACT_CONTENT_TYPE,
-    storage::{LibraryArtifact, LibraryDir, decode_schema_bytes},
+    storage::{Artifact, LibraryStore, decode_schema_bytes},
     txn::TxnHandle,
+    uri,
 };
 
 type HandlerArc = Arc<dyn KernelHandler>;
+type LibraryFactory =
+    Arc<dyn Fn(Vec<u8>) -> TCResult<(LibrarySchema, SchemaRoutes, HandlerArc)> + Send + Sync>;
 
 #[derive(Clone, Debug, Default)]
 pub struct RouteMetadata {
@@ -50,6 +53,304 @@ impl Route for SchemaRoutes {
 
     fn route<'a>(&'a self, path: &'a [PathSegment]) -> Option<&'a Self::Handler> {
         self.dir.route(path)
+    }
+}
+
+#[derive(Clone)]
+pub struct LibraryRegistry {
+    entries: Arc<RwLock<BTreeMap<String, Arc<LibraryRuntime>>>>,
+    store: Option<LibraryStore>,
+    factories: BTreeMap<String, LibraryFactory>,
+}
+
+impl LibraryRegistry {
+    pub fn new(
+        store: Option<LibraryStore>,
+        factories: BTreeMap<String, LibraryFactory>,
+    ) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(BTreeMap::new())),
+            store,
+            factories,
+        }
+    }
+
+    pub async fn insert_schema(&self, schema: LibrarySchema) -> TCResult<()> {
+        let key = canonical_link(schema.id());
+        let store = match self.store.as_ref() {
+            Some(store) => Some(store.for_schema(&schema).await?),
+            None => None,
+        };
+        let runtime = Arc::new(LibraryRuntime::new(
+            schema,
+            store,
+            self.factories.clone(),
+        ));
+        self.entries
+            .write()
+            .expect("library registry write lock")
+            .insert(key, runtime);
+
+        Ok(())
+    }
+
+    pub fn list_dir(&self, path: &str) -> Option<Map<bool>> {
+        let path = normalize_path(path);
+        let entries = self.entries.read().expect("library registry read lock");
+        let mut out = Map::new();
+        let mut has_match = path == uri::LIB_ROOT;
+
+        for (id, _) in entries.iter() {
+            if !is_path_prefix(&path, id) {
+                continue;
+            }
+
+            has_match = true;
+
+            if path == *id {
+                continue;
+            }
+
+            let rest = id
+                .strip_prefix(&path)
+                .unwrap_or(id)
+                .trim_start_matches('/');
+
+            if rest.is_empty() {
+                continue;
+            }
+
+            let mut segments = rest.split('/');
+            let child = segments.next().expect("non-empty rest segment");
+            let is_dir = segments.next().is_some();
+            let entry = out.entry(child.to_string()).or_insert(is_dir);
+            if is_dir {
+                *entry = true;
+            }
+        }
+
+        if has_match {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    pub fn resolve_runtime_for_path(
+        &self,
+        path: &str,
+    ) -> Option<(Arc<LibraryRuntime>, bool)> {
+        let path = normalize_path(path);
+        let entries = self.entries.read().expect("library registry read lock");
+        let mut best: Option<(&String, Arc<LibraryRuntime>)> = None;
+
+        for (id, runtime) in entries.iter() {
+            if !is_path_prefix(id, &path) {
+                continue;
+            }
+
+            let replace = match &best {
+                Some((best_id, _)) => id.len() > best_id.len(),
+                None => true,
+            };
+
+            if replace {
+                best = Some((id, Arc::clone(runtime)));
+            }
+        }
+
+        best.map(|(id, runtime)| (runtime, id == &path))
+    }
+
+    pub fn schema_for_txn(&self, txn: &TxnHandle) -> TCResult<LibrarySchema> {
+        let mut best: Option<(usize, LibrarySchema)> = None;
+
+        for claim in txn
+            .claims()
+            .iter()
+            .chain(std::iter::once(txn.claim()))
+        {
+            let path = canonical_link(&claim.link);
+            if let Some((runtime, _)) = self.resolve_runtime_for_path(&path) {
+                let schema = runtime.state.schema();
+                let score = schema.id().to_string().len();
+                let replace = best.as_ref().is_none_or(|(len, _)| score > *len);
+                if replace {
+                    best = Some((score, schema));
+                }
+            }
+        }
+
+        if let Some((_, schema)) = best {
+            return Ok(schema);
+        }
+
+        let entries = self.entries.read().expect("library registry read lock");
+        if entries.len() == 1 {
+            let schema = entries
+                .values()
+                .next()
+                .expect("single entry")
+                .state
+                .schema();
+            return Ok(schema);
+        }
+
+        Err(TCError::unauthorized(
+            "no library manifest loaded (egress is default-deny)",
+        ))
+    }
+
+    pub async fn install_schema(&self, schema: LibrarySchema) -> Result<(), InstallError> {
+        let runtime = self
+            .runtime_for_schema(&schema)
+            .await
+            .map_err(|err| InstallError::internal(err.to_string()))?;
+        runtime.state.replace_schema(schema);
+        runtime.routes.clear();
+
+        if let Some(store) = runtime.store.as_ref() {
+            store
+                .persist_schema(&runtime.state.schema())
+                .await
+                .map_err(|err| InstallError::internal(err.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn install_payload(&self, payload: InstallArtifacts) -> Result<(), InstallError> {
+        let runtime = self
+            .runtime_for_schema(&payload.schema)
+            .await
+            .map_err(|err| InstallError::internal(err.to_string()))?;
+
+        let artifact = payload
+            .artifacts
+            .into_iter()
+            .find(|artifact| self.factories.contains_key(&artifact.content_type))
+            .ok_or_else(|| {
+                let supported = self
+                    .factories
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                InstallError::bad_request(format!(
+                    "missing supported artifact (expected one of: {supported})"
+                ))
+            })?;
+
+        let factory = self
+            .factories
+            .get(&artifact.content_type)
+            .ok_or_else(|| InstallError::bad_request("unsupported artifact content type"))?;
+
+        let (manifest_schema, schema_routes, handler) =
+            factory(artifact.bytes.clone()).map_err(|err| InstallError::internal(err.to_string()))?;
+
+        if !schemas_equivalent(&manifest_schema, &payload.schema) {
+            return Err(InstallError::bad_request(
+                "manifest schema does not match descriptor",
+            ));
+        }
+
+        runtime
+            .state
+            .replace_with_routes(manifest_schema.clone(), schema_routes);
+        runtime.routes.replace_arc(handler);
+
+        if let Some(store) = runtime.store.as_ref() {
+            store
+                .persist_artifact(
+                    &manifest_schema,
+                    &Artifact {
+                        content_type: artifact.content_type,
+                        bytes: artifact.bytes,
+                        path: artifact.path,
+                    },
+                )
+                .await
+                .map_err(|err| InstallError::internal(err.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+
+    pub async fn export_payload_for_claims(
+        &self,
+        txn: &TxnHandle,
+    ) -> Result<Option<InstallArtifacts>, TCError> {
+        let runtimes = {
+            let entries = self.entries.read().expect("library registry read lock");
+            entries.values().cloned().collect::<Vec<_>>()
+        };
+
+        for runtime in runtimes {
+            let schema = runtime.state.schema();
+            if txn.has_claim(schema.id(), umask::USER_READ) {
+                let Some(store) = &runtime.store else {
+                    return Ok(None);
+                };
+                let artifact = match store.load_artifact(&schema).await? {
+                    Some(artifact) => artifact,
+                    None => return Ok(None),
+                };
+
+                let artifacts = vec![Artifact {
+                    path: schema.id().to_string(),
+                    content_type: artifact.content_type,
+                    bytes: artifact.bytes,
+                }];
+
+                return Ok(Some(InstallArtifacts { schema, artifacts }));
+            }
+        }
+
+        Err(TCError::unauthorized("unauthorized"))
+    }
+
+    pub async fn hydrate_from_storage(&self) -> TCResult<()> {
+        let store = match &self.store {
+            Some(store) => store,
+            None => return Ok(()),
+        };
+
+        let entries = store.discover_schemas().await?;
+        for schema in entries {
+            let runtime = self.runtime_for_schema(&schema).await?;
+            runtime.hydrate_from_storage().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn runtime_for_schema(&self, schema: &LibrarySchema) -> TCResult<Arc<LibraryRuntime>> {
+        let key = canonical_link(schema.id());
+        if let Some(existing) = self
+            .entries
+            .read()
+            .expect("library registry read lock")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+
+        let store = match self.store.as_ref() {
+            Some(store) => Some(store.for_schema(schema).await?),
+            None => None,
+        };
+        let runtime = Arc::new(LibraryRuntime::new(
+            schema.clone(),
+            store,
+            self.factories.clone(),
+        ));
+
+        let mut entries = self.entries.write().expect("library registry write lock");
+        let entry = entries.entry(key).or_insert_with(|| Arc::clone(&runtime));
+        Ok(Arc::clone(entry))
     }
 }
 
@@ -104,17 +405,10 @@ pub enum InstallRequest {
 
 pub struct InstallArtifacts {
     pub schema: LibrarySchema,
-    pub artifacts: Vec<InstallArtifact>,
+    pub artifacts: Vec<Artifact>,
 }
 
-#[derive(Clone, Debug)]
-pub struct InstallArtifact {
-    pub path: String,
-    pub content_type: String,
-    pub bytes: String,
-}
-
-impl de::FromStream for InstallArtifact {
+impl de::FromStream for Artifact {
     type Context = ();
 
     async fn from_stream<D: de::Decoder>(
@@ -124,7 +418,7 @@ impl de::FromStream for InstallArtifact {
         struct ArtifactVisitor;
 
         impl de::Visitor for ArtifactVisitor {
-            type Value = InstallArtifact;
+            type Value = Artifact;
 
             fn expecting() -> &'static str {
                 "an install artifact map"
@@ -142,7 +436,7 @@ impl de::FromStream for InstallArtifact {
                     match key.as_str() {
                         "path" => path = Some(map.next_value(()).await?),
                         "content_type" => content_type = Some(map.next_value(()).await?),
-                        "bytes" => bytes = Some(map.next_value(()).await?),
+                        "bytes" => bytes = Some(map.next_value::<String>(()).await?),
                         _ => {
                             let _ = map.next_value::<de::IgnoredAny>(()).await?;
                         }
@@ -156,8 +450,11 @@ impl de::FromStream for InstallArtifact {
                 })?;
                 let bytes = bytes
                     .ok_or_else(|| de::Error::custom("install artifact missing bytes field"))?;
+                let bytes = BASE64
+                    .decode(bytes.as_bytes())
+                    .map_err(|err| de::Error::custom(format!("invalid base64 artifact: {err}")))?;
 
-                Ok(InstallArtifact {
+                Ok(Artifact {
                     path,
                     content_type,
                     bytes,
@@ -195,55 +492,6 @@ impl InstallError {
     }
 }
 
-struct InstallPayloadRaw {
-    schema: LibrarySchema,
-    artifacts: Vec<InstallArtifact>,
-}
-
-impl de::FromStream for InstallPayloadRaw {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct PayloadVisitor;
-
-        impl de::Visitor for PayloadVisitor {
-            type Value = InstallPayloadRaw;
-
-            fn expecting() -> &'static str {
-                "an install payload map"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut schema = None;
-                let mut artifacts = None;
-
-                while let Some(key) = map.next_key::<String>(()).await? {
-                    match key.as_str() {
-                        "schema" => schema = Some(map.next_value(()).await?),
-                        "artifacts" => artifacts = Some(map.next_value(()).await?),
-                        _ => {
-                            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                        }
-                    }
-                }
-
-                let schema = schema
-                    .ok_or_else(|| de::Error::custom("install payload missing schema field"))?;
-                let artifacts = artifacts.unwrap_or_default();
-
-                Ok(InstallPayloadRaw { schema, artifacts })
-            }
-        }
-
-        decoder.decode_map(PayloadVisitor).await
-    }
-}
 
 pub fn decode_install_request_bytes(bytes: &[u8]) -> Result<InstallRequest, InstallError> {
     if bytes.iter().all(|b| b.is_ascii_whitespace()) {
@@ -254,122 +502,31 @@ pub fn decode_install_request_bytes(bytes: &[u8]) -> Result<InstallRequest, Inst
         return Ok(InstallRequest::SchemaOnly(schema));
     }
 
-    let raw = decode_install_payload(bytes)?;
+    let payload = decode_install_payload(bytes)?;
 
-    Ok(InstallRequest::WithArtifacts(InstallArtifacts {
-        schema: raw.schema,
-        artifacts: raw.artifacts,
-    }))
+    Ok(InstallRequest::WithArtifacts(payload))
 }
 
-pub fn apply_wasm_install(
-    state: &LibraryState,
-    routes: &LibraryRoutes,
-    storage: Option<&LibraryDir>,
-    route_factory: Option<&LibraryRouteFactory>,
-    payload: InstallArtifacts,
-) -> Result<(), InstallError> {
-    let artifact = payload
-        .artifacts
-        .into_iter()
-        .find(|artifact| artifact.content_type == "application/wasm")
-        .ok_or_else(|| InstallError::bad_request("missing application/wasm artifact"))?;
-
-    let wasm_bytes = BASE64
-        .decode(artifact.bytes.as_bytes())
-        .map_err(|err| InstallError::bad_request(format!("invalid base64 artifact: {err}")))?;
-
-    let factory = route_factory
-        .ok_or_else(|| InstallError::bad_request("wasm installs are not supported"))?;
-
-    let (manifest_schema, schema_routes, handler) =
-        factory(wasm_bytes.clone()).map_err(|err| InstallError::internal(err.to_string()))?;
-
-    if !schemas_equivalent(&manifest_schema, &payload.schema) {
-        return Err(InstallError::bad_request(
-            "manifest schema does not match wasm descriptor",
-        ));
+pub fn encode_install_payload_bytes(payload: &InstallArtifacts) -> Result<Vec<u8>, String> {
+    #[derive(Serialize)]
+    struct Payload {
+        schema: RawSchema,
+        #[serde(default)]
+        artifacts: Vec<InstallArtifactRaw>,
     }
 
-    state.replace_with_routes(manifest_schema.clone(), schema_routes);
-    routes.replace_arc(handler);
+    let raw = Payload {
+        schema: RawSchema::from(&payload.schema),
+        artifacts: payload
+            .artifacts
+            .iter()
+            .map(InstallArtifactRaw::from)
+            .collect(),
+    };
 
-    if let Some(storage) = storage {
-        storage
-            .persist_wasm_library(&manifest_schema, &wasm_bytes)
-            .map_err(|err| InstallError::internal(err.to_string()))?;
-    }
-
-    Ok(())
+    serde_json::to_vec(&raw).map_err(|err| err.to_string())
 }
 
-pub fn apply_ir_install(
-    state: &LibraryState,
-    routes: &LibraryRoutes,
-    storage: Option<&LibraryDir>,
-    route_factory: Option<&LibraryRouteFactory>,
-    payload: InstallArtifacts,
-) -> Result<(), InstallError> {
-    let artifact = payload
-        .artifacts
-        .into_iter()
-        .find(|artifact| artifact.content_type == IR_ARTIFACT_CONTENT_TYPE)
-        .ok_or_else(|| InstallError::bad_request("missing application/tinychain+json artifact"))?;
-
-    let ir_bytes = BASE64
-        .decode(artifact.bytes.as_bytes())
-        .map_err(|err| InstallError::bad_request(format!("invalid base64 artifact: {err}")))?;
-
-    let factory = route_factory
-        .ok_or_else(|| InstallError::bad_request("ir installs are not supported"))?;
-
-    let (manifest_schema, schema_routes, handler) =
-        factory(ir_bytes.clone()).map_err(|err| InstallError::internal(err.to_string()))?;
-
-    if !schemas_equivalent(&manifest_schema, &payload.schema) {
-        return Err(InstallError::bad_request("manifest schema does not match descriptor"));
-    }
-
-    state.replace_with_routes(manifest_schema.clone(), schema_routes);
-    routes.replace_arc(handler);
-
-    if let Some(storage) = storage {
-        storage
-            .persist_ir_library(&manifest_schema, &ir_bytes)
-            .map_err(|err| InstallError::internal(err.to_string()))?;
-    }
-
-    Ok(())
-}
-
-pub fn apply_install(
-    state: &LibraryState,
-    routes: &LibraryRoutes,
-    storage: Option<&LibraryDir>,
-    wasm_factory: Option<&LibraryRouteFactory>,
-    ir_factory: Option<&LibraryRouteFactory>,
-    payload: InstallArtifacts,
-) -> Result<(), InstallError> {
-    if payload
-        .artifacts
-        .iter()
-        .any(|artifact| artifact.content_type == "application/wasm")
-    {
-        return apply_wasm_install(state, routes, storage, wasm_factory, payload);
-    }
-
-    if payload
-        .artifacts
-        .iter()
-        .any(|artifact| artifact.content_type == IR_ARTIFACT_CONTENT_TYPE)
-    {
-        return apply_ir_install(state, routes, storage, ir_factory, payload);
-    }
-
-    Err(InstallError::bad_request(
-        "missing supported artifact (expected application/wasm or application/tinychain+json)",
-    ))
-}
 
 fn schemas_equivalent(left: &LibrarySchema, right: &LibrarySchema) -> bool {
     left.version() == right.version()
@@ -386,7 +543,7 @@ fn canonical_links(links: &[Link]) -> Vec<String> {
 fn canonical_link(link: &Link) -> String {
     let raw = link.to_string();
     if raw.starts_with('/') {
-        return raw;
+        return normalize_path(&raw);
     }
 
     // Accept both path-only and absolute link string forms by comparing on the path suffix.
@@ -395,52 +552,84 @@ fn canonical_link(link: &Link) -> String {
     match raw.split_once("://") {
         Some((_, rest)) => rest
             .find('/')
-            .map(|idx| rest[idx..].to_string())
-            .unwrap_or(raw),
-        None => raw,
+            .map(|idx| normalize_path(&rest[idx..]))
+            .unwrap_or_else(|| normalize_path(&raw)),
+        None => normalize_path(&raw),
     }
 }
 
-fn decode_install_payload(bytes: &[u8]) -> Result<InstallPayloadRaw, InstallError> {
-    #[derive(Deserialize)]
-    struct RawSchema {
-        id: String,
-        version: String,
-        #[serde(default)]
-        dependencies: Vec<String>,
+fn normalize_path(path: &str) -> String {
+    uri::normalize_path(path).to_string()
+}
+
+fn is_path_prefix(prefix: &str, path: &str) -> bool {
+    let prefix = normalize_path(prefix);
+    let path = normalize_path(path);
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+#[derive(Deserialize, Serialize)]
+struct RawSchema {
+    id: String,
+    version: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+}
+
+impl TryFrom<RawSchema> for LibrarySchema {
+    type Error = String;
+
+    fn try_from(raw: RawSchema) -> Result<Self, Self::Error> {
+        let id = Link::from_str(&raw.id).map_err(|err| format!("invalid schema id: {err}"))?;
+        let dependencies = raw
+            .dependencies
+            .into_iter()
+            .map(|dep| Link::from_str(&dep).map_err(|err| format!("invalid dependency link: {err}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(LibrarySchema::new(id, raw.version, dependencies))
     }
+}
 
-    impl TryFrom<RawSchema> for LibrarySchema {
-        type Error = String;
-
-        fn try_from(raw: RawSchema) -> Result<Self, Self::Error> {
-            let id = Link::from_str(&raw.id).map_err(|err| format!("invalid schema id: {err}"))?;
-            let dependencies = raw
-                .dependencies
-                .into_iter()
-                .map(|dep| {
-                    Link::from_str(&dep).map_err(|err| format!("invalid dependency link: {err}"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(LibrarySchema::new(id, raw.version, dependencies))
+impl From<&LibrarySchema> for RawSchema {
+    fn from(schema: &LibrarySchema) -> Self {
+        Self {
+            id: schema.id().to_string(),
+            version: schema.version().to_string(),
+            dependencies: schema
+                .dependencies()
+                .iter()
+                .map(|dep| dep.to_string())
+                .collect(),
         }
     }
+}
 
+#[derive(Deserialize, Serialize)]
+struct InstallArtifactRaw {
+    path: String,
+    content_type: String,
+    bytes: String,
+}
+
+impl From<&Artifact> for InstallArtifactRaw {
+    fn from(artifact: &Artifact) -> Self {
+        Self {
+            path: artifact.path.clone(),
+            content_type: artifact.content_type.clone(),
+            bytes: BASE64.encode(&artifact.bytes),
+        }
+    }
+}
+
+fn decode_install_payload(bytes: &[u8]) -> Result<InstallArtifacts, InstallError> {
     #[derive(Deserialize)]
-    struct InstallPayload {
+    struct Payload {
         schema: RawSchema,
         #[serde(default)]
         artifacts: Vec<InstallArtifactRaw>,
     }
 
-    #[derive(Deserialize)]
-    struct InstallArtifactRaw {
-        path: String,
-        content_type: String,
-        bytes: String,
-    }
-
-    let payload: InstallPayload = serde_json::from_slice(bytes)
+    let payload: Payload = serde_json::from_slice(bytes)
         .map_err(|err| InstallError::bad_request(format!("invalid install payload json: {err}")))?;
 
     let schema = payload
@@ -448,39 +637,33 @@ fn decode_install_payload(bytes: &[u8]) -> Result<InstallPayloadRaw, InstallErro
         .try_into()
         .map_err(InstallError::bad_request)?;
 
-    Ok(InstallPayloadRaw {
-        schema,
-        artifacts: payload
-            .artifacts
-            .into_iter()
-            .map(|artifact| InstallArtifact {
+    let artifacts = payload
+        .artifacts
+        .into_iter()
+        .map(|artifact| {
+            let bytes = BASE64
+                .decode(artifact.bytes.as_bytes())
+                .map_err(|err| InstallError::bad_request(format!("invalid base64 artifact: {err}")))?;
+            Ok(Artifact {
                 path: artifact.path,
                 content_type: artifact.content_type,
-                bytes: artifact.bytes,
+                bytes,
             })
-            .collect(),
-    })
-}
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-pub type LibraryRouteFactory = Arc<
-    dyn Fn(Vec<u8>) -> TCResult<(LibrarySchema, SchemaRoutes, HandlerArc)> + Send + Sync,
->;
+    Ok(InstallArtifacts { schema, artifacts })
+}
 
 pub struct LibraryRoutes {
     inner: Arc<RwLock<Option<HandlerArc>>>,
 }
 
-impl Default for LibraryRoutes {
-    fn default() -> Self {
+impl LibraryRoutes {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(None)),
         }
-    }
-}
-
-impl LibraryRoutes {
-    pub fn new() -> Self {
-        Self::default()
     }
 
     pub fn replace<H>(&self, handler: H)
@@ -506,6 +689,12 @@ impl LibraryRoutes {
 
     pub fn current_handler(&self) -> Option<HandlerArc> {
         self.inner.read().expect("library routes read lock").clone()
+    }
+}
+
+impl Default for LibraryRoutes {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -648,137 +837,91 @@ impl<T> NativeLibraryHandler for T where
 pub struct LibraryRuntime {
     state: LibraryState,
     routes: LibraryRoutes,
-    storage: Option<crate::storage::LibraryDir>,
-    wasm_factory: Option<LibraryRouteFactory>,
-    ir_factory: Option<LibraryRouteFactory>,
+    store: Option<LibraryStore>,
+    factories: BTreeMap<String, LibraryFactory>,
 }
 
 impl LibraryRuntime {
     pub fn new(
         initial_schema: LibrarySchema,
-        storage: Option<crate::storage::LibraryDir>,
-        wasm_factory: Option<LibraryRouteFactory>,
-        ir_factory: Option<LibraryRouteFactory>,
+        store: Option<LibraryStore>,
+        factories: BTreeMap<String, LibraryFactory>,
     ) -> Self {
         Self {
             state: LibraryState::new(initial_schema),
             routes: LibraryRoutes::new(),
-            storage,
-            wasm_factory,
-            ir_factory,
+            store,
+            factories,
         }
     }
 
-    pub fn state(&self) -> LibraryState {
-        self.state.clone()
-    }
-
-    pub fn routes(&self) -> LibraryRoutes {
-        self.routes.clone()
-    }
-
-    pub fn storage(&self) -> Option<crate::storage::LibraryDir> {
-        self.storage.clone()
-    }
-
-    pub fn wasm_factory(&self) -> Option<LibraryRouteFactory> {
-        self.wasm_factory.clone()
-    }
-
-    pub fn ir_factory(&self) -> Option<LibraryRouteFactory> {
-        self.ir_factory.clone()
-    }
-
-    pub fn hydrate_from_storage(&self) -> TCResult<()> {
-        let storage = match &self.storage {
-            Some(storage) => storage,
+    pub async fn hydrate_from_storage(&self) -> TCResult<()> {
+        let store = match &self.store {
+            Some(store) => store,
             None => return Ok(()),
         };
 
-        let entries = storage.load_all()?;
-        for (schema, artifact) in entries {
-            let (manifest_schema, schema_routes, handler) = match artifact {
-                LibraryArtifact::Wasm(bytes) => {
-                    let factory = match &self.wasm_factory {
-                        Some(factory) => Arc::clone(factory),
-                        None => continue,
-                    };
-                    factory(bytes)?
-                }
-                LibraryArtifact::Ir(bytes) => {
-                    let factory = match &self.ir_factory {
-                        Some(factory) => Arc::clone(factory),
-                        None => continue,
-                    };
-                    factory(bytes)?
-                }
-            };
+        let schema = self.state.schema();
+        let artifact = match store.load_artifact(&schema).await? {
+            Some(artifact) => artifact,
+            None => return Ok(()),
+        };
 
-            if manifest_schema != schema {
-                return Err(TCError::internal("persisted schema mismatch"));
-            }
+        let factory = match self.factories.get(&artifact.content_type) {
+            Some(factory) => Arc::clone(factory),
+            None => return Ok(()),
+        };
+        let (manifest_schema, schema_routes, handler) = factory(artifact.bytes)?;
 
-            self.state.replace_with_routes(
-                manifest_schema,
-                schema_routes.clone(),
-            );
-            self.routes.replace_arc(handler);
+        if manifest_schema != schema {
+            return Err(TCError::internal("persisted schema mismatch"));
         }
+
+        self.state
+            .replace_with_routes(manifest_schema, schema_routes);
+        self.routes.replace_arc(handler);
 
         Ok(())
     }
 
-    /// Install a WASM library from raw bytes (in-process).
-    ///
-    /// This bypasses the HTTP `/lib` installer envelope and uses the manifest embedded in the WASM
-    /// module as the source of truth for the installed [`LibrarySchema`] and routes.
-    ///
-    /// Callers must enforce authorization (e.g., require a txn claim for the target schema ID).
-    /// Prefer [`install_wasm_bytes_authorized`] where a txn is available.
-    ///
-    /// The returned schema is the manifest schema parsed from the WASM module.
-    pub fn install_wasm_bytes(&self, wasm_bytes: Vec<u8>) -> TCResult<LibrarySchema> {
-        let factory = self
-            .wasm_factory
-            .as_ref()
-            .ok_or_else(|| TCError::bad_request("wasm installs are not supported"))?;
-
-        let (manifest_schema, schema_routes, handler) = factory(wasm_bytes.clone())?;
-
-        self.state
-            .replace_with_routes(manifest_schema.clone(), schema_routes);
-        self.routes.replace_arc(handler);
-
-        if let Some(storage) = &self.storage {
-            storage.persist_wasm_library(&manifest_schema, &wasm_bytes)?;
-        }
-
-        Ok(manifest_schema)
-    }
-
-    /// Install a WASM library from raw bytes after validating a txn claim.
-    pub fn install_wasm_bytes_authorized(
+    pub async fn install_artifact_bytes(
         &self,
-        txn: &crate::txn::TxnHandle,
-        wasm_bytes: Vec<u8>,
+        content_type: &str,
+        bytes: Vec<u8>,
+        txn: Option<&crate::txn::TxnHandle>,
     ) -> TCResult<LibrarySchema> {
         let factory = self
-            .wasm_factory
-            .as_ref()
-            .ok_or_else(|| TCError::bad_request("wasm installs are not supported"))?;
+            .factories
+            .get(content_type)
+            .ok_or_else(|| TCError::bad_request("artifact installs are not supported"))?;
 
-        let (manifest_schema, schema_routes, handler) = factory(wasm_bytes.clone())?;
+        let (manifest_schema, schema_routes, handler) = factory(bytes.clone())?;
 
-        if !txn.has_claim(manifest_schema.id(), Mode::new().with_class_perm(umask::USER, umask::WRITE)) {
-            return Err(TCError::unauthorized("unauthorized library install"));
+        match txn {
+            Some(txn)
+                if !txn.has_claim(
+                    manifest_schema.id(),
+                    Mode::new().with_class_perm(umask::USER, umask::WRITE),
+                ) =>
+            {
+                return Err(TCError::unauthorized("unauthorized library install"));
+            }
+            _ => {}
         }
 
         self.state
             .replace_with_routes(manifest_schema.clone(), schema_routes);
         self.routes.replace_arc(handler);
 
-        if let Some(storage) = &self.storage {
-            storage.persist_wasm_library(&manifest_schema, &wasm_bytes)?;
+        if let Some(store) = &self.store {
+            store.persist_artifact(
+                &manifest_schema,
+                &Artifact {
+                    content_type: content_type.to_string(),
+                    bytes,
+                    path: manifest_schema.id().to_string(),
+                },
+            ).await?;
         }
 
         Ok(manifest_schema)
@@ -790,93 +933,103 @@ impl Clone for LibraryRuntime {
         Self {
             state: self.state.clone(),
             routes: self.routes.clone(),
-            storage: self.storage.clone(),
-            wasm_factory: self.wasm_factory.clone(),
-            ir_factory: self.ir_factory.clone(),
+            store: self.store.clone(),
+            factories: self.factories.clone(),
         }
     }
 }
 
 #[cfg(any(feature = "http-server", feature = "pyo3"))]
 pub mod http {
-    use std::{io, sync::Arc};
+    use std::{collections::BTreeMap, io, path::PathBuf, sync::Arc};
 
     use futures::{FutureExt, TryStreamExt};
     use crate::http::{Body, Request, Response, StatusCode, header};
     use hyper::body;
-    use tc_ir::LibrarySchema;
+    use number_general::Number;
+    use tc_error::TCResult;
+    use tc_ir::{LibrarySchema, Map};
+    use tc_state::State;
+    use tc_value::Value;
 
     use crate::{
         KernelHandler,
         library::{
-            InstallError, InstallRequest, LibraryHandlers, LibraryRouteFactory, LibraryRoutes,
-            LibraryRuntime, LibraryState, apply_install, decode_install_request_bytes,
+            InstallError, InstallRequest, LibraryFactory, LibraryHandlers, LibraryRegistry,
+            decode_install_request_bytes,
         },
-        storage::LibraryDir,
+        storage::LibraryStore,
         wasm::http_wasm_route_handler_from_bytes,
-        ir::http_ir_route_handler_from_bytes,
+        ir::{IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE, http_ir_route_handler_from_bytes},
     };
 
-    pub fn build_http_library_module(
+    pub async fn build_http_library_module(
         initial_schema: LibrarySchema,
-        storage: Option<LibraryDir>,
-    ) -> Arc<LibraryRuntime> {
-        let wasm_factory: LibraryRouteFactory = Arc::new(|bytes: Vec<u8>| {
+        storage_root: Option<PathBuf>,
+    ) -> TCResult<Arc<LibraryRegistry>> {
+        let store = match storage_root {
+            Some(root) => {
+                let root_dir = crate::storage::load_library_root(root).await?;
+                Some(LibraryStore::from_root(root_dir))
+            }
+            None => None,
+        };
+        build_http_library_module_with_store(initial_schema, store).await
+    }
+
+    pub async fn build_http_library_module_with_store(
+        initial_schema: LibrarySchema,
+        store: Option<LibraryStore>,
+    ) -> TCResult<Arc<LibraryRegistry>> {
+        let wasm_factory: LibraryFactory =
+            Arc::new(|bytes: Vec<u8>| {
             let (handler, schema, schema_routes) = http_wasm_route_handler_from_bytes(bytes)?;
             let handler: Arc<dyn KernelHandler> = Arc::new(handler);
             Ok((schema, schema_routes, handler))
         });
 
-        let ir_factory: LibraryRouteFactory = Arc::new(|bytes: Vec<u8>| {
+        let ir_factory: LibraryFactory =
+            Arc::new(|bytes: Vec<u8>| {
             let (handler, schema, schema_routes) = http_ir_route_handler_from_bytes(bytes)?;
             let handler: Arc<dyn KernelHandler> = Arc::new(handler);
             Ok((schema, schema_routes, handler))
         });
 
-        Arc::new(LibraryRuntime::new(
-            initial_schema,
-            storage,
-            Some(wasm_factory),
-            Some(ir_factory),
-        ))
+        let registry = LibraryRegistry::new(
+            store,
+            BTreeMap::from([
+                (WASM_ARTIFACT_CONTENT_TYPE.to_string(), wasm_factory),
+                (IR_ARTIFACT_CONTENT_TYPE.to_string(), ir_factory),
+            ]),
+        );
+        registry.insert_schema(initial_schema).await?;
+        Ok(Arc::new(registry))
     }
 
+
     pub fn http_library_handlers(
-        module: &Arc<LibraryRuntime>,
+        module: &Arc<LibraryRegistry>,
     ) -> LibraryHandlers {
-        let state = module.state();
-        let routes = module.routes();
-        let storage = module.storage();
-        let wasm_factory = module.wasm_factory();
-        let ir_factory = module.ir_factory();
-        let get = schema_get_handler(state.clone());
-        let put = schema_put_handler(state, routes.clone(), storage, wasm_factory, ir_factory);
-        let route = routes_handler(&routes);
+        let get = schema_get_handler(Arc::clone(module));
+        let put = schema_put_handler(Arc::clone(module));
+        let route = routes_handler(Arc::clone(module));
         LibraryHandlers::with_route(get, put, route)
     }
 
     pub fn schema_get_handler(
-        state: LibraryState,
+        registry: Arc<LibraryRegistry>,
     ) -> impl KernelHandler {
         move |_req: Request| {
-            let state = state.clone();
-            async move { respond_with_schema(state.schema()) }.boxed()
+            let registry = Arc::clone(&registry);
+            async move { respond_with_listing(registry.list_dir(crate::uri::LIB_ROOT)) }.boxed()
         }
     }
 
     pub fn schema_put_handler(
-        state: LibraryState,
-        routes: LibraryRoutes,
-        storage: Option<LibraryDir>,
-        wasm_factory: Option<LibraryRouteFactory>,
-        ir_factory: Option<LibraryRouteFactory>,
+        registry: Arc<LibraryRegistry>,
     ) -> impl KernelHandler {
         move |req: Request| {
-            let state = state.clone();
-            let routes = routes.clone();
-            let storage = storage.clone();
-            let wasm_factory = wasm_factory.clone();
-            let ir_factory = ir_factory.clone();
+            let registry = Arc::clone(&registry);
             let txn = req.extensions().get::<crate::txn::TxnHandle>().cloned();
             async move {
                 let txn = match txn {
@@ -889,27 +1042,16 @@ pub mod http {
                         if !txn.has_claim(schema.id(), umask::USER_WRITE) {
                             return unauthorized_response("unauthorized library install");
                         }
-                        state.replace_schema(schema);
-                        routes.clear();
-                        if let Some(storage) = &storage
-                            && let Err(err) = storage.persist_schema(&state.schema())
-                        {
-                            return internal_error(err.to_string());
+                        match registry.install_schema(schema).await {
+                            Ok(()) => no_content_response(),
+                            Err(err) => install_error_response(err),
                         }
-                        no_content_response()
                     }
                     Ok(InstallRequest::WithArtifacts(payload)) => {
                         if !txn.has_claim(payload.schema.id(), umask::USER_WRITE) {
                             return unauthorized_response("unauthorized library install");
                         }
-                        match apply_install(
-                            &state,
-                            &routes,
-                            storage.as_ref(),
-                            wasm_factory.as_ref(),
-                            ir_factory.as_ref(),
-                            payload,
-                        ) {
+                        match registry.install_payload(payload).await {
                             Ok(()) => no_content_response(),
                             Err(err) => install_error_response(err),
                         }
@@ -922,7 +1064,8 @@ pub mod http {
     }
 
     fn respond_with_schema(schema: LibrarySchema) -> Response {
-        match destream_json::encode(schema) {
+        let state = schema_to_state(&schema);
+        match destream_json::encode(state) {
             Ok(stream) => {
                 let body =
                     Body::wrap_stream(stream.map_err(|err| io::Error::other(err.to_string())));
@@ -934,6 +1077,65 @@ pub mod http {
             }
             Err(err) => internal_error(err.to_string()),
         }
+    }
+
+    fn respond_with_listing(listing: Option<tc_ir::Map<bool>>) -> Response {
+        let Some(listing) = listing else {
+            return http::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .expect("dir not found response");
+        };
+
+        let state = listing_to_state(&listing);
+        match destream_json::encode(state) {
+            Ok(stream) => {
+                let body =
+                    Body::wrap_stream(stream.map_err(|err| io::Error::other(err.to_string())));
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .expect("dir listing response")
+            }
+            Err(err) => internal_error(err.to_string()),
+        }
+    }
+
+    fn schema_to_state(schema: &LibrarySchema) -> State {
+        let dependencies = schema
+            .dependencies()
+            .iter()
+            .enumerate()
+            .map(|(idx, dep)| {
+                (
+                    idx.to_string(),
+                    State::from(Value::from(dep.to_string())),
+                )
+            })
+            .collect::<Map<State>>();
+
+        let mut map = Map::new();
+        map.insert("id".to_string(), State::from(Value::from(schema.id().to_string())));
+        map.insert(
+            "version".to_string(),
+            State::from(Value::from(schema.version().to_string())),
+        );
+        map.insert("dependencies".to_string(), State::Map(dependencies));
+        State::Map(map)
+    }
+
+    fn listing_to_state(listing: &tc_ir::Map<bool>) -> State {
+        let map = listing
+            .iter()
+            .map(|(name, is_dir)| {
+                (
+                    name.clone(),
+                    State::from(Value::from(Number::from(*is_dir))),
+                )
+            })
+            .collect::<Map<State>>();
+        State::Map(map)
     }
 
     async fn decode_body(req: Request) -> Result<InstallRequest, InstallError> {
@@ -980,19 +1182,26 @@ pub mod http {
     }
 
     pub fn routes_handler(
-        routes: &LibraryRoutes,
-    ) -> impl KernelHandler + '_ {
-        let routes = routes.clone();
+        registry: Arc<LibraryRegistry>,
+    ) -> impl KernelHandler {
         move |req: Request| {
-            let handler = routes.current_handler();
+            let path = req.uri().path().to_string();
+            let registry = Arc::clone(&registry);
             async move {
-                if let Some(handler) = handler {
-                    handler.call(req).await
-                } else {
-                    http::Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(Body::empty())
-                        .expect("missing route")
+                match registry.resolve_runtime_for_path(&path) {
+                    Some((runtime, true)) => respond_with_schema(runtime.state.schema()),
+                    Some((runtime, false)) => {
+                        let handler = runtime.routes.current_handler();
+                        if let Some(handler) = handler {
+                            handler.call(req).await
+                        } else {
+                            http::Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Body::empty())
+                                .expect("missing route")
+                        }
+                    }
+                    None => respond_with_listing(registry.list_dir(&path)),
                 }
             }
             .boxed()
@@ -1004,20 +1213,74 @@ pub mod http {
         use super::*;
         use crate::{Method, kernel::Kernel};
         use crate::http::{Body, header};
+        use crate::library::{InstallArtifacts, encode_install_payload_bytes};
+        use crate::storage::Artifact;
         use hyper::body::to_bytes;
         use pathlink::Link;
-        use serde_json::Value as JsonValue;
         use std::str::FromStr;
+        use tc_ir::Scalar;
+        use tc_state::{State, null_transaction};
         use tc_ir::LibrarySchema;
+        use futures::stream;
+
+        async fn decode_state(bytes: Vec<u8>) -> State {
+            let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(bytes.clone().into())]);
+            match destream_json::try_decode(null_transaction(), stream).await {
+                Ok(state) => state,
+                Err(_) => {
+                    let text = String::from_utf8(bytes).expect("utf8");
+                    let wrapped = format!(r#"{{"/state/scalar/map":{text}}}"#);
+                    let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(
+                        wrapped.into_bytes().into(),
+                    )]);
+                    destream_json::try_decode(null_transaction(), stream)
+                        .await
+                        .expect("state decode")
+                }
+            }
+        }
+
+        #[test]
+        fn round_trips_install_payload_bytes() {
+            let schema = LibrarySchema::new(
+                Link::from_str("/lib/example-devco/hello/0.1.0").expect("link"),
+                "0.1.0",
+                vec![],
+            );
+
+            let payload = InstallArtifacts {
+                schema: schema.clone(),
+                artifacts: vec![Artifact {
+                    path: schema.id().to_string(),
+                    content_type: WASM_ARTIFACT_CONTENT_TYPE.to_string(),
+                    bytes: b"wasm-bytes".to_vec(),
+                }],
+            };
+
+            let bytes = encode_install_payload_bytes(&payload).expect("encode payload");
+            let request = decode_install_request_bytes(&bytes).expect("decode payload");
+
+            match request {
+                InstallRequest::WithArtifacts(decoded) => {
+                    assert_eq!(decoded.schema.id(), schema.id());
+                    assert_eq!(decoded.schema.version(), schema.version());
+                    assert_eq!(decoded.artifacts.len(), 1);
+                    assert_eq!(decoded.artifacts[0].content_type, WASM_ARTIFACT_CONTENT_TYPE);
+                }
+                _ => panic!("expected artifacts payload"),
+            }
+        }
 
         #[tokio::test]
         async fn serves_schema_over_http() {
             let initial = LibrarySchema::new(
-                Link::from_str("/lib/service").expect("link"),
+                Link::from_str("/lib/example-devco/service/0.1.0").expect("link"),
                 "0.1.0",
                 vec![],
             );
-            let module = build_http_library_module(initial.clone(), None);
+            let module = build_http_library_module(initial.clone(), None)
+                .await
+                .expect("module");
             let handlers = http_library_handlers(&module);
 
             let kernel = Kernel::builder()
@@ -1039,22 +1302,58 @@ pub mod http {
             assert_eq!(response.status(), StatusCode::OK);
 
             let body = to_bytes(response.into_body()).await.expect("body");
-            let json: JsonValue = serde_json::from_slice(&body).expect("json");
+            let state = decode_state(body.to_vec()).await;
+            let State::Map(listing) = state else {
+                panic!("expected State::Map listing");
+            };
+            assert!(listing.contains_key("example-devco"));
 
-            assert_eq!(json["id"], "/lib/service");
-            assert_eq!(json["version"], "0.1.0");
-            assert!(json["dependencies"].is_array());
+            let schema_request = http::Request::builder()
+                .method("GET")
+                .uri("/lib/example-devco/service/0.1.0")
+                .body(Body::empty())
+                .expect("schema request");
+
+            let schema_response = kernel
+                .dispatch(Method::Get, "/lib/example-devco/service/0.1.0", schema_request)
+                .expect("schema handler")
+                .await;
+
+            assert_eq!(schema_response.status(), StatusCode::OK);
+
+            let body = to_bytes(schema_response.into_body()).await.expect("body");
+            let state = decode_state(body.to_vec()).await;
+            let State::Map(schema_map) = state else {
+                panic!("expected State::Map schema");
+            };
+            let id = match schema_map.get("id") {
+                Some(State::Scalar(Scalar::Value(Value::String(value)))) => value.as_str(),
+                _ => panic!("missing schema id"),
+            };
+            let version = match schema_map.get("version") {
+                Some(State::Scalar(Scalar::Value(Value::String(value)))) => value.as_str(),
+                _ => panic!("missing schema version"),
+            };
+            assert_eq!(id, "/lib/example-devco/service/0.1.0");
+            assert_eq!(version, "0.1.0");
+            let deps = match schema_map.get("dependencies") {
+                Some(State::Map(map)) => map,
+                _ => panic!("missing dependencies"),
+            };
+            assert!(deps.is_empty());
         }
 
         #[tokio::test]
         async fn installs_schema_via_put() {
             use tc_ir::Claim;
             let initial = LibrarySchema::new(
-                Link::from_str("/lib/service").expect("link"),
+                Link::from_str("/lib/example-devco/service/0.1.0").expect("link"),
                 "0.1.0",
                 vec![],
             );
-            let module = build_http_library_module(initial, None);
+            let module = build_http_library_module(initial, None)
+                .await
+                .expect("module");
             let handlers = http_library_handlers(&module);
 
             let kernel = Kernel::builder()
@@ -1063,7 +1362,7 @@ pub mod http {
                 .finish();
 
             let new_schema = serde_json::json!({
-                "id": "/lib/updated",
+                "id": "/lib/example-devco/updated/0.2.0",
                 "version": "0.2.0",
                 "dependencies": [],
             });
@@ -1075,7 +1374,7 @@ pub mod http {
                 .body(Body::from(new_schema.to_string()))
                 .expect("install request");
             let install_claim = Claim::new(
-                Link::from_str("/lib/updated").expect("install link"),
+                Link::from_str("/lib/example-devco/updated/0.2.0").expect("install link"),
                 umask::USER_WRITE,
             );
             let install_txn = kernel
@@ -1093,21 +1392,76 @@ pub mod http {
 
             let get_request = http::Request::builder()
                 .method("GET")
-                .uri("/lib")
+                .uri("/lib/example-devco/updated/0.2.0")
                 .body(Body::empty())
                 .expect("get request");
 
             let get_response = kernel
-                .dispatch(Method::Get, "/lib", get_request)
+                .dispatch(Method::Get, "/lib/example-devco/updated/0.2.0", get_request)
                 .expect("get handler")
                 .await;
 
-            let json: JsonValue =
-                serde_json::from_slice(&to_bytes(get_response.into_body()).await.unwrap())
-                    .expect("json");
-
-            assert_eq!(json["id"], "/lib/updated");
-            assert_eq!(json["version"], "0.2.0");
+            let body = to_bytes(get_response.into_body()).await.expect("body");
+            let state = decode_state(body.to_vec()).await;
+            let State::Map(schema_map) = state else {
+                panic!("expected State::Map schema");
+            };
+            let id = match schema_map.get("id") {
+                Some(State::Scalar(Scalar::Value(Value::String(value)))) => value.as_str(),
+                _ => panic!("missing schema id"),
+            };
+            let version = match schema_map.get("version") {
+                Some(State::Scalar(Scalar::Value(Value::String(value)))) => value.as_str(),
+                _ => panic!("missing schema version"),
+            };
+            assert_eq!(id, "/lib/example-devco/updated/0.2.0");
+            assert_eq!(version, "0.2.0");
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::LibraryRegistry;
+    use pathlink::Link;
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+    use tc_ir::{Claim, LibrarySchema};
+    use umask;
+
+    #[test]
+    fn picks_longest_matching_claim_for_egress() {
+        let registry = LibraryRegistry::new(None, BTreeMap::new());
+
+        let parent_id = format!("{}/acme/parent/1.0.0", crate::uri::LIB_ROOT);
+        let child_id = format!("{}/acme/parent/1.0.0/child/0.1.0", crate::uri::LIB_ROOT);
+        let parent = LibrarySchema::new(
+            Link::from_str(&parent_id).expect("parent link"),
+            "1.0.0",
+            vec![],
+        );
+        let child = LibrarySchema::new(
+            Link::from_str(&child_id).expect("child link"),
+            "0.1.0",
+            vec![],
+        );
+
+        futures::executor::block_on(registry.insert_schema(parent.clone()))
+            .expect("insert parent");
+        futures::executor::block_on(registry.insert_schema(child.clone()))
+            .expect("insert child");
+
+        let txn = crate::txn::TxnManager::with_host_id("test-claim")
+            .begin()
+            .with_claims(vec![
+                Claim::new(parent.id().clone(), umask::USER_READ),
+                Claim::new(child.id().clone(), umask::USER_READ),
+            ]);
+
+        let resolved = registry
+            .schema_for_txn(&txn)
+            .expect("schema");
+
+        assert_eq!(resolved.id(), child.id());
     }
 }

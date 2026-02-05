@@ -254,6 +254,7 @@ fn build_request(
         .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
+// Sync HTTP client boundary: encode via async streams by blocking explicitly here.
 fn encode_state_body(state: State) -> TCResult<Vec<u8>> {
     use futures::TryStreamExt;
 

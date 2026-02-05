@@ -26,6 +26,13 @@ base64 = "0.22"
 getrandom = "0.2"
 sha2 = "0.10"
 rjwt = { version = "0.6" }
+freqfs = "0.12.0"
+mdns-sd = { version = "0.11", optional = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+aes-gcm-siv = "0.11"
+hex = "0.4"
+safecast = "0.2"
+number-general = "0.14"
 
 [dependencies.destream_json]
 version = "0.15"
@@ -47,8 +54,7 @@ features = ["full"]
 
 [dependencies.tokio]
 version = "1"
-features = ["rt-multi-thread", "macros", "sync"]
-optional = true
+features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"]
 
 [dependencies.tower]
 version = "0.4"
@@ -58,12 +64,14 @@ optional = true
 [features]
 default = ["http-server", "wasm"]
 # Outbound HTTP client support (for proxying requests to remote hosts).
-http-client = ["dep:http", "dep:tokio"]
+http-client = ["dep:http"]
 # Inbound HTTP server support (Hyper server + tower make_service wiring).
 http-server = ["http-client", "dep:tower", "dep:destream_json"]
 pyo3 = ["http-server", "dep:pyo3", "dep:destream_json", "tc-ir/pyo3-conversions"]
 pyo3-extension = ["pyo3", "pyo3/extension-module"]
 wasm = ["dep:wasmtime"]
+mdns = ["dep:mdns-sd"]
+k8s = []
 
 [dev-dependencies]
 serde_json = "1"
@@ -76,3 +84,7 @@ required-features = ["http-server"]
 
 [[example]]
 name = "rjwt_install_token"
+
+[[bin]]
+name = "tc-server"
+path = "src/main.rs"

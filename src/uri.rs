@@ -22,12 +22,20 @@ pub(crate) fn component_root(path: &str) -> Option<&str> {
         return Some(path);
     }
 
+    if path == HOST_ROOT {
+        return Some(path);
+    }
+
     if path.starts_with("/lib/") {
         return component_root_with_segments(path, 4).or(Some(LIB_ROOT));
     }
 
     if path.starts_with("/service/") {
         return component_root_with_segments(path, 5).or(Some(SERVICE_ROOT));
+    }
+
+    if path.starts_with("/host/") {
+        return Some(HOST_ROOT);
     }
 
     None

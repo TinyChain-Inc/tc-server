@@ -4,6 +4,7 @@ pub mod gateway;
 pub mod kernel;
 pub mod ir;
 pub mod resolve;
+pub mod replication;
 pub mod txn_server;
 pub mod uri;
 
@@ -48,7 +49,7 @@ pub use http_client::HttpRpcGateway;
 
 #[cfg(feature = "http-server")]
 pub use http::{
-    HttpKernel, HttpKernelConfig, HttpServer, build_http_kernel, build_http_kernel_with_config,
+    HttpKernelConfig, HttpServer, build_http_kernel, build_http_kernel_with_config,
 };
 
 #[cfg(feature = "pyo3")]
@@ -59,7 +60,7 @@ use pyo3::prelude::*;
 
 #[cfg(feature = "pyo3")]
 pub use pyo3_runtime::{
-    KernelHandle as PyKernelHandle, PyKernel, PyKernelRequest, PyKernelResponse,
+    KernelHandle as PyKernelHandle, PyKernelRequest, PyKernelResponse,
     register_python_api,
 };
 
@@ -69,7 +70,7 @@ pub(crate) fn build_python_kernel(
     lib: Py<PyAny>,
     service: Py<PyAny>,
     metrics: Option<Py<PyAny>>,
-) -> PyKernel {
+) -> Kernel {
     pyo3_runtime::python_kernel_builder_with_config(
         lib,
         service,
@@ -85,6 +86,6 @@ pub(crate) fn build_python_kernel_with_config(
     service: Py<PyAny>,
     metrics: Option<Py<PyAny>>,
     config: pyo3_runtime::PyKernelConfig,
-) -> PyKernel {
+) -> Kernel {
     pyo3_runtime::python_kernel_builder_with_config(lib, service, metrics, config)
 }

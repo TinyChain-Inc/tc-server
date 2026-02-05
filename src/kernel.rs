@@ -5,7 +5,7 @@ use std::fmt;
 use tc_ir::TxnId;
 
 use crate::egress::EgressPolicy;
-use crate::library::{LibraryHandlers, LibraryRuntime};
+use crate::library::{LibraryHandlers, LibraryRegistry};
 use crate::txn_server::TxnServer;
 use crate::uri::{component_root, normalize_path};
 use crate::{Request, Response};
@@ -59,7 +59,7 @@ pub struct Kernel {
     txn_manager: crate::txn::TxnManager,
     txn_server: TxnServer,
     egress: EgressPolicy,
-    library_module: Option<Arc<LibraryRuntime>>,
+    library_module: Option<Arc<LibraryRegistry>>,
     rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
     kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
@@ -76,10 +76,8 @@ impl Kernel {
         path: &str,
         req: Request,
     ) -> Option<BoxFuture<'static, Response>> {
-        if path.starts_with("/lib/")
-            && let Some(handler) = &self.lib_route_handler
-        {
-            return Some(handler.call(req));
+        if path.starts_with("/lib/") {
+            return self.lib_route_handler.as_ref().map(|handler| handler.call(req));
         }
 
         if path == crate::uri::SERVICE_ROOT || path.starts_with("/service/") {
@@ -89,8 +87,10 @@ impl Kernel {
         match (method, path) {
             (Method::Get, crate::uri::LIB_ROOT) => Some(self.lib_get_handler.call(req)),
             (Method::Put, crate::uri::LIB_ROOT) => Some(self.lib_put_handler.call(req)),
+            (Method::Get, "/") => Some(self.kernel_handler.call(req)),
             (Method::Get, "/host/metrics") => Some(self.kernel_handler.call(req)),
             (Method::Get, "/host/public_key") => Some(self.kernel_handler.call(req)),
+            (Method::Get, "/host/library/export") => Some(self.kernel_handler.call(req)),
             (Method::Get, crate::uri::HEALTHZ) => Some(self.health_handler.call(req)),
             _ => None,
         }
@@ -122,7 +122,7 @@ impl Kernel {
     fn build_txn_resolver(&self) -> Arc<dyn crate::gateway::RpcGateway> {
         Arc::new(KernelTxnResolver {
             gateway: self.rpc_gateway.as_ref().map(Arc::clone),
-            library_state: self.library_module.as_ref().map(|module| module.state()),
+            library_registry: self.library_module.as_ref().map(Arc::clone),
             egress: self.egress.clone(),
             token_verifier: Arc::clone(&self.token_verifier),
             txn_manager: self.txn_manager.clone(),
@@ -164,7 +164,7 @@ impl Kernel {
 
         if path == crate::uri::HEALTHZ
             || path == crate::uri::HOST_ROOT
-            || path.starts_with("/host/")
+            || (path.starts_with("/host/") && path != "/host/library/export")
         {
             return Ok(dispatch_or_not_found(self.dispatch(method, path, req)));
         }
@@ -320,7 +320,7 @@ pub enum KernelDispatch {
 #[derive(Clone)]
 struct KernelTxnResolver {
     gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
-    library_state: Option<crate::library::LibraryState>,
+    library_registry: Option<Arc<LibraryRegistry>>,
     egress: EgressPolicy,
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
     txn_manager: crate::txn::TxnManager,
@@ -335,7 +335,7 @@ impl KernelTxnResolver {
         txn: &crate::txn::TxnHandle,
     ) -> tc_error::TCResult<(pathlink::Link, crate::txn::TxnHandle)> {
         let target_str = target.to_string();
-        let library_state = self.library_state.clone().ok_or_else(|| {
+        let registry = self.library_registry.clone().ok_or_else(|| {
             tc_error::TCError::unauthorized(
                 "no library manifest loaded (egress is default-deny)",
             )
@@ -398,7 +398,7 @@ impl KernelTxnResolver {
             None => None,
         };
 
-        let schema = library_state.schema();
+        let schema = registry.schema_for_txn(txn)?;
         let resolved = self.egress.resolve_target(&schema, &target_str)?;
         let resolved = pathlink::Link::from_str(&resolved)
             .map_err(|err| tc_error::TCError::bad_request(err.to_string()))?;
@@ -511,7 +511,7 @@ pub struct KernelBuilder {
     txn_manager: crate::txn::TxnManager,
     txn_server: TxnServer,
     egress: EgressPolicy,
-    library_module: Option<Arc<LibraryRuntime>>,
+    library_module: Option<Arc<LibraryRegistry>>,
     rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
     kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
@@ -592,7 +592,7 @@ impl KernelBuilder {
 
     pub fn with_library_module(
         mut self,
-        module: Arc<LibraryRuntime>,
+        module: Arc<LibraryRegistry>,
         handlers: LibraryHandlers,
     ) -> Self {
         self.library_module = Some(module);
@@ -673,12 +673,6 @@ impl KernelBuilder {
     }
 
     pub fn finish(self) -> Kernel {
-        if let Some(module) = &self.library_module
-            && let Err(err) = module.hydrate_from_storage()
-        {
-            panic!("failed to hydrate library storage: {err}");
-        }
-
         Kernel {
             lib_get_handler: self
                 .lib_get_handler
@@ -986,9 +980,9 @@ mod tests {
             vec![],
         );
 
-        let module = Arc::new(crate::library::LibraryRuntime::new(
-            schema, None, None, None,
-        ));
+        let registry = crate::library::LibraryRegistry::new(None, std::collections::BTreeMap::new());
+        futures::executor::block_on(registry.insert_schema(schema)).expect("insert schema");
+        let module = Arc::new(registry);
         let handlers = crate::library::LibraryHandlers::without_route(ok_handler(), ok_handler());
 
         let gateway = MockGateway::default();
@@ -1093,9 +1087,9 @@ mod tests {
                 .expect("dependency root")],
         );
 
-        let module = Arc::new(crate::library::LibraryRuntime::new(
-            schema, None, None, None,
-        ));
+        let registry = crate::library::LibraryRegistry::new(None, std::collections::BTreeMap::new());
+        futures::executor::block_on(registry.insert_schema(schema)).expect("insert schema");
+        let module = Arc::new(registry);
         let handlers = crate::library::LibraryHandlers::without_route(ok_handler(), ok_handler());
 
         let gateway = RecordingGateway::new(vec![

@@ -364,7 +364,9 @@ mod http_tests {
         let bytes = super::tests::wasm_module();
         let initial =
             tc_ir::LibrarySchema::new(Link::from_str("/lib/initial").unwrap(), "0.0.1", vec![]);
-        let module = build_http_library_module(initial, None);
+        let module = build_http_library_module(initial, None)
+            .await
+            .expect("module");
         let handlers = http_library_handlers(&module);
 
         let kernel = Kernel::builder()
@@ -622,7 +624,9 @@ mod http_tests {
 
         let initial_schema =
             tc_ir::LibrarySchema::new(Link::from_str("/lib/initial")?, "0.0.1", vec![]);
-        let b_module = build_http_library_module(initial_schema, None);
+        let b_module = build_http_library_module(initial_schema, None)
+            .await
+            .expect("module");
         let b_handlers = http_library_handlers(&b_module);
 
         let b_kernel = Kernel::builder()
@@ -690,7 +694,9 @@ mod http_tests {
             "0.1.0",
             vec![Link::from_str(b_root)?],
         );
-        let a_module = build_http_library_module(a_schema.clone(), None);
+        let a_module = build_http_library_module(a_schema.clone(), None)
+            .await
+            .expect("module");
         let a_handlers = http_library_handlers(&a_module);
 
         let a_kernel = Kernel::builder()

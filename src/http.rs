@@ -20,18 +20,21 @@ use tower::Service;
 use url::form_urlencoded;
 
 use crate::{
-    Kernel, KernelDispatch, KernelHandler, Method,
+    Kernel, KernelBuilder, KernelDispatch, KernelHandler, Method,
     library::{
-        NativeLibrary, NativeLibraryHandler, default_library_schema,
-        http::{build_http_library_module, http_library_handlers},
+        LibraryRegistry, NativeLibrary, NativeLibraryHandler, default_library_schema,
+        http::{
+            build_http_library_module_with_store,
+            http_library_handlers,
+        },
     },
-    storage::LibraryDir,
     txn::TxnHandle,
 };
+use crate::storage::{LibraryStore, load_library_root};
 use tc_error::{ErrorKind, TCError, TCResult};
 use tc_value::Value;
 
-pub type HttpKernel = Kernel;
+// Alias removed: use Kernel directly.
 
 /// Configuration options for building an HTTP kernel instance.
 #[derive(Clone, Debug)]
@@ -69,39 +72,72 @@ impl HttpKernelConfig {
 }
 
 /// Helper that wires the shared library module plus storage into a kernel configured for HTTP.
-pub fn build_http_kernel_with_config<S, K, H>(
+pub async fn build_http_kernel_with_config<S, K, H>(
     config: HttpKernelConfig,
     service_handler: S,
     kernel_handler: K,
     health_handler: H,
-) -> HttpKernel
+) -> TCResult<Kernel>
 where
     S: KernelHandler,
     K: KernelHandler,
     H: KernelHandler,
 {
-    let storage = config
-        .data_dir
-        .as_ref()
-        .map(|path| LibraryDir::new(path.clone()));
-    let module = build_http_library_module(config.initial_schema.clone(), storage);
-    let handlers = http_library_handlers(&module);
-
-    Kernel::builder()
-        .with_host_id(config.host_id.clone())
-        .with_http_rpc_gateway()
-        .with_library_module(module, handlers)
-        .with_service_handler(service_handler)
-        .with_kernel_handler(kernel_handler)
-        .with_health_handler(health_handler)
-        .finish()
+    let (kernel, _module) = build_http_kernel_and_registry_with_config_and_builder(
+        config,
+        service_handler,
+        health_handler,
+        |_, builder| builder.with_kernel_handler(kernel_handler),
+    )
+    .await?;
+    Ok(kernel)
 }
 
-pub fn build_http_kernel<S, K, H>(
+pub async fn build_http_kernel_and_registry_with_config_and_builder<S, H, F>(
+    config: HttpKernelConfig,
+    service_handler: S,
+    health_handler: H,
+    configure: F,
+) -> TCResult<(Kernel, Arc<LibraryRegistry>)>
+where
+    S: KernelHandler,
+    H: KernelHandler,
+    F: FnOnce(&Arc<LibraryRegistry>, KernelBuilder) -> KernelBuilder,
+{
+    let storage_root = config.data_dir.clone();
+    let store = match storage_root {
+        Some(root) => {
+            let root_dir = load_library_root(root).await?;
+            Some(LibraryStore::from_root(root_dir))
+        }
+        None => None,
+    };
+
+    let module = build_http_library_module_with_store(
+        config.initial_schema.clone(),
+        store,
+    )
+    .await?;
+    module.hydrate_from_storage().await?;
+    let handlers = http_library_handlers(&module);
+
+    let builder = Kernel::builder()
+        .with_host_id(config.host_id.clone())
+        .with_http_rpc_gateway()
+        .with_library_module(module.clone(), handlers)
+        .with_service_handler(service_handler)
+        .with_health_handler(health_handler);
+
+    let kernel = configure(&module, builder).finish();
+
+    Ok((kernel, module))
+}
+
+pub async fn build_http_kernel<S, K, H>(
     service_handler: S,
     kernel_handler: K,
     health_handler: H,
-) -> HttpKernel
+) -> TCResult<Kernel>
 where
     S: KernelHandler,
     K: KernelHandler,
@@ -113,6 +149,7 @@ where
         kernel_handler,
         health_handler,
     )
+    .await
 }
 
 pub fn build_http_kernel_with_native_library<H, S, K, He>(
@@ -120,7 +157,7 @@ pub fn build_http_kernel_with_native_library<H, S, K, He>(
     service_handler: S,
     kernel_handler: K,
     health_handler: He,
-) -> HttpKernel
+) -> Kernel
 where
     H: NativeLibraryHandler,
     S: KernelHandler,
@@ -142,7 +179,7 @@ pub fn build_http_kernel_with_native_library_and_config<H, S, K, He>(
     service_handler: S,
     kernel_handler: K,
     health_handler: He,
-) -> HttpKernel
+) -> Kernel
 where
     H: NativeLibraryHandler,
     S: KernelHandler,
@@ -166,11 +203,11 @@ where
 }
 
 pub struct HttpServer {
-    kernel: HttpKernel,
+    kernel: Kernel,
 }
 
 impl HttpServer {
-    pub fn new(kernel: HttpKernel) -> Self {
+    pub fn new(kernel: Kernel) -> Self {
         Self { kernel }
     }
 
@@ -217,11 +254,11 @@ impl HttpServer {
 
 #[derive(Clone)]
 pub(crate) struct KernelService {
-    kernel: HttpKernel,
+    kernel: Kernel,
 }
 
 impl KernelService {
-    fn new(kernel: HttpKernel) -> Self {
+    fn new(kernel: Kernel) -> Self {
         Self { kernel }
     }
 }
@@ -297,15 +334,19 @@ impl Service<Request> for KernelService {
             ) {
                 Ok(KernelDispatch::Response(resp)) => {
                     let mut response = resp.await;
-                    if inbound_txn_id.is_none()
-                        && let Some(txn_id) = minted_txn_id
-                        && let Ok(value) = HeaderValue::from_str(&txn_id.to_string())
-                    {
-                        response.headers_mut().insert("x-tc-txn-id", value);
-                        if let Some(token) = minted_token
-                            && let Ok(value) = HeaderValue::from_str(&token)
+                    if inbound_txn_id.is_none() {
+                        if let Some(value) = minted_txn_id
+                            .map(|txn_id| HeaderValue::from_str(&txn_id.to_string()))
+                            .and_then(Result::ok)
                         {
-                            response.headers_mut().insert("x-tc-bearer-token", value);
+                            response.headers_mut().insert("x-tc-txn-id", value);
+                        }
+                        if let Some(value) =
+                            minted_token.and_then(|token| HeaderValue::from_str(&token).ok())
+                        {
+                            response
+                                .headers_mut()
+                                .insert("x-tc-bearer-token", value);
                         }
                     }
 
@@ -725,14 +766,15 @@ where
 }
 
 async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> {
-    if let Some(body) = req.extensions().get::<RequestBody>()
-        && !body.is_empty()
-    {
-        let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body.clone_bytes())]);
-        return destream_json::try_decode((), stream)
-            .await
-            .map(Some)
-            .map_err(|err| TCError::bad_request(err.to_string()));
+    match req.extensions().get::<RequestBody>() {
+        Some(body) if !body.is_empty() => {
+            let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body.clone_bytes())]);
+            return destream_json::try_decode((), stream)
+                .await
+                .map(Some)
+                .map_err(|err| TCError::bad_request(err.to_string()));
+        }
+        _ => {}
     }
 
     let query = req.uri().query().unwrap_or("");
@@ -797,7 +839,7 @@ mod tests {
         }
     }
 
-    fn kernel_with_lib_handler() -> HttpKernel {
+    fn kernel_with_lib_handler() -> Kernel {
         Kernel::builder()
             .with_lib_handler(ok_handler())
             .with_lib_put_handler(ok_handler())
@@ -809,7 +851,7 @@ mod tests {
             .finish()
     }
 
-    fn kernel_with_ok_routing() -> HttpKernel {
+    fn kernel_with_ok_routing() -> Kernel {
         Kernel::builder()
             .with_lib_handler(ok_handler())
             .with_lib_put_handler(ok_handler())
@@ -900,7 +942,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_bearer_token_for_anonymous_txn() {
-        let kernel: HttpKernel = Kernel::builder()
+        let kernel: Kernel = Kernel::builder()
             .with_lib_handler(ok_handler())
             .with_lib_put_handler(ok_handler())
             .with_lib_route_handler(ok_handler())
@@ -1141,10 +1183,13 @@ mod tests {
         let bytes = crate::test_utils::wasm_echo_request_module();
         let initial =
             tc_ir::LibrarySchema::new(Link::from_str("/lib/initial").unwrap(), "0.0.1", vec![]);
-        let module = crate::library::http::build_http_library_module(initial, None);
+        let module =
+            crate::library::http::build_http_library_module(initial, None)
+                .await
+                .expect("module");
         let handlers = crate::library::http::http_library_handlers(&module);
 
-        let remote_kernel: HttpKernel = Kernel::builder()
+        let remote_kernel: Kernel = Kernel::builder()
             .with_host_id("tc-wasm-test")
             .with_library_module(module, handlers)
             .with_service_handler(ok_handler())
@@ -1203,10 +1248,13 @@ mod tests {
             vec![Link::from_str("/lib/example-devco/example/0.1.0").expect("dependency root")],
         );
 
-        let module = crate::library::http::build_http_library_module(schema, None);
+        let module =
+            crate::library::http::build_http_library_module(schema, None)
+                .await
+                .expect("module");
         let handlers = crate::library::http::http_library_handlers(&module);
 
-        let local_kernel: HttpKernel = crate::Kernel::builder()
+        let local_kernel: Kernel = crate::Kernel::builder()
             .with_library_module(module, handlers)
             .with_dependency_route("/lib/example-devco/example/0.1.0", addr)
             .with_http_rpc_gateway()
@@ -1363,7 +1411,9 @@ mod tests {
             ok_handler(),
             host_handler,
             ok_handler(),
-        );
+        )
+        .await
+        .expect("kernel");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
