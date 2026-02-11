@@ -75,11 +75,7 @@ impl OpPlan {
         Ok(Self { levels, deps })
     }
 
-    pub fn required_set(
-        &self,
-        capture: &Id,
-        providers: &HashMap<Id, Scalar>,
-    ) -> HashSet<Id> {
+    pub fn required_set(&self, capture: &Id, providers: &HashMap<Id, Scalar>) -> HashSet<Id> {
         let mut required = HashSet::new();
         let mut stack = vec![capture.clone()];
 

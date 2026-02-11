@@ -3,7 +3,10 @@ use std::{env, io::Write, net::TcpListener, str::FromStr};
 use futures::{FutureExt, TryStreamExt};
 use pathlink::Link;
 use tc_error::{TCError, TCResult};
-use tc_ir::{Dir, HandleDelete, HandleGet, HandlePost, HandlePut, LibraryModule, Map, OpDef, OpRef, Scalar, Subject, TCRef, parse_route_path};
+use tc_ir::{
+    Dir, HandleDelete, HandleGet, HandlePost, HandlePut, LibraryModule, Map, OpDef, OpRef, Scalar,
+    Subject, TCRef, parse_route_path,
+};
 use tc_value::Value;
 use tinychain::http::build_http_kernel_with_native_library_and_config;
 use tinychain::http::{Body, HttpMethod, Request, Response, StatusCode};
@@ -29,7 +32,9 @@ struct ScalarHandler {
 impl ScalarHandler {
     fn hello_name(request: Value) -> String {
         match request {
-            Value::String(s) => serde_json::from_str::<String>(s.as_ref()).unwrap_or_else(|_| s.to_string()),
+            Value::String(s) => {
+                serde_json::from_str::<String>(s.as_ref()).unwrap_or_else(|_| s.to_string())
+            }
             Value::None => String::new(),
             other => format!("{other:?}"),
         }
@@ -41,10 +46,7 @@ impl ScalarHandler {
         let opref = OpRef::Get((Subject::Link(subject), Scalar::default()));
         let tcref = TCRef::Op(opref);
 
-        let inner = OpDef::Post(vec![(
-            "x".parse().expect("Id"),
-            Scalar::from(tcref),
-        )]);
+        let inner = OpDef::Post(vec![("x".parse().expect("Id"), Scalar::from(tcref))]);
 
         let mut plain_map = Map::new();
         plain_map.insert("a".parse().expect("Id"), Scalar::from(1_u64));
@@ -66,11 +68,12 @@ impl ScalarHandler {
         ]);
 
         let stream = destream_json::encode(outer).expect("encode opdef");
-        let bytes = futures::executor::block_on(stream.try_fold(Vec::new(), |mut acc, chunk| async move {
-            acc.extend_from_slice(&chunk);
-            Ok(acc)
-        }))
-        .expect("collect opdef");
+        let bytes =
+            futures::executor::block_on(stream.try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            }))
+            .expect("collect opdef");
         Value::String(String::from_utf8(bytes).expect("opdef json"))
     }
 }

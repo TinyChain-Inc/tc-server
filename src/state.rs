@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, stream};
-use url::form_urlencoded;
 use number_general::Number;
 use tc_ir::{Id, Map, Scalar};
 use tc_state::State;
 use tc_value::Value;
+use url::form_urlencoded;
 
-use crate::{Body, KernelHandler, Request, Response, StatusCode, header};
 use crate::reflect;
+use crate::{Body, KernelHandler, Request, Response, StatusCode, header};
 
 pub fn state_handler() -> Arc<dyn KernelHandler> {
     Arc::new(|req: Request| async move { dispatch(req).await }.boxed())
@@ -21,16 +21,14 @@ async fn dispatch(req: Request) -> Response {
     if reflect::is_reflect_path(req.uri().path()) {
         return reflect::reflect_handler().call(req).await;
     }
-    if req.uri().path() == "/state/scalar/value/number/add"
-    {
+    if req.uri().path() == "/state/scalar/value/number/add" {
         return match *req.method() {
             hyper::Method::POST => number_add(req).await,
             hyper::Method::GET => number_add_get(req).await,
             _ => method_not_allowed(),
         };
     }
-    if req.uri().path() == "/state/scalar/value/number/gt"
-    {
+    if req.uri().path() == "/state/scalar/value/number/gt" {
         return match *req.method() {
             hyper::Method::POST => number_gt(req).await,
             hyper::Method::GET => number_gt_get(req).await,

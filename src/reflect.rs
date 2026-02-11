@@ -6,10 +6,10 @@ use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, stream};
 
 use crate::{Body, KernelHandler, Request, Response, StatusCode, header};
+use pathlink::Link;
 use tc_ir::{Id, Map, NativeClass, OpDef, OpRef, Scalar, TCRef};
 use tc_state::State;
 use tc_value::Value;
-use pathlink::Link;
 
 enum ReflectPath {
     ScalarClass,
@@ -106,7 +106,8 @@ fn extract_scalar<'a>(params: &'a Map<Scalar>) -> Result<&'a Scalar, Response> {
     let op_key = Id::from_str("op")
         .map_err(|err| internal_error_response(&format!("invalid op key id: {err}")))?;
 
-    params.get(&scalar_key)
+    params
+        .get(&scalar_key)
         .or_else(|| params.get(&op_key))
         .ok_or_else(|| bad_request_response("missing scalar parameter"))
 }
@@ -115,15 +116,12 @@ async fn opdef_from_scalar(scalar: &Scalar) -> Result<OpDef, Response> {
     match scalar {
         Scalar::Op(opdef) => Ok(opdef.clone()),
         Scalar::Value(Value::String(raw)) => {
-            let stream =
-                stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(
-                    raw.as_bytes(),
-                ))]);
+            let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(
+                raw.as_bytes(),
+            ))]);
             destream_json::try_decode((), stream)
                 .await
-                .map_err(|err| {
-                    bad_request_response(&format!("invalid OpDef JSON string: {err}"))
-                })
+                .map_err(|err| bad_request_response(&format!("invalid OpDef JSON string: {err}")))
         }
         _ => Err(bad_request_response("expected OpDef scalar parameter")),
     }
@@ -286,7 +284,6 @@ async fn opdef_scalars(req: Request) -> Response {
     let scalars = opdef.walk_scalars().cloned().collect();
     state_response(State::Scalar(Scalar::Tuple(scalars)))
 }
-
 
 fn state_response(state: State) -> Response {
     match destream_json::encode(state) {

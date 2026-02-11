@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "mdns")]
-use std::time::Duration;
 
 use clap::Parser;
 use futures::FutureExt;
@@ -69,7 +67,11 @@ struct Config {
     #[arg(long = "max-request-bytes", env = "TC_MAX_REQUEST_BYTES", default_value_t = 1 * 1024 * 1024)]
     max_request_bytes: usize,
 
-    #[arg(long = "request-ttl-secs", env = "TC_REQUEST_TTL_SECS", default_value_t = 3)]
+    #[arg(
+        long = "request-ttl-secs",
+        env = "TC_REQUEST_TTL_SECS",
+        default_value_t = 3
+    )]
     request_ttl_secs: u64,
 }
 

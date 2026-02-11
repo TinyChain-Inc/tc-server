@@ -21,9 +21,12 @@ pub const WASM_ARTIFACT_CONTENT_TYPE: &str = "application/wasm";
 pub fn http_ir_route_handler_from_bytes(
     bytes: Vec<u8>,
 ) -> TCResult<(impl KernelHandler, LibrarySchema, SchemaRoutes)> {
-    use bytes::Bytes;
-    use crate::http::{Body, HttpMethod, Request, Response, StatusCode, header, decode_request_body_with_txn, RequestBody};
+    use crate::http::{
+        Body, HttpMethod, Request, RequestBody, Response, StatusCode, decode_request_body_with_txn,
+        header,
+    };
     use crate::resolve::Resolve;
+    use bytes::Bytes;
     use futures::{FutureExt, TryStreamExt};
     use std::{collections::HashMap, io};
     use tc_ir::{Map, OpDef, OpRef, Scalar, Subject, parse_route_path};
@@ -93,7 +96,9 @@ pub fn http_ir_route_handler_from_bytes(
             let stream =
                 futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
             let opdef: OpDef = futures::executor::block_on(destream_json::try_decode((), stream))
-                .map_err(|err| TCError::bad_request(format!("invalid opdef encoding: {err}")))?;
+                .map_err(|err| {
+                TCError::bad_request(format!("invalid opdef encoding: {err}"))
+            })?;
             routes.insert(segments, RouteImpl::OpDef(opdef));
         } else {
             return Err(TCError::bad_request("route missing value or op"));
@@ -199,11 +204,11 @@ pub fn http_ir_route_handler_from_bytes(
                             .expect("method not allowed");
                     }
                     match op.resolve(&txn).await {
-                    Ok(state) => state_response(state),
-                    Err(err) => http::Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Body::from(err.message().to_string()))
-                        .expect("error response"),
+                        Ok(state) => state_response(state),
+                        Err(err) => http::Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from(err.message().to_string()))
+                            .expect("error response"),
                     }
                 }
                 Some(RouteImpl::OpDef(opdef)) => {
@@ -350,7 +355,9 @@ pub fn http_ir_route_handler_from_bytes(
             .map_err(|err| TCError::bad_request(err.to_string()))?;
 
         let serde_json::Value::Object(map) = json_value else {
-            return Err(TCError::bad_request("expected map request body".to_string()));
+            return Err(TCError::bad_request(
+                "expected map request body".to_string(),
+            ));
         };
 
         let mut out = Map::new();
@@ -358,9 +365,10 @@ pub fn http_ir_route_handler_from_bytes(
             let id: Id = key
                 .parse::<Id>()
                 .map_err(|err| TCError::bad_request(err.to_string()))?;
-            let bytes = serde_json::to_vec(&value)
-                .map_err(|err| TCError::bad_request(err.to_string()))?;
-            let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+            let bytes =
+                serde_json::to_vec(&value).map_err(|err| TCError::bad_request(err.to_string()))?;
+            let stream =
+                futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
             let scalar: Scalar = destream_json::try_decode((), stream)
                 .await
                 .map_err(|err| TCError::bad_request(err.to_string()))?;
