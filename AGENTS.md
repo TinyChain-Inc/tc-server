@@ -35,6 +35,9 @@ Keep the following rules in mind whenever you extend the server:
   `/service` route. The Python client ships stubs purely for documentation and
   IDE support; the real work always flows through the shared kernel so HTTP,
   PyO3, WebSocket, and future adapters observe identical behavior.
+* **Single Op compiler.** All `OpDef` compilation (DAG planning/topological
+  scheduling) must go through the shared host-side entrypoint (`op_plan`); do
+  not reimplement this logic in adapters, installers, or runtime registries.
 * Feature flags (`http`, `pyo3`, `ws`, `media`, etc.) only toggle which adapters are compiled. They
   must **never** create additional kernel instances or mutate global state.
 * The WebSocket adapter (guarded by `ws`) must reuse the same kernel routing as HTTP: capability masks,

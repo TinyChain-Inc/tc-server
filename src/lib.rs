@@ -1,16 +1,20 @@
 pub mod auth;
 pub mod egress;
 pub mod gateway;
-pub mod kernel;
 pub mod ir;
-pub mod resolve;
+pub mod kernel;
 pub mod replication;
+pub mod resolve;
+pub mod op_executor;
+pub mod op_plan;
+pub mod reflect;
+pub mod state;
 pub mod txn_server;
 pub mod uri;
 
-pub use kernel::{Kernel, KernelBuilder, KernelDispatch, KernelHandler, Method};
-pub use hyper::{Body, StatusCode, header};
 pub use hyper::Method as HttpMethod;
+pub use hyper::{Body, StatusCode, header};
+pub use kernel::{Kernel, KernelBuilder, KernelDispatch, KernelHandler, Method};
 pub type Request = hyper::Request<hyper::Body>;
 pub type Response = hyper::Response<hyper::Body>;
 pub use gateway::RpcGateway as RpcClient;
@@ -35,6 +39,21 @@ pub use txn_server::TxnServer;
 pub use tc_state::State;
 pub use tc_value::Value;
 
+#[derive(Clone, Copy, Debug)]
+pub struct KernelLimits {
+    pub txn_ttl: std::time::Duration,
+    pub max_request_bytes_unauth: usize,
+}
+
+impl Default for KernelLimits {
+    fn default() -> Self {
+        Self {
+            txn_ttl: std::time::Duration::from_secs(3),
+            max_request_bytes_unauth: 1 * 1024 * 1024,
+        }
+    }
+}
+
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
@@ -48,9 +67,7 @@ pub mod http_client;
 pub use http_client::HttpRpcGateway;
 
 #[cfg(feature = "http-server")]
-pub use http::{
-    HttpKernelConfig, HttpServer, build_http_kernel, build_http_kernel_with_config,
-};
+pub use http::{HttpKernelConfig, HttpServer, build_http_kernel, build_http_kernel_with_config};
 
 #[cfg(feature = "pyo3")]
 pub mod pyo3_runtime;
@@ -60,8 +77,7 @@ use pyo3::prelude::*;
 
 #[cfg(feature = "pyo3")]
 pub use pyo3_runtime::{
-    KernelHandle as PyKernelHandle, PyKernelRequest, PyKernelResponse,
-    register_python_api,
+    KernelHandle as PyKernelHandle, PyKernelRequest, PyKernelResponse, register_python_api,
 };
 
 #[cfg(feature = "pyo3")]

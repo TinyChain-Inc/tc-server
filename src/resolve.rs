@@ -7,17 +7,11 @@ use tc_value::Value;
 use crate::gateway::RpcGateway;
 
 pub trait Resolve: Send + Sync + 'static {
-    fn resolve(
-        &self,
-        txn: &crate::txn::TxnHandle,
-    ) -> BoxFuture<'static, TCResult<State>>;
+    fn resolve(&self, txn: &crate::txn::TxnHandle) -> BoxFuture<'static, TCResult<State>>;
 }
 
 impl Resolve for OpRef {
-    fn resolve(
-        &self,
-        txn: &crate::txn::TxnHandle,
-    ) -> BoxFuture<'static, TCResult<State>> {
+    fn resolve(&self, txn: &crate::txn::TxnHandle) -> BoxFuture<'static, TCResult<State>> {
         let txn = txn.clone();
         let op = self.clone();
         Box::pin(async move {
@@ -46,38 +40,56 @@ impl Resolve for OpRef {
                 OpRef::Get((Subject::Ref(_, _), _))
                 | OpRef::Put((Subject::Ref(_, _), _, _))
                 | OpRef::Post((Subject::Ref(_, _), _))
-                | OpRef::Delete((Subject::Ref(_, _), _)) => {
-                    Err(TCError::bad_request(
-                        "cannot resolve OpRef subject Ref without a scope",
-                    ))
-                }
+                | OpRef::Delete((Subject::Ref(_, _), _)) => Err(TCError::bad_request(
+                    "cannot resolve OpRef subject Ref without a scope",
+                )),
             }
         })
     }
 }
 
 impl Resolve for TCRef {
-    fn resolve(
-        &self,
-        txn: &crate::txn::TxnHandle,
-    ) -> BoxFuture<'static, TCResult<State>> {
+    fn resolve(&self, txn: &crate::txn::TxnHandle) -> BoxFuture<'static, TCResult<State>> {
         match self {
             TCRef::Op(op) => op.resolve(txn),
+            TCRef::Id(_) => Box::pin(async move {
+                Err(TCError::bad_request(
+                    "cannot resolve TCRef::Id without a scope".to_string(),
+                ))
+            }),
+            TCRef::If(_) => Box::pin(async move {
+                Err(TCError::bad_request(
+                    "cannot resolve TCRef::If without a scope".to_string(),
+                ))
+            }),
+            TCRef::While(_) => Box::pin(async move {
+                Err(TCError::bad_request(
+                    "cannot resolve TCRef::While without a scope".to_string(),
+                ))
+            }),
         }
     }
 }
 
-async fn scalar_to_value(
-    txn: &crate::txn::TxnHandle,
-    scalar: tc_ir::Scalar,
-) -> TCResult<Value> {
+async fn scalar_to_value(txn: &crate::txn::TxnHandle, scalar: tc_ir::Scalar) -> TCResult<Value> {
     match scalar {
         tc_ir::Scalar::Value(value) => Ok(value),
+        tc_ir::Scalar::Op(_) => Err(TCError::bad_request(
+            "expected scalar value; found Op definition".to_string(),
+        )),
+        tc_ir::Scalar::Map(_) | tc_ir::Scalar::Tuple(_) => Err(TCError::bad_request(
+            "expected scalar value; found a scalar container".to_string(),
+        )),
         tc_ir::Scalar::Ref(r) => {
             let response = r.resolve(txn).await?;
             match response {
                 State::None => Ok(Value::None),
                 State::Scalar(tc_ir::Scalar::Value(value)) => Ok(value),
+                State::Scalar(tc_ir::Scalar::Map(_) | tc_ir::Scalar::Tuple(_)) => {
+                    Err(TCError::bad_request(
+                        "resolved ref returned scalar container; expected value".to_string(),
+                    ))
+                }
                 State::Scalar(tc_ir::Scalar::Ref(_)) => Err(TCError::bad_request(
                     "resolved ref returned scalar ref; expected value".to_string(),
                 )),
@@ -89,15 +101,12 @@ async fn scalar_to_value(
     }
 }
 
-async fn scalar_to_state(
-    txn: &crate::txn::TxnHandle,
-    scalar: tc_ir::Scalar,
-) -> TCResult<State> {
+async fn scalar_to_state(txn: &crate::txn::TxnHandle, scalar: tc_ir::Scalar) -> TCResult<State> {
     match scalar {
         tc_ir::Scalar::Value(value) => Ok(State::from(value)),
-        tc_ir::Scalar::Ref(r) => {
-            r.resolve(txn).await
-        }
+        tc_ir::Scalar::Op(_) => Ok(State::Scalar(scalar)),
+        tc_ir::Scalar::Map(_) | tc_ir::Scalar::Tuple(_) => Ok(State::Scalar(scalar)),
+        tc_ir::Scalar::Ref(r) => r.resolve(txn).await,
     }
 }
 
@@ -190,7 +199,10 @@ mod tests {
         let (uri, txn_call, key) = &calls[0];
         assert_eq!(uri.to_string(), "/lib/acme/foo/1.0.0");
         assert_eq!(txn_call.id(), txn.id());
-        assert_eq!(txn_call.authorization_header(), Some("Bearer tok".to_string()));
+        assert_eq!(
+            txn_call.authorization_header(),
+            Some("Bearer tok".to_string())
+        );
         assert_eq!(key, &Value::None);
     }
 }

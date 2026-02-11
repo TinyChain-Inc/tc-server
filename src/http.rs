@@ -4,33 +4,34 @@ use std::{
     net::SocketAddr,
     net::TcpListener,
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, future::BoxFuture, stream};
-pub use hyper::{Body, StatusCode, header};
 pub use hyper::Method as HttpMethod;
+pub use hyper::{Body, StatusCode, header};
 pub type Request = hyper::Request<hyper::Body>;
 pub type Response = hyper::Response<hyper::Body>;
 use hyper::{body::to_bytes, header::HeaderValue};
+use hyper::header::AUTHORIZATION;
+use pathlink::PathBuf as LinkPathBuf;
 use tc_ir::{LibrarySchema, Route, TxnId, parse_route_path};
 use tower::Service;
 use url::form_urlencoded;
 
+use crate::storage::{LibraryStore, load_library_root};
 use crate::{
     Kernel, KernelBuilder, KernelDispatch, KernelHandler, Method,
     library::{
         LibraryRegistry, NativeLibrary, NativeLibraryHandler, default_library_schema,
-        http::{
-            build_http_library_module_with_store,
-            http_library_handlers,
-        },
+        http::{build_http_library_module_with_store, http_library_handlers},
     },
     txn::TxnHandle,
 };
-use crate::storage::{LibraryStore, load_library_root};
 use tc_error::{ErrorKind, TCError, TCResult};
 use tc_value::Value;
 
@@ -42,6 +43,7 @@ pub struct HttpKernelConfig {
     pub data_dir: Option<PathBuf>,
     pub initial_schema: LibrarySchema,
     pub host_id: String,
+    pub limits: crate::KernelLimits,
 }
 
 impl Default for HttpKernelConfig {
@@ -50,6 +52,7 @@ impl Default for HttpKernelConfig {
             data_dir: None,
             initial_schema: default_library_schema(),
             host_id: "tc-http-host".to_string(),
+            limits: crate::KernelLimits::default(),
         }
     }
 }
@@ -67,6 +70,16 @@ impl HttpKernelConfig {
 
     pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
         self.host_id = host_id.into();
+        self
+    }
+
+    pub fn with_txn_ttl(mut self, ttl: Duration) -> Self {
+        self.limits.txn_ttl = ttl;
+        self
+    }
+
+    pub fn with_max_request_bytes_unauth(mut self, max_bytes: usize) -> Self {
+        self.limits.max_request_bytes_unauth = max_bytes;
         self
     }
 }
@@ -113,11 +126,7 @@ where
         None => None,
     };
 
-    let module = build_http_library_module_with_store(
-        config.initial_schema.clone(),
-        store,
-    )
-    .await?;
+    let module = build_http_library_module_with_store(config.initial_schema.clone(), store).await?;
     module.hydrate_from_storage().await?;
     let handlers = http_library_handlers(&module);
 
@@ -126,7 +135,8 @@ where
         .with_http_rpc_gateway()
         .with_library_module(module.clone(), handlers)
         .with_service_handler(service_handler)
-        .with_health_handler(health_handler);
+        .with_health_handler(health_handler)
+        .with_txn_ttl(config.limits.txn_ttl);
 
     let kernel = configure(&module, builder).finish();
 
@@ -204,21 +214,35 @@ where
 
 pub struct HttpServer {
     kernel: Kernel,
+    limits: crate::KernelLimits,
 }
 
 impl HttpServer {
     pub fn new(kernel: Kernel) -> Self {
-        Self { kernel }
+        Self {
+            kernel,
+            limits: crate::KernelLimits::default(),
+        }
+    }
+
+    pub fn new_with_limits(kernel: Kernel, max_request_bytes_unauth: usize) -> Self {
+        Self {
+            kernel,
+            limits: crate::KernelLimits {
+                max_request_bytes_unauth,
+                ..crate::KernelLimits::default()
+            },
+        }
     }
 
     pub async fn serve(self, addr: SocketAddr) -> hyper::Result<()> {
-        let service = KernelService::new(self.kernel);
+        let service = KernelService::new(self.kernel, self.limits);
         let make_service = tower::make::Shared::new(service);
         hyper::Server::bind(&addr).serve(make_service).await
     }
 
     pub async fn serve_listener(self, listener: TcpListener) -> hyper::Result<()> {
-        let service = KernelService::new(self.kernel);
+        let service = KernelService::new(self.kernel, self.limits);
         let make_service = tower::make::Shared::new(service);
         hyper::Server::from_tcp(listener)?.serve(make_service).await
     }
@@ -227,7 +251,7 @@ impl HttpServer {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let service = KernelService::new(self.kernel);
+        let service = KernelService::new(self.kernel, self.limits);
         let make_service = tower::make::Shared::new(service);
         hyper::Server::bind(&addr)
             .serve(make_service)
@@ -243,7 +267,7 @@ impl HttpServer {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let service = KernelService::new(self.kernel);
+        let service = KernelService::new(self.kernel, self.limits);
         let make_service = tower::make::Shared::new(service);
         hyper::Server::from_tcp(listener)?
             .serve(make_service)
@@ -255,11 +279,12 @@ impl HttpServer {
 #[derive(Clone)]
 pub(crate) struct KernelService {
     kernel: Kernel,
+    limits: crate::KernelLimits,
 }
 
 impl KernelService {
-    fn new(kernel: Kernel) -> Self {
-        Self { kernel }
+    fn new(kernel: Kernel, limits: crate::KernelLimits) -> Self {
+        Self { kernel, limits }
     }
 }
 
@@ -277,6 +302,7 @@ impl Service<Request> for KernelService {
         let method = req.method().clone();
         let path = uri.path().to_owned();
         let kernel = self.kernel.clone();
+        let max_request_bytes_unauth = self.limits.max_request_bytes_unauth;
 
         Box::pin(async move {
             let method = match to_kernel_method(&method) {
@@ -284,7 +310,7 @@ impl Service<Request> for KernelService {
                 None => return Ok(method_not_allowed()),
             };
 
-            let (req, body_is_none) = match parse_body(req).await {
+            let (req, body_is_none) = match parse_body(req, max_request_bytes_unauth).await {
                 Ok(pair) => pair,
                 Err(resp) => return Ok(resp),
             };
@@ -344,9 +370,7 @@ impl Service<Request> for KernelService {
                         if let Some(value) =
                             minted_token.and_then(|token| HeaderValue::from_str(&token).ok())
                         {
-                            response
-                                .headers_mut()
-                                .insert("x-tc-bearer-token", value);
+                            response.headers_mut().insert("x-tc-bearer-token", value);
                         }
                     }
 
@@ -446,18 +470,37 @@ fn parse_bearer_token(req: &Request) -> Option<String> {
     Some(token.to_string())
 }
 
-pub fn host_handler_with_public_keys(
-    keys: crate::auth::PublicKeyStore,
-) -> impl KernelHandler {
+pub fn host_handler_with_public_keys(keys: crate::auth::PublicKeyStore) -> impl KernelHandler {
+    let reflect = crate::reflect::reflect_handler();
+    let state = crate::state::state_handler();
     move |req: Request| {
         let keys = keys.clone();
+        let reflect = reflect.clone();
+        let state = state.clone();
         async move {
+            if req.uri().path().starts_with("/state/") {
+                return state.call(req).await;
+            }
             match req.uri().path() {
-                "/host/metrics" => http::Response::builder()
+                _ if req.method() == hyper::Method::POST
+                    && {
+                        let Ok(parsed) = LinkPathBuf::from_str(req.uri().path()) else {
+                            return not_found();
+                        };
+                        parsed == LinkPathBuf::from(tc_ir::SCALAR_REFLECT_CLASS)
+                            || parsed == LinkPathBuf::from(tc_ir::SCALAR_REFLECT_IF_PARTS)
+                            || parsed == LinkPathBuf::from(tc_ir::OPDEF_REFLECT_FORM)
+                            || parsed == LinkPathBuf::from(tc_ir::OPDEF_REFLECT_LAST_ID)
+                            || parsed == LinkPathBuf::from(tc_ir::OPDEF_REFLECT_SCALARS)
+                    } =>
+                {
+                    reflect.call(req).await
+                }
+                crate::uri::HOST_METRICS => http::Response::builder()
                     .status(StatusCode::OK)
                     .body(Body::empty())
                     .expect("metrics response"),
-                "/host/public_key" => {
+                crate::uri::HOST_PUBLIC_KEY => {
                     use base64::Engine as _;
 
                     let query = req.uri().query().unwrap_or("");
@@ -480,11 +523,7 @@ pub fn host_handler_with_public_keys(
                             )]);
                             match destream_json::try_decode((), stream).await {
                                 Ok(Value::String(value)) => value,
-                                _ => {
-                                    return bad_request_response(
-                                        "invalid key query parameter",
-                                    )
-                                }
+                                _ => return bad_request_response("invalid key query parameter"),
                             }
                         }
                     };
@@ -538,6 +577,13 @@ fn internal_error_response(msg: &str) -> Response {
         .expect("internal error response")
 }
 
+fn payload_too_large_response(msg: &str) -> Response {
+    http::Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .body(Body::from(msg.to_string()))
+        .expect("payload too large response")
+}
+
 fn no_content() -> Response {
     http::Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -545,11 +591,38 @@ fn no_content() -> Response {
         .expect("no content response")
 }
 
-async fn parse_body(req: Request) -> Result<(Request, bool), Response> {
+async fn parse_body(
+    req: Request,
+    max_request_bytes_unauth: usize,
+) -> Result<(Request, bool), Response> {
+
     let (parts, body) = req.into_parts();
+    let has_bearer = parts.headers.get(AUTHORIZATION).is_some();
+    let max_bytes = if has_bearer {
+        None
+    } else {
+        Some(max_request_bytes_unauth)
+    };
+
+    if let (Some(limit), Some(len)) = (max_bytes, parts.headers.get(header::CONTENT_LENGTH)) {
+        let len = len
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| payload_too_large_response("invalid content-length header"))?;
+        if len > limit {
+            return Err(payload_too_large_response("request payload too large"));
+        }
+    }
+
     let body_bytes = to_bytes(body)
         .await
         .map_err(|_| internal_error_response("failed to read request body"))?;
+    if let Some(limit) = max_bytes {
+        if body_bytes.len() > limit {
+            return Err(payload_too_large_response("request payload too large"));
+        }
+    }
     let body_is_none = body_bytes.iter().all(|b| b.is_ascii_whitespace());
     let mut req = Request::from_parts(parts, Body::from(body_bytes.clone()));
     if !body_is_none {
@@ -558,9 +631,7 @@ async fn parse_body(req: Request) -> Result<(Request, bool), Response> {
     Ok((req, body_is_none))
 }
 
-fn native_schema_get_handler(
-    schema: LibrarySchema,
-) -> impl KernelHandler {
+fn native_schema_get_handler(schema: LibrarySchema) -> impl KernelHandler {
     move |_req: Request| {
         let schema = schema.clone();
         async move { schema_response(schema) }.boxed()
@@ -581,9 +652,7 @@ fn native_install_not_supported_handler() -> impl KernelHandler {
     }
 }
 
-fn http_native_routes_handler<H>(
-    library: Arc<NativeLibrary<H>>,
-) -> impl KernelHandler + 'static
+fn http_native_routes_handler<H>(library: Arc<NativeLibrary<H>>) -> impl KernelHandler + 'static
 where
     H: NativeLibraryHandler,
 {
@@ -591,11 +660,11 @@ where
         let library = library.clone();
         async move {
             let path = req.uri().path().to_string();
-            if !path.starts_with("/lib/") {
+            if !path.starts_with(crate::uri::LIB_ROOT_PREFIX) {
                 return not_found();
             }
 
-            let relative = &path["/lib".len()..];
+            let relative = &path[crate::uri::LIB_ROOT.len()..];
             let normalized = if relative.starts_with('/') {
                 relative
             } else {
@@ -727,15 +796,15 @@ pub(crate) struct RequestBody {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl RequestBody {
-    fn new(bytes: Bytes) -> Self {
+    pub(crate) fn new(bytes: Bytes) -> Self {
         Self { bytes }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.bytes.is_empty() || self.bytes.iter().all(|b| b.is_ascii_whitespace())
     }
 
-    fn clone_bytes(&self) -> Bytes {
+    pub(crate) fn clone_bytes(&self) -> Bytes {
         self.bytes.clone()
     }
 }
@@ -818,14 +887,14 @@ fn schema_response(schema: LibrarySchema) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::TokenVerifier;
+    use crate::resolve::Resolve;
     use crate::{NativeLibrary, State};
     use hyper::Body;
     use pathlink::Link;
     use std::str::FromStr;
-    use tc_ir::{HandleDelete, HandleGet, HandlePost, HandlePut, LibraryModule, tc_library_routes};
-    use crate::resolve::Resolve;
-    use crate::auth::TokenVerifier;
     use tc_ir::TxnId;
+    use tc_ir::{HandleDelete, HandleGet, HandlePost, HandlePut, LibraryModule, tc_library_routes};
 
     fn ok_handler() -> impl crate::KernelHandler {
         move |_req: Request| {
@@ -870,8 +939,10 @@ mod tests {
         fn verify(
             &self,
             bearer_token: String,
-        ) -> futures::future::BoxFuture<'static, Result<crate::auth::TokenContext, crate::txn::TxnError>>
-        {
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::auth::TokenContext, crate::txn::TxnError>,
+        > {
             use std::str::FromStr;
 
             let mut parts = bearer_token.splitn(2, '|');
@@ -885,7 +956,8 @@ mod tests {
                     Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim link"),
                     umask::USER_EXEC | umask::USER_WRITE,
                 );
-                ctx.claims.push(("/host".to_string(), actor_id, claim));
+                ctx.claims
+                    .push((crate::uri::HOST_ROOT.to_string(), actor_id, claim));
             }
 
             futures::future::ready(Ok(ctx)).boxed()
@@ -896,7 +968,7 @@ mod tests {
     async fn txn_begin_and_commit() {
         let kernel = kernel_with_lib_handler();
         let txn_manager = kernel.txn_manager().clone();
-        let mut service = KernelService::new(kernel);
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
         let request = http::Request::builder()
             .method("GET")
@@ -951,7 +1023,7 @@ mod tests {
             .with_health_handler(ok_handler())
             .finish();
 
-        let mut service = KernelService::new(kernel);
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
         let begin = http::Request::builder()
             .method("GET")
@@ -996,7 +1068,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_request_with_mismatched_owner_token() {
         let kernel = kernel_with_lib_handler();
-        let mut service = KernelService::new(kernel);
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
         let begin = http::Request::builder()
             .method("GET")
@@ -1028,7 +1100,7 @@ mod tests {
     async fn finalize_is_root_only() {
         let kernel = kernel_with_ok_routing();
         let txn_manager = kernel.txn_manager().clone();
-        let mut service = KernelService::new(kernel);
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
         let begin = http::Request::builder()
             .method("GET")
@@ -1083,7 +1155,7 @@ mod tests {
     async fn finalize_root_parsing_for_component_paths() {
         let kernel = kernel_with_ok_routing();
         let txn_manager = kernel.txn_manager().clone();
-        let mut service = KernelService::new(kernel);
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
         let begin = http::Request::builder()
             .method("GET")
@@ -1183,10 +1255,9 @@ mod tests {
         let bytes = crate::test_utils::wasm_echo_request_module();
         let initial =
             tc_ir::LibrarySchema::new(Link::from_str("/lib/initial").unwrap(), "0.0.1", vec![]);
-        let module =
-            crate::library::http::build_http_library_module(initial, None)
-                .await
-                .expect("module");
+        let module = crate::library::http::build_http_library_module(initial, None)
+            .await
+            .expect("module");
         let handlers = crate::library::http::http_library_handlers(&module);
 
         let remote_kernel: Kernel = Kernel::builder()
@@ -1238,7 +1309,10 @@ mod tests {
         let server_kernel = remote_kernel.clone();
         let server = hyper::Server::from_tcp(listener)
             .expect("hyper server")
-            .serve(tower::make::Shared::new(KernelService::new(server_kernel)));
+            .serve(tower::make::Shared::new(KernelService::new(
+                server_kernel,
+                crate::KernelLimits::default(),
+            )));
 
         let server_task = tokio::spawn(async move { server.await.expect("server") });
 
@@ -1248,10 +1322,9 @@ mod tests {
             vec![Link::from_str("/lib/example-devco/example/0.1.0").expect("dependency root")],
         );
 
-        let module =
-            crate::library::http::build_http_library_module(schema, None)
-                .await
-                .expect("module");
+        let module = crate::library::http::build_http_library_module(schema, None)
+            .await
+            .expect("module");
         let handlers = crate::library::http::http_library_handlers(&module);
 
         let local_kernel: Kernel = crate::Kernel::builder()
@@ -1262,8 +1335,7 @@ mod tests {
 
         let txn = local_kernel.with_resolver(remote_kernel.txn_manager().begin());
 
-        let link =
-            Link::from_str("/lib/example-devco/example/0.1.0/hello").expect("op link");
+        let link = Link::from_str("/lib/example-devco/example/0.1.0/hello").expect("op link");
         let op = OpRef::Get((
             tc_ir::Subject::Link(link),
             tc_ir::Scalar::Value(tc_value::Value::from("World")),

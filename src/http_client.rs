@@ -1,10 +1,10 @@
 use bytes::Bytes;
-use pathlink::Link;
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
+use pathlink::Link;
+use std::sync::Arc;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Map, TxnId};
 use tc_state::State;
-use std::sync::Arc;
 use tc_value::Value;
 use url::form_urlencoded;
 
@@ -178,9 +178,9 @@ impl RpcGateway for HttpRpcGateway {
 
         let request =
             match build_request(Method::Delete, uri, txn.authorization_header(), Vec::new()) {
-            Ok(req) => req,
-            Err(err) => return futures::future::ready(Err(err)).boxed(),
-        };
+                Ok(req) => req,
+                Err(err) => return futures::future::ready(Err(err)).boxed(),
+            };
 
         let client = self.client.clone();
         async move {
@@ -212,9 +212,7 @@ fn validate_finalize_target(uri: &str) -> TCResult<String> {
 
     let path = normalize_path(parsed.path());
     let root = component_root(path).ok_or_else(|| {
-        TCError::bad_request(
-            "commit/rollback target is not a TinyChain component".to_string(),
-        )
+        TCError::bad_request("commit/rollback target is not a TinyChain component".to_string())
     })?;
 
     if root != path {
@@ -258,12 +256,12 @@ fn build_request(
 fn encode_state_body(state: State) -> TCResult<Vec<u8>> {
     use futures::TryStreamExt;
 
-    if matches!(state, State::None | State::Scalar(tc_ir::Scalar::Value(Value::None))) {
+    if state.is_none() {
         return Ok(Vec::new());
     }
 
-    let stream = destream_json::encode(state)
-        .map_err(|err| TCError::bad_request(err.to_string()))?;
+    let stream =
+        destream_json::encode(state).map_err(|err| TCError::bad_request(err.to_string()))?;
     futures::executor::block_on(async move {
         stream
             .map_err(|err| std::io::Error::other(err.to_string()))
@@ -279,8 +277,8 @@ fn encode_state_body(state: State) -> TCResult<Vec<u8>> {
 fn encode_params_body(params: Map<State>) -> TCResult<Vec<u8>> {
     use futures::TryStreamExt;
 
-    let stream = destream_json::encode(params)
-        .map_err(|err| TCError::bad_request(err.to_string()))?;
+    let stream =
+        destream_json::encode(params).map_err(|err| TCError::bad_request(err.to_string()))?;
     futures::executor::block_on(async move {
         stream
             .map_err(|err| std::io::Error::other(err.to_string()))
@@ -417,8 +415,7 @@ mod tests {
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0_u8; 32]);
 
         let uri = "http://localhost:8702/lib?foo=bar";
-        let updated =
-            append_txn_id_and_key(uri, txn_id, &Value::None).expect("append txn_id");
+        let updated = append_txn_id_and_key(uri, txn_id, &Value::None).expect("append txn_id");
         assert!(updated.contains("foo=bar"));
         assert!(updated.contains("txn_id="));
     }

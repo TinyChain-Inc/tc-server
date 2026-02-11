@@ -10,7 +10,7 @@ use pathlink::{Link, PathSegment};
 use serde::{Deserialize, Serialize};
 use tc_error::{TCError, TCResult};
 use tc_ir::{
-    Dir, HandleDelete, HandleGet, HandlePost, HandlePut, Library, LibraryModule, LibrarySchema,
+    Dir, HandleDelete, HandleGet, HandlePost, HandlePut, Id, Library, LibraryModule, LibrarySchema,
     Map, Route,
 };
 use tc_value::Value;
@@ -64,10 +64,7 @@ pub struct LibraryRegistry {
 }
 
 impl LibraryRegistry {
-    pub fn new(
-        store: Option<LibraryStore>,
-        factories: BTreeMap<String, LibraryFactory>,
-    ) -> Self {
+    pub fn new(store: Option<LibraryStore>, factories: BTreeMap<String, LibraryFactory>) -> Self {
         Self {
             entries: Arc::new(RwLock::new(BTreeMap::new())),
             store,
@@ -81,11 +78,7 @@ impl LibraryRegistry {
             Some(store) => Some(store.for_schema(&schema).await?),
             None => None,
         };
-        let runtime = Arc::new(LibraryRuntime::new(
-            schema,
-            store,
-            self.factories.clone(),
-        ));
+        let runtime = Arc::new(LibraryRuntime::new(schema, store, self.factories.clone()));
         self.entries
             .write()
             .expect("library registry write lock")
@@ -111,10 +104,7 @@ impl LibraryRegistry {
                 continue;
             }
 
-            let rest = id
-                .strip_prefix(&path)
-                .unwrap_or(id)
-                .trim_start_matches('/');
+            let rest = id.strip_prefix(&path).unwrap_or(id).trim_start_matches('/');
 
             if rest.is_empty() {
                 continue;
@@ -123,23 +113,19 @@ impl LibraryRegistry {
             let mut segments = rest.split('/');
             let child = segments.next().expect("non-empty rest segment");
             let is_dir = segments.next().is_some();
-            let entry = out.entry(child.to_string()).or_insert(is_dir);
+            let Ok(child_id) = child.parse::<Id>() else {
+                continue;
+            };
+            let entry = out.entry(child_id).or_insert(is_dir);
             if is_dir {
                 *entry = true;
             }
         }
 
-        if has_match {
-            Some(out)
-        } else {
-            None
-        }
+        if has_match { Some(out) } else { None }
     }
 
-    pub fn resolve_runtime_for_path(
-        &self,
-        path: &str,
-    ) -> Option<(Arc<LibraryRuntime>, bool)> {
+    pub fn resolve_runtime_for_path(&self, path: &str) -> Option<(Arc<LibraryRuntime>, bool)> {
         let path = normalize_path(path);
         let entries = self.entries.read().expect("library registry read lock");
         let mut best: Option<(&String, Arc<LibraryRuntime>)> = None;
@@ -165,11 +151,7 @@ impl LibraryRegistry {
     pub fn schema_for_txn(&self, txn: &TxnHandle) -> TCResult<LibrarySchema> {
         let mut best: Option<(usize, LibrarySchema)> = None;
 
-        for claim in txn
-            .claims()
-            .iter()
-            .chain(std::iter::once(txn.claim()))
-        {
+        for claim in txn.claims().iter().chain(std::iter::once(txn.claim())) {
             let path = canonical_link(&claim.link);
             if let Some((runtime, _)) = self.resolve_runtime_for_path(&path) {
                 let schema = runtime.state.schema();
@@ -246,8 +228,8 @@ impl LibraryRegistry {
             .get(&artifact.content_type)
             .ok_or_else(|| InstallError::bad_request("unsupported artifact content type"))?;
 
-        let (manifest_schema, schema_routes, handler) =
-            factory(artifact.bytes.clone()).map_err(|err| InstallError::internal(err.to_string()))?;
+        let (manifest_schema, schema_routes, handler) = factory(artifact.bytes.clone())
+            .map_err(|err| InstallError::internal(err.to_string()))?;
 
         if !schemas_equivalent(&manifest_schema, &payload.schema) {
             return Err(InstallError::bad_request(
@@ -276,7 +258,6 @@ impl LibraryRegistry {
 
         Ok(())
     }
-
 
     pub async fn export_payload_for_claims(
         &self,
@@ -492,7 +473,6 @@ impl InstallError {
     }
 }
 
-
 pub fn decode_install_request_bytes(bytes: &[u8]) -> Result<InstallRequest, InstallError> {
     if bytes.iter().all(|b| b.is_ascii_whitespace()) {
         return Err(InstallError::bad_request("empty install payload"));
@@ -526,7 +506,6 @@ pub fn encode_install_payload_bytes(payload: &InstallArtifacts) -> Result<Vec<u8
 
     serde_json::to_vec(&raw).map_err(|err| err.to_string())
 }
-
 
 fn schemas_equivalent(left: &LibrarySchema, right: &LibrarySchema) -> bool {
     left.version() == right.version()
@@ -584,7 +563,9 @@ impl TryFrom<RawSchema> for LibrarySchema {
         let dependencies = raw
             .dependencies
             .into_iter()
-            .map(|dep| Link::from_str(&dep).map_err(|err| format!("invalid dependency link: {err}")))
+            .map(|dep| {
+                Link::from_str(&dep).map_err(|err| format!("invalid dependency link: {err}"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(LibrarySchema::new(id, raw.version, dependencies))
     }
@@ -641,9 +622,9 @@ fn decode_install_payload(bytes: &[u8]) -> Result<InstallArtifacts, InstallError
         .artifacts
         .into_iter()
         .map(|artifact| {
-            let bytes = BASE64
-                .decode(artifact.bytes.as_bytes())
-                .map_err(|err| InstallError::bad_request(format!("invalid base64 artifact: {err}")))?;
+            let bytes = BASE64.decode(artifact.bytes.as_bytes()).map_err(|err| {
+                InstallError::bad_request(format!("invalid base64 artifact: {err}"))
+            })?;
             Ok(Artifact {
                 path: artifact.path,
                 content_type: artifact.content_type,
@@ -914,14 +895,16 @@ impl LibraryRuntime {
         self.routes.replace_arc(handler);
 
         if let Some(store) = &self.store {
-            store.persist_artifact(
-                &manifest_schema,
-                &Artifact {
-                    content_type: content_type.to_string(),
-                    bytes,
-                    path: manifest_schema.id().to_string(),
-                },
-            ).await?;
+            store
+                .persist_artifact(
+                    &manifest_schema,
+                    &Artifact {
+                        content_type: content_type.to_string(),
+                        bytes,
+                        path: manifest_schema.id().to_string(),
+                    },
+                )
+                .await?;
         }
 
         Ok(manifest_schema)
@@ -943,8 +926,8 @@ impl Clone for LibraryRuntime {
 pub mod http {
     use std::{collections::BTreeMap, io, path::PathBuf, sync::Arc};
 
-    use futures::{FutureExt, TryStreamExt};
     use crate::http::{Body, Request, Response, StatusCode, header};
+    use futures::{FutureExt, TryStreamExt};
     use hyper::body;
     use number_general::Number;
     use tc_error::TCResult;
@@ -954,13 +937,15 @@ pub mod http {
 
     use crate::{
         KernelHandler,
+        ir::{
+            IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE, http_ir_route_handler_from_bytes,
+        },
         library::{
             InstallError, InstallRequest, LibraryFactory, LibraryHandlers, LibraryRegistry,
             decode_install_request_bytes,
         },
         storage::LibraryStore,
         wasm::http_wasm_route_handler_from_bytes,
-        ir::{IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE, http_ir_route_handler_from_bytes},
     };
 
     pub async fn build_http_library_module(
@@ -981,15 +966,13 @@ pub mod http {
         initial_schema: LibrarySchema,
         store: Option<LibraryStore>,
     ) -> TCResult<Arc<LibraryRegistry>> {
-        let wasm_factory: LibraryFactory =
-            Arc::new(|bytes: Vec<u8>| {
+        let wasm_factory: LibraryFactory = Arc::new(|bytes: Vec<u8>| {
             let (handler, schema, schema_routes) = http_wasm_route_handler_from_bytes(bytes)?;
             let handler: Arc<dyn KernelHandler> = Arc::new(handler);
             Ok((schema, schema_routes, handler))
         });
 
-        let ir_factory: LibraryFactory =
-            Arc::new(|bytes: Vec<u8>| {
+        let ir_factory: LibraryFactory = Arc::new(|bytes: Vec<u8>| {
             let (handler, schema, schema_routes) = http_ir_route_handler_from_bytes(bytes)?;
             let handler: Arc<dyn KernelHandler> = Arc::new(handler);
             Ok((schema, schema_routes, handler))
@@ -1006,28 +989,21 @@ pub mod http {
         Ok(Arc::new(registry))
     }
 
-
-    pub fn http_library_handlers(
-        module: &Arc<LibraryRegistry>,
-    ) -> LibraryHandlers {
+    pub fn http_library_handlers(module: &Arc<LibraryRegistry>) -> LibraryHandlers {
         let get = schema_get_handler(Arc::clone(module));
         let put = schema_put_handler(Arc::clone(module));
         let route = routes_handler(Arc::clone(module));
         LibraryHandlers::with_route(get, put, route)
     }
 
-    pub fn schema_get_handler(
-        registry: Arc<LibraryRegistry>,
-    ) -> impl KernelHandler {
+    pub fn schema_get_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
         move |_req: Request| {
             let registry = Arc::clone(&registry);
             async move { respond_with_listing(registry.list_dir(crate::uri::LIB_ROOT)) }.boxed()
         }
     }
 
-    pub fn schema_put_handler(
-        registry: Arc<LibraryRegistry>,
-    ) -> impl KernelHandler {
+    pub fn schema_put_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
         move |req: Request| {
             let registry = Arc::clone(&registry);
             let txn = req.extensions().get::<crate::txn::TxnHandle>().cloned();
@@ -1109,19 +1085,22 @@ pub mod http {
             .enumerate()
             .map(|(idx, dep)| {
                 (
-                    idx.to_string(),
+                    idx.to_string().parse().expect("Id"),
                     State::from(Value::from(dep.to_string())),
                 )
             })
             .collect::<Map<State>>();
 
         let mut map = Map::new();
-        map.insert("id".to_string(), State::from(Value::from(schema.id().to_string())));
         map.insert(
-            "version".to_string(),
+            "id".parse().expect("Id"),
+            State::from(Value::from(schema.id().to_string())),
+        );
+        map.insert(
+            "version".parse().expect("Id"),
             State::from(Value::from(schema.version().to_string())),
         );
-        map.insert("dependencies".to_string(), State::Map(dependencies));
+        map.insert("dependencies".parse().expect("Id"), State::Map(dependencies));
         State::Map(map)
     }
 
@@ -1144,7 +1123,6 @@ pub mod http {
             .map_err(|err| InstallError::internal(err.to_string()))?;
         decode_install_request_bytes(&body_bytes)
     }
-
 
     fn bad_request(message: String) -> Response {
         http::Response::builder()
@@ -1181,9 +1159,7 @@ pub mod http {
         }
     }
 
-    pub fn routes_handler(
-        registry: Arc<LibraryRegistry>,
-    ) -> impl KernelHandler {
+    pub fn routes_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
         move |req: Request| {
             let path = req.uri().path().to_string();
             let registry = Arc::clone(&registry);
@@ -1211,20 +1187,22 @@ pub mod http {
     #[cfg(all(test, feature = "http-server"))]
     mod tests {
         use super::*;
-        use crate::{Method, kernel::Kernel};
         use crate::http::{Body, header};
         use crate::library::{InstallArtifacts, encode_install_payload_bytes};
         use crate::storage::Artifact;
+        use crate::{Method, kernel::Kernel};
+        use futures::stream;
         use hyper::body::to_bytes;
         use pathlink::Link;
         use std::str::FromStr;
+        use tc_ir::LibrarySchema;
         use tc_ir::Scalar;
         use tc_state::{State, null_transaction};
-        use tc_ir::LibrarySchema;
-        use futures::stream;
 
         async fn decode_state(bytes: Vec<u8>) -> State {
-            let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(bytes.clone().into())]);
+            let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(
+                bytes.clone().into(),
+            )]);
             match destream_json::try_decode(null_transaction(), stream).await {
                 Ok(state) => state,
                 Err(_) => {
@@ -1265,7 +1243,10 @@ pub mod http {
                     assert_eq!(decoded.schema.id(), schema.id());
                     assert_eq!(decoded.schema.version(), schema.version());
                     assert_eq!(decoded.artifacts.len(), 1);
-                    assert_eq!(decoded.artifacts[0].content_type, WASM_ARTIFACT_CONTENT_TYPE);
+                    assert_eq!(
+                        decoded.artifacts[0].content_type,
+                        WASM_ARTIFACT_CONTENT_TYPE
+                    );
                 }
                 _ => panic!("expected artifacts payload"),
             }
@@ -1315,7 +1296,11 @@ pub mod http {
                 .expect("schema request");
 
             let schema_response = kernel
-                .dispatch(Method::Get, "/lib/example-devco/service/0.1.0", schema_request)
+                .dispatch(
+                    Method::Get,
+                    "/lib/example-devco/service/0.1.0",
+                    schema_request,
+                )
                 .expect("schema handler")
                 .await;
 
@@ -1446,10 +1431,8 @@ mod registry_tests {
             vec![],
         );
 
-        futures::executor::block_on(registry.insert_schema(parent.clone()))
-            .expect("insert parent");
-        futures::executor::block_on(registry.insert_schema(child.clone()))
-            .expect("insert child");
+        futures::executor::block_on(registry.insert_schema(parent.clone())).expect("insert parent");
+        futures::executor::block_on(registry.insert_schema(child.clone())).expect("insert child");
 
         let txn = crate::txn::TxnManager::with_host_id("test-claim")
             .begin()
@@ -1458,9 +1441,7 @@ mod registry_tests {
                 Claim::new(child.id().clone(), umask::USER_READ),
             ]);
 
-        let resolved = registry
-            .schema_for_txn(&txn)
-            .expect("schema");
+        let resolved = registry.schema_for_txn(&txn).expect("schema");
 
         assert_eq!(resolved.id(), child.id());
     }

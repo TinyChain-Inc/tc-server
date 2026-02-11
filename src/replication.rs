@@ -3,20 +3,20 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aes_gcm_siv::aead::{Aead, OsRng};
 use aes_gcm_siv::aead::rand_core::RngCore;
+use aes_gcm_siv::aead::{Aead, OsRng};
 use aes_gcm_siv::{Aes256GcmSiv, Key, KeyInit, Nonce};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::FutureExt;
-use hyper::{Body, Request, Response, StatusCode};
 use hyper::body::to_bytes;
-use serde::{Deserialize, Serialize};
-use tc_error::{TCError, TCResult};
-use tc_ir::Claim;
-use tc_state::{State, null_transaction};
+use hyper::{Body, Request, Response, StatusCode};
 use number_general::Number;
 use pathlink::Link;
+use serde::{Deserialize, Serialize};
+use tc_error::{TCError, TCResult};
+use tc_ir::{Claim, Id};
+use tc_state::{State, null_transaction};
 use tc_value::Value;
 use umask::Mode;
 use url::Url;
@@ -29,7 +29,7 @@ use crate::library::{
 };
 use crate::txn::TxnHandle;
 
-pub const LIBRARY_EXPORT_PATH: &str = "/host/library/export";
+pub const LIBRARY_EXPORT_PATH: &str = crate::uri::HOST_LIBRARY_EXPORT;
 const TOKEN_PATH: &str = "/";
 const REPLICATION_TTL: Duration = Duration::from_secs(30);
 
@@ -56,9 +56,7 @@ pub fn parse_psk_keys(values: &[String]) -> TCResult<Vec<Key<Aes256GcmSiv>>> {
                 TCError::bad_request("invalid PSK: expected hex-encoded 32-byte key")
             })?;
             if raw.len() != 32 {
-                return Err(TCError::bad_request(
-                    "invalid PSK: expected 32-byte key",
-                ));
+                return Err(TCError::bad_request("invalid PSK: expected 32-byte key"));
             }
             Ok(Key::<Aes256GcmSiv>::from_slice(&raw).to_owned())
         })
@@ -109,7 +107,10 @@ impl ReplicationIssuer {
 
         let actor = Actor::new(Value::String(path.to_string()));
         self.public_keys.insert_actor(&actor);
-        let _ = self.keyring.clone().with_actor(self.host.clone(), actor.clone());
+        let _ = self
+            .keyring
+            .clone()
+            .with_actor(self.host.clone(), actor.clone());
         actors.insert(path.to_string(), actor.clone());
         actor
     }
@@ -363,10 +364,7 @@ pub async fn fetch_library_schema(peer: &str, path: &str) -> TCResult<tc_ir::Lib
     decode_schema_body(body_bytes).await
 }
 
-pub async fn fetch_library_listing(
-    peer: &str,
-    path: &str,
-) -> TCResult<tc_ir::Map<bool>> {
+pub async fn fetch_library_listing(peer: &str, path: &str) -> TCResult<tc_ir::Map<bool>> {
     let mut url = peer_to_url(peer)?;
     url.set_path(path);
 
@@ -553,15 +551,19 @@ fn schema_from_state(state: State) -> TCResult<tc_ir::LibrarySchema> {
         return Err(TCError::bad_request("expected schema state map"));
     };
 
-    let id = match map.get("id") {
+    let id_key: Id = "id".parse().expect("Id");
+    let version_key: Id = "version".parse().expect("Id");
+    let deps_key: Id = "dependencies".parse().expect("Id");
+
+    let id = match map.get(&id_key) {
         Some(State::Scalar(tc_ir::Scalar::Value(Value::String(value)))) => value.clone(),
         _ => return Err(TCError::bad_request("missing schema id")),
     };
-    let version = match map.get("version") {
+    let version = match map.get(&version_key) {
         Some(State::Scalar(tc_ir::Scalar::Value(Value::String(value)))) => value.clone(),
         _ => return Err(TCError::bad_request("missing schema version")),
     };
-    let dependencies = match map.get("dependencies") {
+    let dependencies = match map.get(&deps_key) {
         Some(State::Map(deps)) => deps,
         _ => return Err(TCError::bad_request("missing schema dependencies")),
     };
@@ -569,7 +571,7 @@ fn schema_from_state(state: State) -> TCResult<tc_ir::LibrarySchema> {
     let mut items = dependencies
         .iter()
         .filter_map(|(key, value)| {
-            let idx = key.parse::<usize>().ok()?;
+            let idx = key.as_str().parse::<usize>().ok()?;
             let State::Scalar(tc_ir::Scalar::Value(Value::String(link))) = value else {
                 return None;
             };
@@ -583,8 +585,7 @@ fn schema_from_state(state: State) -> TCResult<tc_ir::LibrarySchema> {
         .map(|(_, link)| Link::from_str(&link).map_err(|err| TCError::bad_request(err.to_string())))
         .collect::<TCResult<Vec<_>>>()?;
 
-    let schema_id =
-        Link::from_str(&id).map_err(|err| TCError::bad_request(err.to_string()))?;
+    let schema_id = Link::from_str(&id).map_err(|err| TCError::bad_request(err.to_string()))?;
     Ok(tc_ir::LibrarySchema::new(schema_id, version, deps))
 }
 
@@ -610,10 +611,7 @@ fn listing_from_state(state: State) -> TCResult<tc_ir::Map<bool>> {
     Ok(listing)
 }
 
-fn encrypt_path_with_key(
-    path: &str,
-    key: &Key<Aes256GcmSiv>,
-) -> TCResult<(Vec<u8>, Vec<u8>)> {
+fn encrypt_path_with_key(path: &str, key: &Key<Aes256GcmSiv>) -> TCResult<(Vec<u8>, Vec<u8>)> {
     let cipher = Aes256GcmSiv::new(key);
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
@@ -637,10 +635,8 @@ fn decrypt_path(cipher: &Aes256GcmSiv, nonce: &[u8], path_encrypted: &[u8]) -> T
     let nonce = Nonce::from_slice(&nonce);
 
     match cipher.decrypt(nonce, path_encrypted) {
-        Ok(path_decrypted) => {
-            String::from_utf8(path_decrypted)
-                .map_err(|cause| TCError::bad_request(format!("invalid UTF8: {cause}")))
-        }
+        Ok(path_decrypted) => String::from_utf8(path_decrypted)
+            .map_err(|cause| TCError::bad_request(format!("invalid UTF8: {cause}"))),
         Err(_cause) => Err(TCError::bad_request("unable to decrypt path")),
     }
 }
@@ -681,10 +677,10 @@ fn encrypt_token(cipher: &Aes256GcmSiv, nonce: &[u8], token: String) -> TCResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pathlink::Link;
-    use tc_ir::LibrarySchema;
     use crate::library::http::build_http_library_module;
     use crate::storage::{LibraryStore, load_library_root};
+    use pathlink::Link;
+    use tc_ir::LibrarySchema;
 
     #[tokio::test]
     async fn issues_replication_token() {
@@ -730,13 +726,17 @@ mod tests {
         ])
         .expect("keys");
 
-        let issuer = Arc::new(ReplicationIssuer::new(host, keys.clone(), keyring, public_keys));
+        let issuer = Arc::new(ReplicationIssuer::new(
+            host,
+            keys.clone(),
+            keyring,
+            public_keys,
+        ));
         let token_handler = replication_token_handler(issuer.clone());
 
         let token = {
             let (nonce, encrypted) =
-                encrypt_path_with_key(schema.id().to_string().as_str(), &keys[0])
-                    .expect("encrypt");
+                encrypt_path_with_key(schema.id().to_string().as_str(), &keys[0]).expect("encrypt");
             let body = encode_encrypted_payload(&nonce, &encrypted).expect("encode body");
             let req = Request::builder()
                 .uri(TOKEN_PATH)

@@ -9,8 +9,8 @@ use tc_value::Value;
 use tinychain::auth::{Actor, KeyringActorResolver, Token};
 use tinychain::http::HttpServer;
 use tinychain::kernel::Kernel;
-use tinychain::library::{InstallArtifacts, default_library_schema, encode_install_payload_bytes};
 use tinychain::library::http::{build_http_library_module, http_library_handlers};
+use tinychain::library::{InstallArtifacts, default_library_schema, encode_install_payload_bytes};
 use tinychain::storage::Artifact;
 use umask::USER_WRITE;
 
@@ -46,11 +46,7 @@ async fn install_rejects_mismatched_manifest() {
 }
 
 fn sample_schema(id: &str) -> LibrarySchema {
-    LibrarySchema::new(
-        Link::from_str(id).expect("schema link"),
-        "0.1.0",
-        vec![],
-    )
+    LibrarySchema::new(Link::from_str(id).expect("schema link"), "0.1.0", vec![])
 }
 
 fn ir_bytes_for_schema(schema: &LibrarySchema) -> Vec<u8> {
@@ -70,10 +66,7 @@ fn ir_bytes_for_schema(schema: &LibrarySchema) -> Vec<u8> {
     .expect("ir manifest bytes")
 }
 
-fn install_payload_for_schema(
-    schema: &LibrarySchema,
-    artifact_bytes: Vec<u8>,
-) -> Vec<u8> {
+fn install_payload_for_schema(schema: &LibrarySchema, artifact_bytes: Vec<u8>) -> Vec<u8> {
     let artifacts = vec![Artifact {
         path: schema.id().to_string(),
         content_type: tinychain::ir::IR_ARTIFACT_CONTENT_TYPE.to_string(),

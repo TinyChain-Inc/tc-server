@@ -6,8 +6,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::future::BoxFuture;
 use getrandom::getrandom;
 use parking_lot::Mutex;
@@ -61,9 +61,7 @@ impl TxnHandle {
     }
 
     pub fn has_claim(&self, link: &Link, required: Mode) -> bool {
-        self.claims
-            .iter()
-            .any(|claim| claim.allows(link, required))
+        self.claims.iter().any(|claim| claim.allows(link, required))
     }
 
     pub fn owner_id(&self) -> Option<&str> {
@@ -144,8 +142,7 @@ impl TxnHandle {
                 .consume_and_sign((**token).clone(), host, claim, now)
                 .map_err(|err| TCError::unauthorized(err.to_string()))?,
             None => {
-                let token =
-                    Token::new(host, now, self.ttl, actor.id().clone(), claim);
+                let token = Token::new(host, now, self.ttl, actor.id().clone(), claim);
                 actor
                     .sign_token(token)
                     .map_err(|err| TCError::unauthorized(err.to_string()))?
@@ -204,32 +201,26 @@ impl TxnHandle {
 
                 if claim.mask.has(umask::USER_EXEC) {
                     if owner.is_some() {
-                        return Err(TCError::bad_request(
-                            "invalid token: multiple txn owners",
-                        ));
+                        return Err(TCError::bad_request("invalid token: multiple txn owners"));
                     }
                     owner = Some((host, actor_id));
                 }
 
                 if claim.mask.has(umask::USER_WRITE) {
                     if lock.is_some() {
-                        return Err(TCError::bad_request(
-                            "invalid token: multiple txn locks",
-                        ));
+                        return Err(TCError::bad_request("invalid token: multiple txn locks"));
                     }
                     lock = Some((host, actor_id));
                 }
             }
         }
 
-        let canonical_claim = canonical_claim.ok_or_else(|| {
-            TCError::bad_request("invalid token: missing canonical txn claim")
-        })?;
+        let canonical_claim = canonical_claim
+            .ok_or_else(|| TCError::bad_request("invalid token: missing canonical txn claim"))?;
 
         if let Some(lock) = lock {
-            let owner = owner.ok_or_else(|| {
-                TCError::bad_request("invalid token: txn lock without owner")
-            })?;
+            let owner = owner
+                .ok_or_else(|| TCError::bad_request("invalid token: txn lock without owner"))?;
 
             if lock != owner {
                 return Err(TCError::bad_request(
@@ -292,7 +283,7 @@ impl TxnManager {
                 nonce: 0,
             })),
             host_id: Arc::new(host_id.into()),
-            ttl: Duration::from_secs(30),
+            ttl: Duration::from_secs(3),
         }
     }
 
@@ -336,12 +327,8 @@ impl TxnManager {
         let trace = compute_trace(&self.host_id, ts, nonce);
         let id = TxnId::from_parts(ts, nonce).with_trace(trace);
         let claim = default_claim();
-        let txn_claim = Link::from_str(&format!("/txn/{id}"))
-            .expect("txn claim link");
-        let txn_claim = Claim::new(
-            txn_claim,
-            umask::USER_EXEC | umask::USER_WRITE,
-        );
+        let txn_claim = Link::from_str(&format!("/txn/{id}")).expect("txn claim link");
+        let txn_claim = Claim::new(txn_claim, umask::USER_EXEC | umask::USER_WRITE);
         let mut owner_id = owner_id.map(str::to_string);
         let mut bearer_token = bearer_token.map(str::to_string);
         let minted_token = owner_id.is_none() && bearer_token.is_none();
@@ -488,12 +475,8 @@ impl TxnManager {
     ) -> TxnHandle {
         let canonical = self.ensure_trace(id);
         let claim = default_claim();
-        let txn_claim = Link::from_str(&format!("/txn/{canonical}"))
-            .expect("txn claim link");
-        let txn_claim = Claim::new(
-            txn_claim,
-            umask::USER_EXEC | umask::USER_WRITE,
-        );
+        let txn_claim = Link::from_str(&format!("/txn/{canonical}")).expect("txn claim link");
+        let txn_claim = Claim::new(txn_claim, umask::USER_EXEC | umask::USER_WRITE);
         let mut owner_id = owner_id.map(str::to_string);
         let mut bearer_token = bearer_token.map(str::to_string);
         let minted_token = owner_id.is_none() && bearer_token.is_none();
@@ -550,8 +533,7 @@ pub(crate) fn owner_id_from_token(
     token: &crate::auth::TokenContext,
 ) -> Result<String, TxnError> {
     let txn_link = format!("/txn/{txn_id}");
-    let txn_link =
-        Link::from_str(&txn_link).map_err(|_| TxnError::Unauthorized)?;
+    let txn_link = Link::from_str(&txn_link).map_err(|_| TxnError::Unauthorized)?;
 
     let mut owner: Option<(&str, &str)> = None;
     let mut lock: Option<(&str, &str)> = None;
@@ -645,9 +627,9 @@ impl RpcGateway for TxnHandle {
     ) -> BoxFuture<'static, tc_error::TCResult<State>> {
         match &self.resolver {
             Some(resolver) => resolver.get(target, txn, key),
-            None => Box::pin(async move {
-                Err(TCError::bad_gateway("no txn resolver configured"))
-            }),
+            None => {
+                Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) })
+            }
         }
     }
 
@@ -660,9 +642,9 @@ impl RpcGateway for TxnHandle {
     ) -> BoxFuture<'static, tc_error::TCResult<()>> {
         match &self.resolver {
             Some(resolver) => resolver.put(target, txn, key, value),
-            None => Box::pin(async move {
-                Err(TCError::bad_gateway("no txn resolver configured"))
-            }),
+            None => {
+                Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) })
+            }
         }
     }
 
@@ -674,9 +656,9 @@ impl RpcGateway for TxnHandle {
     ) -> BoxFuture<'static, tc_error::TCResult<State>> {
         match &self.resolver {
             Some(resolver) => resolver.post(target, txn, params),
-            None => Box::pin(async move {
-                Err(TCError::bad_gateway("no txn resolver configured"))
-            }),
+            None => {
+                Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) })
+            }
         }
     }
 
@@ -688,9 +670,9 @@ impl RpcGateway for TxnHandle {
     ) -> BoxFuture<'static, tc_error::TCResult<()>> {
         match &self.resolver {
             Some(resolver) => resolver.delete(target, txn, key),
-            None => Box::pin(async move {
-                Err(TCError::bad_gateway("no txn resolver configured"))
-            }),
+            None => {
+                Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) })
+            }
         }
     }
 }
@@ -706,8 +688,7 @@ mod tests {
 
         assert!(handle.raw_token().is_some());
 
-        let txn_link =
-            Link::from_str(&format!("/txn/{}", handle.id())).expect("txn link");
+        let txn_link = Link::from_str(&format!("/txn/{}", handle.id())).expect("txn link");
         assert!(handle.has_claim(&txn_link, umask::USER_EXEC));
         assert!(handle.has_claim(&txn_link, umask::USER_WRITE));
     }
@@ -727,10 +708,7 @@ mod tests {
             Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim"),
             umask::USER_EXEC,
         );
-        let auth_claim = Claim::new(
-            Link::from_str("/lib/auth").expect("auth link"),
-            Mode::all(),
-        );
+        let auth_claim = Claim::new(Link::from_str("/lib/auth").expect("auth link"), Mode::all());
 
         let host = Link::from_str("/host").expect("host link");
         let actor = Actor::new(Value::from("actor-a"));
@@ -768,8 +746,9 @@ mod tests {
             .consume_and_sign(signed, host, final_claim, now)
             .expect("consume token");
         let err = handle.with_signed_token(signed).expect_err("should reject");
-        assert!(err
-            .message()
-            .contains("canonical claim must be first or second"));
+        assert!(
+            err.message()
+                .contains("canonical claim must be first or second")
+        );
     }
 }

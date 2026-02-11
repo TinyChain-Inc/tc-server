@@ -16,8 +16,8 @@ use crate::resolve::Resolve;
 
 #[cfg(feature = "http-server")]
 use {
-    crate::txn::TxnHandle,
     crate::http::{Body, Request, Response, StatusCode},
+    crate::txn::TxnHandle,
     hyper::body,
     tc_error::ErrorKind,
     tokio::sync::Mutex,
@@ -339,14 +339,14 @@ mod tests {
 #[cfg(all(test, feature = "http-server"))]
 mod http_tests {
     use super::*;
+    use crate::http::{Body, StatusCode};
     use crate::{
+        HttpServer,
         kernel::{Kernel, Method},
         library::http::{build_http_library_module, http_library_handlers},
-        HttpServer,
         txn::TxnManager,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-    use crate::http::{Body, StatusCode};
     use hyper::{Client, body};
     use pathlink::Link;
     use std::net::TcpListener;
@@ -419,7 +419,11 @@ mod http_tests {
         request.extensions_mut().insert(txn.clone());
 
         let fut = kernel
-            .dispatch(Method::Get, "/lib/example-devco/example/0.1.0/hello", request)
+            .dispatch(
+                Method::Get,
+                "/lib/example-devco/example/0.1.0/hello",
+                request,
+            )
             .expect("wasm handler");
         let response = fut.await;
         let body = body::to_bytes(response.into_body()).await.expect("body");
@@ -503,7 +507,8 @@ mod http_tests {
             .try_into()
             .expect("response fits in u32");
 
-        let manifest_packed: i64 = (((manifest_len as u64) << 32) | (MANIFEST_OFFSET as u64)) as i64;
+        let manifest_packed: i64 =
+            (((manifest_len as u64) << 32) | (MANIFEST_OFFSET as u64)) as i64;
 
         let mut module = Module::new();
 
@@ -617,7 +622,8 @@ mod http_tests {
     }
 
     #[tokio::test]
-    async fn http_wasm_route_resolves_opref_via_gateway() -> Result<(), Box<dyn std::error::Error>> {
+    async fn http_wasm_route_resolves_opref_via_gateway() -> Result<(), Box<dyn std::error::Error>>
+    {
         let b_root = "/lib/example-devco/b/0.1.0";
         let b_hello = "/lib/example-devco/b/0.1.0/hello";
         let b_route = "/hello";
@@ -637,9 +643,9 @@ mod http_tests {
             .with_health_handler(|_req| async { Response::new(Body::empty()) })
             .finish();
 
-        let b_schema =
-            tc_ir::LibrarySchema::new(Link::from_str(b_root)?, "0.1.0", vec![]);
-        let wasm_b = wasm_static_response_module(b_schema, b_route, "hello", br#""hello""#.to_vec());
+        let b_schema = tc_ir::LibrarySchema::new(Link::from_str(b_root)?, "0.1.0", vec![]);
+        let wasm_b =
+            wasm_static_response_module(b_schema, b_route, "hello", br#""hello""#.to_vec());
 
         let install_payload_b = serde_json::json!({
             "schema": {
@@ -659,10 +665,7 @@ mod http_tests {
             .uri("/lib")
             .header(crate::http::header::CONTENT_TYPE, "application/json")
             .body(Body::from(install_payload_b.to_string()))?;
-        let install_claim_b = Claim::new(
-            Link::from_str(b_root)?,
-            umask::USER_WRITE,
-        );
+        let install_claim_b = Claim::new(Link::from_str(b_root)?, umask::USER_WRITE);
         let install_txn_b = b_kernel
             .txn_manager()
             .begin()
@@ -717,7 +720,12 @@ mod http_tests {
             );
             serde_json::Value::Object(map)
         };
-        let wasm_a = wasm_static_response_module(a_schema, a_route, "from_b", wasm_response.to_string().into_bytes());
+        let wasm_a = wasm_static_response_module(
+            a_schema,
+            a_route,
+            "from_b",
+            wasm_response.to_string().into_bytes(),
+        );
 
         let install_payload_a = serde_json::json!({
             "schema": {
@@ -737,10 +745,7 @@ mod http_tests {
             .uri("/lib")
             .header(crate::http::header::CONTENT_TYPE, "application/json")
             .body(Body::from(install_payload_a.to_string()))?;
-        let install_claim_a = Claim::new(
-            Link::from_str(a_root)?,
-            umask::USER_WRITE,
-        );
+        let install_claim_a = Claim::new(Link::from_str(a_root)?, umask::USER_WRITE);
         let install_txn_a = a_kernel
             .txn_manager()
             .begin()
@@ -772,10 +777,7 @@ mod http_tests {
         let response = Client::new().request(request).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = body::to_bytes(response.into_body()).await?;
-        assert_eq!(
-            body.as_ref(),
-            br#"{"/state/scalar/value/string":"hello"}"#
-        );
+        assert_eq!(body.as_ref(), br#"{"/state/scalar/value/string":"hello"}"#);
 
         a_task.abort();
         b_task.abort();
@@ -786,11 +788,7 @@ mod http_tests {
 #[cfg(feature = "http-server")]
 pub fn http_wasm_route_handler_from_bytes(
     bytes: Vec<u8>,
-) -> TCResult<(
-    impl KernelHandler,
-    LibrarySchema,
-    SchemaRoutes,
-)> {
+) -> TCResult<(impl KernelHandler, LibrarySchema, SchemaRoutes)> {
     let engine = Engine::default();
     let wasm = WasmLibrary::from_bytes(&engine, &bytes)?;
     let schema = wasm.schema().clone();
@@ -882,6 +880,21 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request) -> Respo
                         Ok(state) => return state_response(state),
                         Err(err) => return error_response(err),
                     },
+                    tc_ir::TCRef::Id(_) => {
+                        return error_response(TCError::bad_request(
+                            "cannot resolve TCRef::Id without a scope".to_string(),
+                        ))
+                    }
+                    tc_ir::TCRef::If(_) => {
+                        return error_response(TCError::bad_request(
+                            "cannot resolve TCRef::If without a scope".to_string(),
+                        ))
+                    }
+                    tc_ir::TCRef::While(_) => {
+                        return error_response(TCError::bad_request(
+                            "cannot resolve TCRef::While without a scope".to_string(),
+                        ))
+                    }
                 }
             }
 

@@ -137,20 +137,12 @@ mod rjwt_token {
 
     #[async_trait]
     pub trait ActorResolver: Send + Sync + 'static {
-        async fn resolve_actor(
-            &self,
-            host: &Link,
-            actor_id: &Value,
-        ) -> Result<ActorV1, TxnError>;
+        async fn resolve_actor(&self, host: &Link, actor_id: &Value) -> Result<ActorV1, TxnError>;
     }
 
     #[async_trait]
     impl ActorResolver for KeyringActorResolver {
-        async fn resolve_actor(
-            &self,
-            host: &Link,
-            actor_id: &Value,
-        ) -> Result<ActorV1, TxnError> {
+        async fn resolve_actor(&self, host: &Link, actor_id: &Value) -> Result<ActorV1, TxnError> {
             self.actors
                 .read()
                 .get(&(host.clone(), actor_identity(actor_id)))
@@ -179,17 +171,13 @@ mod rjwt_token {
     #[cfg(feature = "http-client")]
     #[async_trait]
     impl ActorResolver for RpcActorResolver {
-        async fn resolve_actor(
-            &self,
-            host: &Link,
-            actor_id: &Value,
-        ) -> Result<ActorV1, TxnError> {
+        async fn resolve_actor(&self, host: &Link, actor_id: &Value) -> Result<ActorV1, TxnError> {
             use base64::Engine as _;
 
             let actor_id = actor_identity(actor_id);
             let target = {
-                let host_segment = pathlink::PathSegment::from_str("host")
-                    .map_err(|_| TxnError::Unauthorized)?;
+                let host_segment =
+                    pathlink::PathSegment::from_str("host").map_err(|_| TxnError::Unauthorized)?;
                 let key_segment = pathlink::PathSegment::from_str("public_key")
                     .map_err(|_| TxnError::Unauthorized)?;
                 host.clone().append(host_segment).append(key_segment)
@@ -197,11 +185,7 @@ mod rjwt_token {
 
             let response = self
                 .gateway
-                .get(
-                    target,
-                    self.txn.clone(),
-                    Value::String(actor_id.clone()),
-                )
+                .get(target, self.txn.clone(), Value::String(actor_id.clone()))
                 .await
                 .map_err(|_| TxnError::Unauthorized)?;
 
@@ -290,6 +274,7 @@ mod rjwt_token {
             Value::None => "none".to_string(),
             Value::Number(num) => num.to_string(),
             Value::String(value) => value.clone(),
+            Value::Link(link) => link.to_string(),
         }
     }
 }

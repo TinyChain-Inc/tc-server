@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pathlink::Link;
+use serde_json::json;
 use tc_ir::LibrarySchema;
 use tinychain::auth::{KeyringActorResolver, PublicKeyStore};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
@@ -14,7 +15,6 @@ use tinychain::replication::{
     replication_token_handler, request_replication_token,
 };
 use tinychain::storage::{Artifact, LibraryStore};
-use serde_json::json;
 
 #[tokio::test]
 async fn rotates_psk_keys_for_export_integration() {
@@ -91,14 +91,13 @@ async fn rotates_psk_keys_for_export_integration() {
     let addr_new = start_server(schema.clone(), Some(dir), keys_new_only.clone()).await;
     let peer_new = format!("http://{addr_new}");
 
-    let token_old = request_replication_token(&peer_new, &schema.id().to_string(), &keys_old_only)
-        .await;
+    let token_old =
+        request_replication_token(&peer_new, &schema.id().to_string(), &keys_old_only).await;
     assert!(token_old.is_err());
 
-    let token_new =
-        request_replication_token(&peer_new, &schema.id().to_string(), &keys_new_only)
-            .await
-            .expect("token");
+    let token_new = request_replication_token(&peer_new, &schema.id().to_string(), &keys_new_only)
+        .await
+        .expect("token");
     let payload = fetch_library_export(&peer_new, &token_new)
         .await
         .expect("export")

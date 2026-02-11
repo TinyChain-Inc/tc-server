@@ -1,6 +1,6 @@
 use std::{str::FromStr, sync::Arc};
 
-use futures::future::BoxFuture;
+use futures::{TryStreamExt, future::BoxFuture};
 use std::fmt;
 use tc_ir::TxnId;
 
@@ -8,7 +8,7 @@ use crate::egress::EgressPolicy;
 use crate::library::{LibraryHandlers, LibraryRegistry};
 use crate::txn_server::TxnServer;
 use crate::uri::{component_root, normalize_path};
-use crate::{Request, Response};
+use crate::{Body, Request, Response};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Method {
@@ -76,11 +76,18 @@ impl Kernel {
         path: &str,
         req: Request,
     ) -> Option<BoxFuture<'static, Response>> {
-        if path.starts_with("/lib/") {
-            return self.lib_route_handler.as_ref().map(|handler| handler.call(req));
+        if path.starts_with("/state/") {
+            return Some(self.kernel_handler.call(req));
         }
 
-        if path == crate::uri::SERVICE_ROOT || path.starts_with("/service/") {
+        if path.starts_with(crate::uri::LIB_ROOT_PREFIX) {
+            return self
+                .lib_route_handler
+                .as_ref()
+                .map(|handler| handler.call(req));
+        }
+
+        if path == crate::uri::SERVICE_ROOT || path.starts_with(crate::uri::SERVICE_ROOT_PREFIX) {
             return Some(self.service_handler.call(req));
         }
 
@@ -88,9 +95,12 @@ impl Kernel {
             (Method::Get, crate::uri::LIB_ROOT) => Some(self.lib_get_handler.call(req)),
             (Method::Put, crate::uri::LIB_ROOT) => Some(self.lib_put_handler.call(req)),
             (Method::Get, "/") => Some(self.kernel_handler.call(req)),
-            (Method::Get, "/host/metrics") => Some(self.kernel_handler.call(req)),
-            (Method::Get, "/host/public_key") => Some(self.kernel_handler.call(req)),
-            (Method::Get, "/host/library/export") => Some(self.kernel_handler.call(req)),
+            (Method::Get, crate::uri::HOST_METRICS) => Some(self.kernel_handler.call(req)),
+            (Method::Get, crate::uri::HOST_PUBLIC_KEY) => Some(self.kernel_handler.call(req)),
+            (Method::Get, crate::uri::HOST_LIBRARY_EXPORT) => Some(self.kernel_handler.call(req)),
+            (Method::Post, path) if is_scalar_reflect_path_str(path) => {
+                Some(self.kernel_handler.call(req))
+            }
             (Method::Get, crate::uri::HEALTHZ) => Some(self.health_handler.call(req)),
             _ => None,
         }
@@ -112,10 +122,7 @@ impl Kernel {
         &self.token_verifier
     }
 
-    pub fn with_resolver(
-        &self,
-        handle: crate::txn::TxnHandle,
-    ) -> crate::txn::TxnHandle {
+    pub fn with_resolver(&self, handle: crate::txn::TxnHandle) -> crate::txn::TxnHandle {
         handle.with_resolver(self.build_txn_resolver())
     }
 
@@ -127,6 +134,7 @@ impl Kernel {
             token_verifier: Arc::clone(&self.token_verifier),
             txn_manager: self.txn_manager.clone(),
             txn_server: self.txn_server.clone(),
+            host_handler: Arc::clone(&self.kernel_handler),
         })
     }
 
@@ -164,7 +172,8 @@ impl Kernel {
 
         if path == crate::uri::HEALTHZ
             || path == crate::uri::HOST_ROOT
-            || (path.starts_with("/host/") && path != "/host/library/export")
+            || (path.starts_with(crate::uri::HOST_ROOT_PREFIX)
+                && path != crate::uri::HOST_LIBRARY_EXPORT)
         {
             return Ok(dispatch_or_not_found(self.dispatch(method, path, req)));
         }
@@ -179,7 +188,11 @@ impl Kernel {
                     .iter()
                     .map(|(_, _, claim)| claim.clone())
                     .collect::<Vec<_>>();
-                (Some(owner_id), Some(token.bearer_token.to_string()), Some(claims))
+                (
+                    Some(owner_id),
+                    Some(token.bearer_token.to_string()),
+                    Some(claims),
+                )
             }
             (_, Some(token)) => {
                 let claims = if token.claims.is_empty() {
@@ -299,9 +312,7 @@ fn token_claim_for_target(method: Method, target: &str) -> Option<tc_ir::Claim> 
     Some(tc_ir::Claim::new(link, mask))
 }
 
-fn dispatch_or_not_found(
-    fut: Option<BoxFuture<'static, Response>>,
-) -> KernelDispatch {
+fn dispatch_or_not_found(fut: Option<BoxFuture<'static, Response>>) -> KernelDispatch {
     match fut {
         Some(fut) => KernelDispatch::Response(fut),
         None => KernelDispatch::NotFound,
@@ -325,6 +336,7 @@ struct KernelTxnResolver {
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
     txn_manager: crate::txn::TxnManager,
     txn_server: TxnServer,
+    host_handler: Arc<dyn KernelHandler>,
 }
 
 impl KernelTxnResolver {
@@ -336,9 +348,7 @@ impl KernelTxnResolver {
     ) -> tc_error::TCResult<(pathlink::Link, crate::txn::TxnHandle)> {
         let target_str = target.to_string();
         let registry = self.library_registry.clone().ok_or_else(|| {
-            tc_error::TCError::unauthorized(
-                "no library manifest loaded (egress is default-deny)",
-            )
+            tc_error::TCError::unauthorized("no library manifest loaded (egress is default-deny)")
         })?;
 
         let bearer_token = match txn.raw_token() {
@@ -386,9 +396,7 @@ impl KernelTxnResolver {
                         self.token_verifier
                             .grant(ctx, claim)
                             .await
-                            .map_err(|_| tc_error::TCError::unauthorized(
-                                "invalid bearer token",
-                            ))?
+                            .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?
                     }
                     None => ctx,
                 };
@@ -419,11 +427,13 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
     ) -> BoxFuture<'static, tc_error::TCResult<tc_state::State>> {
         let resolver = self.clone();
         Box::pin(async move {
-            let gateway = resolver.gateway.clone().ok_or_else(|| {
-                tc_error::TCError::bad_gateway("no RPC gateway configured")
-            })?;
-            let (resolved, outbound_txn) =
-                resolver.prepare_outbound(Method::Get, &target, &txn).await?;
+            let gateway = resolver
+                .gateway
+                .clone()
+                .ok_or_else(|| tc_error::TCError::bad_gateway("no RPC gateway configured"))?;
+            let (resolved, outbound_txn) = resolver
+                .prepare_outbound(Method::Get, &target, &txn)
+                .await?;
             gateway.get(resolved, outbound_txn, key).await
         })
     }
@@ -437,11 +447,13 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
     ) -> BoxFuture<'static, tc_error::TCResult<()>> {
         let resolver = self.clone();
         Box::pin(async move {
-            let gateway = resolver.gateway.clone().ok_or_else(|| {
-                tc_error::TCError::bad_gateway("no RPC gateway configured")
-            })?;
-            let (resolved, outbound_txn) =
-                resolver.prepare_outbound(Method::Put, &target, &txn).await?;
+            let gateway = resolver
+                .gateway
+                .clone()
+                .ok_or_else(|| tc_error::TCError::bad_gateway("no RPC gateway configured"))?;
+            let (resolved, outbound_txn) = resolver
+                .prepare_outbound(Method::Put, &target, &txn)
+                .await?;
             gateway.put(resolved, outbound_txn, key, value).await
         })
     }
@@ -454,11 +466,16 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
     ) -> BoxFuture<'static, tc_error::TCResult<tc_state::State>> {
         let resolver = self.clone();
         Box::pin(async move {
-            let gateway = resolver.gateway.clone().ok_or_else(|| {
-                tc_error::TCError::bad_gateway("no RPC gateway configured")
-            })?;
-            let (resolved, outbound_txn) =
-                resolver.prepare_outbound(Method::Post, &target, &txn).await?;
+            if is_scalar_reflect_path(&target) {
+                return dispatch_host_post(resolver.host_handler.clone(), target, params).await;
+            }
+            let gateway = resolver
+                .gateway
+                .clone()
+                .ok_or_else(|| tc_error::TCError::bad_gateway("no RPC gateway configured"))?;
+            let (resolved, outbound_txn) = resolver
+                .prepare_outbound(Method::Post, &target, &txn)
+                .await?;
             gateway.post(resolved, outbound_txn, params).await
         })
     }
@@ -471,14 +488,105 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
     ) -> BoxFuture<'static, tc_error::TCResult<()>> {
         let resolver = self.clone();
         Box::pin(async move {
-            let gateway = resolver.gateway.clone().ok_or_else(|| {
-                tc_error::TCError::bad_gateway("no RPC gateway configured")
-            })?;
-            let (resolved, outbound_txn) =
-                resolver.prepare_outbound(Method::Delete, &target, &txn).await?;
+            let gateway = resolver
+                .gateway
+                .clone()
+                .ok_or_else(|| tc_error::TCError::bad_gateway("no RPC gateway configured"))?;
+            let (resolved, outbound_txn) = resolver
+                .prepare_outbound(Method::Delete, &target, &txn)
+                .await?;
             gateway.delete(resolved, outbound_txn, key).await
         })
     }
+}
+
+fn is_scalar_reflect_path(target: &pathlink::Link) -> bool {
+    let Ok(path) = pathlink::PathBuf::from_str(&target.to_string()) else {
+        return false;
+    };
+    path == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_CLASS)
+        || path == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_IF_PARTS)
+        || path == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_FORM)
+        || path == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_LAST_ID)
+        || path == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_SCALARS)
+}
+
+fn is_scalar_reflect_path_str(path: &str) -> bool {
+    let Ok(parsed) = pathlink::PathBuf::from_str(path) else {
+        return false;
+    };
+    parsed == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_CLASS)
+        || parsed == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_IF_PARTS)
+        || parsed == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_FORM)
+        || parsed == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_LAST_ID)
+        || parsed == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_SCALARS)
+}
+
+fn host_request(
+    method: http::Method,
+    target: pathlink::Link,
+    body: Body,
+) -> tc_error::TCResult<Request> {
+    let target = target.to_string();
+    let uri = http::Uri::from_str(&target)
+        .map_err(|err| tc_error::TCError::bad_request(err.to_string()))?;
+    http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(body)
+        .map_err(|err| tc_error::TCError::bad_request(err.to_string()))
+}
+
+async fn decode_host_state_response(resp: Response) -> tc_error::TCResult<tc_state::State> {
+    use futures::stream;
+
+    let status = resp.status();
+    let body = hyper::body::to_bytes(resp.into_body())
+        .await
+        .map_err(|err| tc_error::TCError::internal(err.to_string()))?;
+
+    if status.is_success() {
+        if body.is_empty() || body.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(tc_state::State::None);
+        }
+        let stream = stream::iter(vec![Ok::<bytes::Bytes, std::io::Error>(body)]);
+        return destream_json::try_decode(tc_state::null_transaction(), stream)
+            .await
+            .map_err(|err| tc_error::TCError::bad_request(err.to_string()));
+    }
+
+    let message = if body.is_empty() {
+        status.to_string()
+    } else {
+        String::from_utf8_lossy(&body).to_string()
+    };
+    Err(status_to_error(status, message))
+}
+
+fn status_to_error(status: hyper::StatusCode, message: String) -> tc_error::TCError {
+    match status {
+        hyper::StatusCode::BAD_REQUEST => tc_error::TCError::bad_request(message),
+        hyper::StatusCode::CONFLICT => tc_error::TCError::conflict(message),
+        hyper::StatusCode::METHOD_NOT_ALLOWED => tc_error::TCError::bad_request(message),
+        hyper::StatusCode::NOT_FOUND => tc_error::TCError::not_found(message),
+        hyper::StatusCode::UNAUTHORIZED => tc_error::TCError::unauthorized(message),
+        _ => tc_error::TCError::internal(message),
+    }
+}
+
+async fn dispatch_host_post(
+    handler: Arc<dyn KernelHandler>,
+    target: pathlink::Link,
+    params: tc_ir::Map<tc_state::State>,
+) -> tc_error::TCResult<tc_state::State> {
+    let stream = destream_json::encode(params)
+        .map_err(|err| tc_error::TCError::bad_request(err.to_string()))?;
+    let body = Body::wrap_stream(
+        stream.map_err(|err| std::io::Error::other(err.to_string())),
+    );
+    let req = host_request(http::Method::POST, target, body)?;
+    let resp = handler.call(req).await;
+    decode_host_state_response(resp).await
 }
 
 impl Clone for Kernel {
@@ -644,11 +752,7 @@ impl KernelBuilder {
         self
     }
 
-    pub fn with_kernel_actor(
-        mut self,
-        host: pathlink::Link,
-        actor: crate::auth::Actor,
-    ) -> Self {
+    pub fn with_kernel_actor(mut self, host: pathlink::Link, actor: crate::auth::Actor) -> Self {
         self.kernel_actor = Some((host, actor));
         self
     }
@@ -713,10 +817,10 @@ fn stub_handler(label: &str) -> Arc<dyn KernelHandler> {
 mod tests {
     use super::*;
     use crate::Body;
+    use crate::resolve::Resolve;
     use futures::FutureExt;
     use std::sync::{Arc, Mutex};
     use tc_ir::{LibrarySchema, NetworkTime};
-    use crate::resolve::Resolve;
 
     fn ok_handler() -> impl KernelHandler {
         |_req: Request| async { Response::new(Body::empty()) }.boxed()
@@ -789,7 +893,7 @@ mod tests {
         let kernel = Kernel::builder().with_lib_handler(ok_handler()).finish();
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0; 32]);
 
-        let host = pathlink::Link::from_str("/host").expect("host link");
+        let host = pathlink::Link::from_str(crate::uri::HOST_ROOT).expect("host link");
         let actor_a = rjwt::Actor::new(Value::from("actor-a"));
         let resolver =
             crate::auth::KeyringActorResolver::default().with_actor(host.clone(), actor_a.clone());
@@ -938,9 +1042,7 @@ mod tests {
             _key: tc_value::Value,
         ) -> BoxFuture<'static, tc_error::TCResult<tc_state::State>> {
             self.calls.lock().expect("calls lock").push(uri);
-            Box::pin(async move {
-                Ok(tc_state::State::None)
-            })
+            Box::pin(async move { Ok(tc_state::State::None) })
         }
 
         fn put(
@@ -980,7 +1082,8 @@ mod tests {
             vec![],
         );
 
-        let registry = crate::library::LibraryRegistry::new(None, std::collections::BTreeMap::new());
+        let registry =
+            crate::library::LibraryRegistry::new(None, std::collections::BTreeMap::new());
         futures::executor::block_on(registry.insert_schema(schema)).expect("insert schema");
         let module = Arc::new(registry);
         let handlers = crate::library::LibraryHandlers::without_route(ok_handler(), ok_handler());
@@ -999,8 +1102,7 @@ mod tests {
         ));
 
         let txn = kernel.with_resolver(kernel.txn_manager().begin());
-        let err = futures::executor::block_on(op.resolve(&txn))
-            .expect_err("expected unauthorized");
+        let err = futures::executor::block_on(op.resolve(&txn)).expect_err("expected unauthorized");
         assert_eq!(err.code(), tc_error::ErrorKind::Unauthorized);
     }
 
@@ -1030,48 +1132,44 @@ mod tests {
         impl crate::gateway::RpcGateway for RecordingGateway {
             fn get(
                 &self,
-            uri: pathlink::Link,
-            _txn: crate::txn::TxnHandle,
-            key: Value,
-        ) -> BoxFuture<'static, tc_error::TCResult<State>> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push((Method::Get, uri, Some(key)));
-
-                let response = self
-                    .responses
+                uri: pathlink::Link,
+                _txn: crate::txn::TxnHandle,
+                key: Value,
+            ) -> BoxFuture<'static, tc_error::TCResult<State>> {
+                self.calls
                     .lock()
-                    .expect("responses lock")
-                    .remove(0);
+                    .expect("calls lock")
+                    .push((Method::Get, uri, Some(key)));
+
+                let response = self.responses.lock().expect("responses lock").remove(0);
 
                 Box::pin(async move { Ok(response) })
             }
 
             fn put(
                 &self,
-            _uri: pathlink::Link,
-            _txn: crate::txn::TxnHandle,
-            _key: Value,
-            _value: State,
+                _uri: pathlink::Link,
+                _txn: crate::txn::TxnHandle,
+                _key: Value,
+                _value: State,
             ) -> BoxFuture<'static, tc_error::TCResult<()>> {
                 Box::pin(async move { Ok(()) })
             }
 
             fn post(
                 &self,
-            _uri: pathlink::Link,
-            _txn: crate::txn::TxnHandle,
-            _params: tc_ir::Map<State>,
+                _uri: pathlink::Link,
+                _txn: crate::txn::TxnHandle,
+                _params: tc_ir::Map<State>,
             ) -> BoxFuture<'static, tc_error::TCResult<State>> {
                 Box::pin(async move { Ok(State::None) })
             }
 
             fn delete(
                 &self,
-            _uri: pathlink::Link,
-            _txn: crate::txn::TxnHandle,
-            _key: Value,
+                _uri: pathlink::Link,
+                _txn: crate::txn::TxnHandle,
+                _key: Value,
             ) -> BoxFuture<'static, tc_error::TCResult<()>> {
                 Box::pin(async move { Ok(()) })
             }
@@ -1082,12 +1180,15 @@ mod tests {
                 .parse()
                 .expect("schema id"),
             "1.0.0",
-            vec!["/lib/example-devco/example/1.0.0"
-                .parse()
-                .expect("dependency root")],
+            vec![
+                "/lib/example-devco/example/1.0.0"
+                    .parse()
+                    .expect("dependency root"),
+            ],
         );
 
-        let registry = crate::library::LibraryRegistry::new(None, std::collections::BTreeMap::new());
+        let registry =
+            crate::library::LibraryRegistry::new(None, std::collections::BTreeMap::new());
         futures::executor::block_on(registry.insert_schema(schema)).expect("insert schema");
         let module = Arc::new(registry);
         let handlers = crate::library::LibraryHandlers::without_route(ok_handler(), ok_handler());
@@ -1126,9 +1227,7 @@ mod tests {
             Scalar::Ref(Box::new(TCRef::Op(inner_op))),
         ));
 
-        let response =
-            futures::executor::block_on(outer_op.resolve(&txn))
-                .expect("resolve op");
+        let response = futures::executor::block_on(outer_op.resolve(&txn)).expect("resolve op");
 
         assert!(matches!(
             response,

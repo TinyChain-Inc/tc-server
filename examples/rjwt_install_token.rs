@@ -3,8 +3,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::str::FromStr;
     use std::time::{Duration, SystemTime};
 
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
     use pathlink::Link;
     use tc_ir::Claim;
     use tc_value::Value;
@@ -30,10 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--ttl-secs" => {
-                ttl_secs = args
-                    .next()
-                    .ok_or("missing --ttl-secs value")?
-                    .parse()?;
+                ttl_secs = args.next().ok_or("missing --ttl-secs value")?.parse()?;
             }
             "--help" | "-h" => {
                 print_usage();
@@ -60,10 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SystemTime::now(),
         Duration::from_secs(ttl_secs),
         actor.id().clone(),
-        claims
-            .first()
-            .cloned()
-            .ok_or("missing --lib claim")?,
+        claims.first().cloned().ok_or("missing --lib claim")?,
     );
     let mut signed = actor.sign_token(token)?;
     for claim in claims.iter().skip(1).cloned() {

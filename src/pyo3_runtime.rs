@@ -2,8 +2,8 @@
 
 use std::{fmt, io, marker::PhantomData, path::PathBuf, sync::Arc};
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, executor, stream};
 use pathlink::Link;
@@ -11,13 +11,15 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyModule, PyString, PyType};
 use pyo3::{Bound, PyClassInitializer, PyRef};
-use tc_ir::{LibrarySchema, OpRef, Scalar, Subject, TxnId};
+use tc_ir::{Claim, LibrarySchema, OpRef, Scalar, Subject, TxnId};
+use umask;
 use url::form_urlencoded;
 
 use crate::{
     Body, Kernel, KernelDispatch, KernelHandler, Method, Request, Response, State, StatusCode,
-    resolve::Resolve,
+    auth::TokenContext,
     library::{default_library_schema, http as http_library},
+    resolve::Resolve,
     storage::load_library_root,
     txn::{TxnError, TxnManager},
 };
@@ -29,6 +31,7 @@ pub struct PyKernelConfig {
     pub data_dir: Option<PathBuf>,
     pub initial_schema: LibrarySchema,
     pub host_id: String,
+    pub limits: crate::KernelLimits,
 }
 
 impl Default for PyKernelConfig {
@@ -37,8 +40,23 @@ impl Default for PyKernelConfig {
             data_dir: None,
             initial_schema: default_library_schema(),
             host_id: "tc-py-host".to_string(),
+            limits: crate::KernelLimits::default(),
         }
     }
+}
+
+fn apply_config_overrides(
+    mut config: PyKernelConfig,
+    request_ttl_secs: Option<u64>,
+    max_request_bytes_unauth: Option<usize>,
+) -> PyKernelConfig {
+    if let Some(secs) = request_ttl_secs.filter(|value| *value > 0) {
+        config.limits.txn_ttl = std::time::Duration::from_secs(secs);
+    }
+    if let Some(max_bytes) = max_request_bytes_unauth.filter(|value| *value > 0) {
+        config.limits.max_request_bytes_unauth = max_bytes;
+    }
+    config
 }
 
 /// Wrapper around a typed state value shared between handlers.
@@ -303,30 +321,55 @@ pub(crate) fn python_kernel_builder_with_config(
     // PyO3 boundary is synchronous; block here by design to build the library module.
     let module = match storage_root {
         Some(root) => {
-            let root_dir = runtime.block_on(load_library_root(root))
+            let root_dir = runtime
+                .block_on(load_library_root(root))
                 .expect("library root");
-            runtime.block_on(http_library::build_http_library_module_with_store(
-                config.initial_schema.clone(),
-                Some(crate::storage::LibraryStore::from_root(root_dir)),
-            ))
-            .expect("library module")
+            runtime
+                .block_on(http_library::build_http_library_module_with_store(
+                    config.initial_schema.clone(),
+                    Some(crate::storage::LibraryStore::from_root(root_dir)),
+                ))
+                .expect("library module")
         }
-        None => runtime.block_on(http_library::build_http_library_module(
-            config.initial_schema.clone(),
-            None,
-        ))
-        .expect("library module"),
+        None => runtime
+            .block_on(http_library::build_http_library_module(
+                config.initial_schema.clone(),
+                None,
+            ))
+            .expect("library module"),
     };
     // PyO3 boundary is synchronous; hydrate storage by blocking here.
-    runtime.block_on(module.hydrate_from_storage()).expect("library hydrate");
+    runtime
+        .block_on(module.hydrate_from_storage())
+        .expect("library hydrate");
     let library_handlers = http_library::http_library_handlers(&module);
+
+    let kernel_handler = crate::reflect::host_reflect_handler(Arc::new(python_handler(
+        metrics.unwrap_or_else(stub_py_handler),
+    )));
+    let kernel_handler: Arc<dyn KernelHandler> = Arc::new(kernel_handler);
+    let state_handler = crate::state::state_handler();
+    let kernel_handler = move |req: Request| {
+        let state_handler = state_handler.clone();
+        let kernel_handler = kernel_handler.clone();
+        async move {
+            if req.uri().path().starts_with("/state/")
+                && !crate::reflect::is_reflect_path(req.uri().path())
+            {
+                return state_handler.call(req).await;
+            }
+            kernel_handler.call(req).await
+        }
+        .boxed()
+    };
 
     let mut builder = Kernel::builder()
         .with_host_id(config.host_id.clone())
         .with_library_module(module, library_handlers)
         .with_service_handler(python_handler(service))
-        .with_kernel_handler(python_handler(metrics.unwrap_or_else(stub_py_handler)))
-        .with_health_handler(python_health_handler());
+        .with_kernel_handler(kernel_handler)
+        .with_health_handler(python_health_handler())
+        .with_txn_ttl(config.limits.txn_ttl);
 
     #[cfg(feature = "http-client")]
     {
@@ -346,7 +389,6 @@ where
         .expect("tokio runtime")
         .block_on(fut)
 }
-
 
 pub(crate) fn python_handler(callback: Py<PyAny>) -> impl KernelHandler {
     move |req: Request| {
@@ -378,13 +420,15 @@ pub(crate) fn python_handler(callback: Py<PyAny>) -> impl KernelHandler {
 }
 
 pub(crate) fn python_health_handler() -> impl KernelHandler {
-    move |_req: Request| async move {
-        http::Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::empty())
-            .expect("health response")
+    move |_req: Request| {
+        async move {
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .expect("health response")
+        }
+        .boxed()
     }
-    .boxed()
 }
 
 pub(crate) fn stub_py_handler() -> Py<PyAny> {
@@ -407,6 +451,7 @@ pub struct KernelHandle {
     inner: Arc<Kernel>,
     txn_manager: TxnManager,
     runtime: Arc<tokio::runtime::Runtime>,
+    config: PyKernelConfig,
 }
 
 impl Clone for KernelHandle {
@@ -415,12 +460,13 @@ impl Clone for KernelHandle {
             inner: Arc::clone(&self.inner),
             txn_manager: self.txn_manager.clone(),
             runtime: Arc::clone(&self.runtime),
+            config: self.config.clone(),
         }
     }
 }
 
 impl KernelHandle {
-    fn from_kernel(kernel: Kernel) -> Self {
+    fn from_kernel(kernel: Kernel, config: PyKernelConfig) -> Self {
         let txn_manager = kernel.txn_manager().clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -430,6 +476,7 @@ impl KernelHandle {
             inner: Arc::new(kernel),
             txn_manager,
             runtime: Arc::new(runtime),
+            config,
         }
     }
 
@@ -445,20 +492,22 @@ impl KernelHandle {
 #[pymethods]
 impl KernelHandle {
     #[new]
-    #[pyo3(signature = (lib, service, metrics=None, data_dir=None))]
+    #[pyo3(signature = (lib, service, metrics=None, data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
     pub fn new(
         lib: Py<PyAny>,
         service: Py<PyAny>,
         metrics: Option<Py<PyAny>>,
         data_dir: Option<PathBuf>,
+        request_ttl_secs: Option<u64>,
+        max_request_bytes_unauth: Option<usize>,
     ) -> Self {
         let config = PyKernelConfig {
             data_dir,
             ..PyKernelConfig::default()
         };
-        Self::from_kernel(python_kernel_builder_with_config(
-            lib, service, metrics, config,
-        ))
+        let config = apply_config_overrides(config, request_ttl_secs, max_request_bytes_unauth);
+        let kernel = python_kernel_builder_with_config(lib, service, metrics, config.clone());
+        Self::from_kernel(kernel, config)
     }
 
     /// Construct a local kernel handle with no Python service handlers installed.
@@ -466,27 +515,51 @@ impl KernelHandle {
     /// This is intended for tooling/tests which only need the Rust `/lib` and `/healthz` handlers
     /// (e.g. WASM installs into a local `data_dir`) without providing Python callbacks.
     #[classmethod]
-    #[pyo3(signature = (data_dir=None))]
-    pub fn local(_cls: &Bound<'_, PyType>, data_dir: Option<PathBuf>) -> Self {
+    #[pyo3(signature = (data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
+    pub fn local(
+        _cls: &Bound<'_, PyType>,
+        data_dir: Option<PathBuf>,
+        request_ttl_secs: Option<u64>,
+        max_request_bytes_unauth: Option<usize>,
+    ) -> Self {
         let stub = stub_py_handler();
-        Self::new(stub.clone(), stub, None, data_dir)
+        Self::new(
+            stub.clone(),
+            stub,
+            None,
+            data_dir,
+            request_ttl_secs,
+            max_request_bytes_unauth,
+        )
     }
 
     #[classmethod]
-    pub fn with_library_schema(_cls: &Bound<'_, PyType>, schema_json: &str) -> PyResult<Self> {
+    #[pyo3(signature = (schema_json, request_ttl_secs=None, max_request_bytes_unauth=None))]
+    pub fn with_library_schema(
+        _cls: &Bound<'_, PyType>,
+        schema_json: &str,
+        request_ttl_secs: Option<u64>,
+        max_request_bytes_unauth: Option<usize>,
+    ) -> PyResult<Self> {
         let schema = decode_schema_from_json(schema_json)?;
-        let module = block_on_tokio(http_library::build_http_library_module(schema, None))
-            .expect("module");
+        let module =
+            block_on_tokio(http_library::build_http_library_module(schema, None)).expect("module");
         let handlers = http_library::http_library_handlers(&module);
+        let config =
+            apply_config_overrides(PyKernelConfig::default(), request_ttl_secs, max_request_bytes_unauth);
+        let kernel_handler =
+            crate::http::host_handler_with_public_keys(crate::auth::PublicKeyStore::default());
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
             .with_library_module(module, handlers)
+            .with_kernel_handler(kernel_handler)
+            .with_txn_ttl(config.limits.txn_ttl)
             .finish();
-        Ok(Self::from_kernel(kernel))
+        Ok(Self::from_kernel(kernel, config))
     }
 
     #[classmethod]
-    #[pyo3(signature = (schema_json, token_host, actor_id, public_key_b64, data_dir=None))]
+    #[pyo3(signature = (schema_json, token_host, actor_id, public_key_b64, data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
     pub fn with_library_schema_rjwt(
         _cls: &Bound<'_, PyType>,
         schema_json: &str,
@@ -494,6 +567,8 @@ impl KernelHandle {
         actor_id: &str,
         public_key_b64: &str,
         data_dir: Option<PathBuf>,
+        request_ttl_secs: Option<u64>,
+        max_request_bytes_unauth: Option<usize>,
     ) -> PyResult<Self> {
         use std::str::FromStr;
 
@@ -505,8 +580,8 @@ impl KernelHandle {
         ))
         .expect("module");
         let handlers = http_library::http_library_handlers(&module);
-        let host = Link::from_str(token_host)
-            .map_err(|_| PyValueError::new_err("invalid token host"))?;
+        let host =
+            Link::from_str(token_host).map_err(|_| PyValueError::new_err("invalid token host"))?;
         let key_bytes = STANDARD
             .decode(public_key_b64)
             .map_err(|_| PyValueError::new_err("invalid public key base64"))?;
@@ -514,22 +589,33 @@ impl KernelHandle {
             .map_err(|_| PyValueError::new_err("invalid public key"))?;
         let actor = crate::auth::Actor::with_public_key(Value::from(actor_id), verifying_key);
         let keyring = crate::auth::KeyringActorResolver::default().with_actor(host, actor);
+        let config = PyKernelConfig {
+            data_dir,
+            ..PyKernelConfig::default()
+        };
+        let config = apply_config_overrides(config, request_ttl_secs, max_request_bytes_unauth);
+        let kernel_handler =
+            crate::http::host_handler_with_public_keys(crate::auth::PublicKeyStore::default());
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
             .with_library_module(module, handlers)
             .with_rjwt_keyring_token_verifier(keyring)
+            .with_kernel_handler(kernel_handler)
+            .with_txn_ttl(config.limits.txn_ttl)
             .finish();
-        Ok(Self::from_kernel(kernel))
+        Ok(Self::from_kernel(kernel, config))
     }
 
     #[classmethod]
-    #[pyo3(signature = (schema_json, dependency_root, authority, data_dir=None))]
+    #[pyo3(signature = (schema_json, dependency_root, authority, data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
     pub fn with_library_schema_and_dependency_route(
         _cls: &Bound<'_, PyType>,
         schema_json: &str,
         dependency_root: &str,
         authority: &str,
         data_dir: Option<PathBuf>,
+        request_ttl_secs: Option<u64>,
+        max_request_bytes_unauth: Option<usize>,
     ) -> PyResult<Self> {
         let authority = authority
             .parse()
@@ -542,17 +628,23 @@ impl KernelHandle {
         ))
         .expect("module");
         let handlers = http_library::http_library_handlers(&module);
+        let config = PyKernelConfig {
+            data_dir,
+            ..PyKernelConfig::default()
+        };
+        let config = apply_config_overrides(config, request_ttl_secs, max_request_bytes_unauth);
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
             .with_library_module(module, handlers)
             .with_dependency_route(dependency_root, authority)
             .with_http_rpc_gateway()
+            .with_txn_ttl(config.limits.txn_ttl)
             .finish();
-        Ok(Self::from_kernel(kernel))
+        Ok(Self::from_kernel(kernel, config))
     }
 
     #[classmethod]
-    #[pyo3(signature = (schema_json, dependency_root, authority, token_host, actor_id, public_key_b64, data_dir=None))]
+    #[pyo3(signature = (schema_json, dependency_root, authority, token_host, actor_id, public_key_b64, data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn with_library_schema_and_dependency_route_rjwt(
         _cls: &Bound<'_, PyType>,
@@ -563,6 +655,8 @@ impl KernelHandle {
         actor_id: &str,
         public_key_b64: &str,
         data_dir: Option<PathBuf>,
+        request_ttl_secs: Option<u64>,
+        max_request_bytes_unauth: Option<usize>,
     ) -> PyResult<Self> {
         use std::str::FromStr;
 
@@ -577,8 +671,8 @@ impl KernelHandle {
         ))
         .expect("module");
         let handlers = http_library::http_library_handlers(&module);
-        let host = Link::from_str(token_host)
-            .map_err(|_| PyValueError::new_err("invalid token host"))?;
+        let host =
+            Link::from_str(token_host).map_err(|_| PyValueError::new_err("invalid token host"))?;
         let key_bytes = STANDARD
             .decode(public_key_b64)
             .map_err(|_| PyValueError::new_err("invalid public key base64"))?;
@@ -586,14 +680,20 @@ impl KernelHandle {
             .map_err(|_| PyValueError::new_err("invalid public key"))?;
         let actor = crate::auth::Actor::with_public_key(Value::from(actor_id), verifying_key);
         let keyring = crate::auth::KeyringActorResolver::default().with_actor(host, actor);
+        let config = PyKernelConfig {
+            data_dir,
+            ..PyKernelConfig::default()
+        };
+        let config = apply_config_overrides(config, request_ttl_secs, max_request_bytes_unauth);
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
             .with_library_module(module, handlers)
             .with_dependency_route(dependency_root, authority)
             .with_http_rpc_gateway()
             .with_rjwt_keyring_token_verifier(keyring)
+            .with_txn_ttl(config.limits.txn_ttl)
             .finish();
-        Ok(Self::from_kernel(kernel))
+        Ok(Self::from_kernel(kernel, config))
     }
 
     #[pyo3(signature = (path, body=None, bearer_token=None))]
@@ -617,17 +717,28 @@ impl KernelHandle {
             None => None,
         };
 
-        let txn_handle = match token.as_ref() {
+        let mut txn_handle = match token.as_ref() {
             Some(token) => self
                 .txn_manager
                 .begin_with_owner(Some(&token.owner_id), Some(&token.bearer_token)),
             None => self.txn_manager.begin(),
         };
+        let read_claim = Claim::new(
+            Link::from_str(component_root).map_err(|_| PyValueError::new_err("invalid component root"))?,
+            umask::USER_READ,
+        );
+        let _ = self.txn_manager.record_claim(&txn_handle.id(), read_claim.clone());
+        txn_handle = txn_handle.with_claims(vec![read_claim]);
         let txn = self.inner.with_resolver(txn_handle.clone());
         let txn_id = txn_handle.id();
 
         let scalar = if let Some(body) = body.clone() {
             let bytes = request_body_bytes(Some(body))?;
+            if bearer_token.is_none()
+                && bytes.len() > self.config.limits.max_request_bytes_unauth
+            {
+                return Err(PyValueError::new_err("request payload too large"));
+            }
             if bytes.is_empty() {
                 Scalar::default()
             } else {
@@ -665,14 +776,19 @@ impl KernelHandle {
 
                 Ok(PyKernelResponse::new(200, None, body))
             }),
-            Err(err) if err.message().starts_with("no egress route for ") => {
+            Err(err)
+                if err.message().starts_with("no egress route for ")
+                    || err.message().starts_with("no RPC gateway configured") =>
+            {
                 let local_token = match token.as_ref() {
                     Some(token) => Some(token.clone()),
                     None => match txn_handle.raw_token() {
-                        Some(raw) => Some(
-                            self.block_on(self.inner.token_verifier().verify(raw.to_string()))
-                                .map_err(|_| PyValueError::new_err("invalid bearer token"))?,
-                        ),
+                        Some(raw) => match self
+                            .block_on(self.inner.token_verifier().verify(raw.to_string()))
+                        {
+                            Ok(ctx) => Some(ctx),
+                            Err(_) => Some(TokenContext::new(raw.to_string(), raw.to_string())),
+                        },
                         None => None,
                     },
                 };
@@ -684,9 +800,9 @@ impl KernelHandle {
                 let request = PyKernelRequest::new(
                     "GET",
                     path,
-                    bearer_token
-                        .as_deref()
-                        .map(|token| vec![("authorization".to_string(), format!("Bearer {token}"))]),
+                    bearer_token.as_deref().map(|token| {
+                        vec![("authorization".to_string(), format!("Bearer {token}"))]
+                    }),
                     body,
                 )?;
                 let request = http_request_from_py(&request)?;
@@ -719,11 +835,11 @@ impl KernelHandle {
             Err(err) => Err(PyValueError::new_err(err.message().to_string())),
         };
 
-    let _ = self.block_on(rollback_op.resolve(&txn));
-    let _ = self.txn_manager.rollback(txn_id);
+        let _ = self.block_on(rollback_op.resolve(&txn));
+        let _ = self.txn_manager.rollback(txn_id);
 
-    response
-}
+        response
+    }
 
     pub fn dispatch(&self, request: PyKernelRequest) -> PyResult<PyKernelResponse> {
         let method = request.method_enum();
@@ -732,6 +848,15 @@ impl KernelHandle {
         let body_is_none = py_body_is_none(request.body());
         let bearer = py_bearer_token(&request);
         let inbound_bearer = bearer.clone();
+        let body_bytes = if body_is_none {
+            Vec::new()
+        } else {
+            let bytes = request_body_bytes(request.body())?;
+            if bearer.is_none() && bytes.len() > self.config.limits.max_request_bytes_unauth {
+                return Ok(PyKernelResponse::new(413, None, None));
+            }
+            bytes
+        };
         let token = match bearer {
             Some(token) => Some(
                 self.block_on(self.inner.token_verifier().verify(token))
@@ -742,7 +867,12 @@ impl KernelHandle {
         let inbound_txn_id = txn_id;
         let mut minted_txn_id: Option<TxnId> = None;
         let mut minted_token: Option<String> = None;
-        let request = http_request_from_py(&request)?;
+        let mut request = http_request_from_py_with_body(&request, body_bytes.clone())?;
+        if !body_bytes.is_empty() {
+            request
+                .extensions_mut()
+                .insert(crate::http::RequestBody::new(Bytes::from(body_bytes)));
+        }
 
         match self.inner.route_request(
             method,
@@ -799,15 +929,24 @@ pub struct PyBackend {
 #[pymethods]
 impl PyBackend {
     #[new]
-    #[pyo3(signature = (lib, service, metrics=None, data_dir=None))]
+    #[pyo3(signature = (lib, service, metrics=None, data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
     pub fn new(
         lib: Py<PyAny>,
         service: Py<PyAny>,
         metrics: Option<Py<PyAny>>,
         data_dir: Option<PathBuf>,
+        request_ttl_secs: Option<u64>,
+        max_request_bytes_unauth: Option<usize>,
     ) -> Self {
         Self {
-            kernel: KernelHandle::new(lib, service, metrics, data_dir),
+            kernel: KernelHandle::new(
+                lib,
+                service,
+                metrics,
+                data_dir,
+                request_ttl_secs,
+                max_request_bytes_unauth,
+            ),
         }
     }
 
@@ -850,6 +989,7 @@ fn parse_method(method: &str) -> PyResult<Method> {
     }
 }
 
+
 fn http_request_from_py(request: &PyKernelRequest) -> PyResult<Request> {
     let method = match request.method_enum() {
         Method::Get => crate::HttpMethod::GET,
@@ -864,6 +1004,25 @@ fn http_request_from_py(request: &PyKernelRequest) -> PyResult<Request> {
     }
 
     let body_bytes = request_body_bytes(request.body())?;
+    http_request_from_py_with_body(request, body_bytes)
+}
+
+fn http_request_from_py_with_body(
+    request: &PyKernelRequest,
+    body_bytes: Vec<u8>,
+) -> PyResult<Request> {
+    let method = match request.method_enum() {
+        Method::Get => crate::HttpMethod::GET,
+        Method::Put => crate::HttpMethod::PUT,
+        Method::Post => crate::HttpMethod::POST,
+        Method::Delete => crate::HttpMethod::DELETE,
+    };
+
+    let mut builder = http::Request::builder().method(method).uri(request.path());
+    for (name, value) in request.headers() {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+
     builder
         .body(Body::from(body_bytes))
         .map_err(|err| PyValueError::new_err(err.to_string()))
@@ -918,8 +1077,12 @@ async fn py_response_from_http(response: Response) -> PyResult<PyKernelResponse>
     let body_bytes = hyper::body::to_bytes(response.into_body())
         .await
         .map_err(|err| PyValueError::new_err(err.to_string()))?;
-    let body = if body_bytes.is_empty() || status >= 400 {
+    let body = if body_bytes.is_empty() {
         None
+    } else if status >= 400 {
+        Some(Python::with_gil(|py| {
+            PyStateHandle::new(PyBytes::new_bound(py, &body_bytes).into_py(py))
+        }))
     } else {
         let state = decode_state_from_bytes(body_bytes.to_vec())?;
         Some(py_state_handle_from_state(state)?)
@@ -993,8 +1156,8 @@ pub(crate) fn py_bearer_token(request: &PyKernelRequest) -> Option<String> {
 #[cfg(all(test, feature = "pyo3", feature = "http-server", feature = "wasm"))]
 mod tests {
     use super::*;
-    use futures::FutureExt;
     use crate::{Body, Request, Response, StatusCode};
+    use futures::FutureExt;
     use hyper::body::to_bytes;
     use pathlink::Link;
     use std::{net::TcpListener, str::FromStr};
@@ -1169,10 +1332,9 @@ mod tests {
         let bytes = wasm_module();
         let initial =
             tc_ir::LibrarySchema::new(Link::from_str("/lib/initial").unwrap(), "0.0.1", vec![]);
-        let module =
-            crate::library::http::build_http_library_module(initial, None)
-                .await
-                .expect("module");
+        let module = crate::library::http::build_http_library_module(initial, None)
+            .await
+            .expect("module");
         let handlers = crate::library::http::http_library_handlers(&module);
 
         let remote_kernel: crate::Kernel = crate::Kernel::builder()
@@ -1239,10 +1401,9 @@ mod tests {
             "0.1.0",
             vec![Link::from_str(dependency_root).unwrap()],
         );
-        let local_module =
-            crate::library::http::build_http_library_module(local_schema, None)
-                .await
-                .expect("module");
+        let local_module = crate::library::http::build_http_library_module(local_schema, None)
+            .await
+            .expect("module");
         let local_handlers = crate::library::http::http_library_handlers(&local_module);
 
         let local_kernel: Kernel = crate::Kernel::builder()
@@ -1256,12 +1417,8 @@ mod tests {
             .finish();
 
         let remote_txn = remote_kernel.txn_manager().begin();
-        let owner_id = remote_txn
-            .owner_id()
-            .expect("remote txn owner");
-        let bearer = remote_txn
-            .raw_token()
-            .expect("remote txn bearer token");
+        let owner_id = remote_txn.owner_id().expect("remote txn owner");
+        let bearer = remote_txn.raw_token().expect("remote txn bearer token");
         let _ = local_kernel.txn_manager().interpret_request(
             Some(remote_txn.id()),
             Some(owner_id),
@@ -1269,9 +1426,7 @@ mod tests {
         );
         let txn = local_kernel.with_resolver(remote_txn);
         let op = OpRef::Get((
-            tc_ir::Subject::Link(
-                Link::from_str("/lib/example-devco/example/0.1.0/hello").unwrap(),
-            ),
+            tc_ir::Subject::Link(Link::from_str("/lib/example-devco/example/0.1.0/hello").unwrap()),
             tc_ir::Scalar::default(),
         ));
 
@@ -1294,10 +1449,9 @@ mod tests {
             "0.1.0",
             vec![Link::from_str("/lib").unwrap()],
         );
-        let local_module =
-            crate::library::http::build_http_library_module(local_schema, None)
-                .await
-                .expect("module");
+        let local_module = crate::library::http::build_http_library_module(local_schema, None)
+            .await
+            .expect("module");
         let local_handlers = crate::library::http::http_library_handlers(&local_module);
 
         let local_kernel: Kernel = crate::Kernel::builder()
@@ -1377,12 +1531,11 @@ pub(crate) fn request_body_bytes(body: Option<PyStateHandle>) -> PyResult<Vec<u8
         let value = handle.value();
         let any = value.bind(py);
         if let Some(state) = try_extract_state(any)? {
-            match state {
-                State::None | State::Scalar(Scalar::Value(Value::None)) => return Ok(Vec::new()),
-                _ => {
-                    return encode_state_to_bytes(state);
-                }
+            if state.is_none() {
+                return Ok(Vec::new());
             }
+
+            return encode_state_to_bytes(state);
         }
         if let Ok(bytes) = any.downcast::<PyBytes>() {
             Ok(bytes.as_bytes().to_vec())
@@ -1414,9 +1567,10 @@ fn try_extract_state(any: &Bound<'_, PyAny>) -> PyResult<Option<State>> {
 }
 
 pub(crate) fn encode_state_to_bytes(state: State) -> PyResult<Vec<u8>> {
-    match state {
-        State::None | State::Scalar(Scalar::Value(Value::None)) => Ok(Vec::new()),
-        other => encode_state_via_destream(other),
+    if state.is_none() {
+        Ok(Vec::new())
+    } else {
+        encode_state_via_destream(state)
     }
 }
 
@@ -1438,14 +1592,14 @@ async fn encode_state_via_destream_async(state: State) -> Result<Vec<u8>, String
 fn py_body_is_none(body: Option<PyStateHandle>) -> bool {
     match body {
         None => true,
-        Some(handle) => matches!(
-            Python::with_gil(|py| {
-                let value = handle.value();
-                let any = value.bind(py);
-                try_extract_state(any)
-            }),
-            Ok(Some(State::None)) | Ok(Some(State::Scalar(Scalar::Value(Value::None))))
-        ),
+        Some(handle) => Python::with_gil(|py| {
+            let value = handle.value();
+            let any = value.bind(py);
+            match try_extract_state(any) {
+                Ok(Some(state)) => state.is_none(),
+                _ => false,
+            }
+        }),
     }
 }
 #[pyclass(name = "State", subclass)]

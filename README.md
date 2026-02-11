@@ -16,6 +16,9 @@ the kernel is compiled, every adapter clones the same instance so `/lib`,
   and route registries shared with WASM loaders.
 - `txn`, `storage`, `pyo3_runtime`, and optional `wasm` support modules (including
   transaction-bound RPC resolution for `OpRef`/`Scalar::Ref` without adapter types).
+- `op_plan` – the single host-side compiler for `OpDef` DAG planning; every adapter
+  and installer must reuse this entrypoint rather than building execution plans
+  in transport-specific code.
 - Reference docs: see `AGENTS.md` for design guardrails and
   `PROTOCOL_COMPATIBILITY.md` for adapter expectations.
 
@@ -29,6 +32,13 @@ library (false). Requests that resolve to a leaf return the library schema.
 Replication exports are always leaf-scoped: the export endpoint checks for a
 claim on the concrete library ID (publisher + name + version) and returns only
 that library’s payload. There is no global export of all libraries.
+
+## Execution semantics
+
+- **Scoped numeric ops:** During OpDef execution, a `POST` OpRef whose subject is a scoped ref
+  like `$x/add` mirrors v1 behavior: the left operand is the subject ref (`$x`), and the right
+  operand is passed as `{ "r": <number> }`. This implicit-left rule is only defined for `add`.
+  All other subjects must resolve to concrete links (or `$self` in a library context).
 
 ## Building & testing
 

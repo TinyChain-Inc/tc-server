@@ -36,11 +36,7 @@ impl EgressPolicy {
     /// Configure a default authority used to resolve a path-only dependency URI.
     ///
     /// This also implicitly whitelists the same authority for that dependency.
-    pub fn route_dependency(
-        &mut self,
-        dependency_root: impl Into<String>,
-        authority: SocketAddr,
-    ) {
+    pub fn route_dependency(&mut self, dependency_root: impl Into<String>, authority: SocketAddr) {
         let dependency_root = dependency_root.into();
         let authority = authority.to_string();
         let rule = self.deps.entry(dependency_root).or_default();

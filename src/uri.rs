@@ -1,6 +1,12 @@
 pub(crate) const LIB_ROOT: &str = "/lib";
+pub(crate) const LIB_ROOT_PREFIX: &str = "/lib/";
 pub(crate) const SERVICE_ROOT: &str = "/service";
+pub(crate) const SERVICE_ROOT_PREFIX: &str = "/service/";
 pub(crate) const HOST_ROOT: &str = "/host";
+pub(crate) const HOST_ROOT_PREFIX: &str = "/host/";
+pub(crate) const HOST_METRICS: &str = "/host/metrics";
+pub(crate) const HOST_PUBLIC_KEY: &str = "/host/public_key";
+pub(crate) const HOST_LIBRARY_EXPORT: &str = "/host/library/export";
 pub(crate) const HEALTHZ: &str = "/healthz";
 
 pub(crate) fn normalize_path(path: &str) -> &str {
@@ -26,15 +32,15 @@ pub(crate) fn component_root(path: &str) -> Option<&str> {
         return Some(path);
     }
 
-    if path.starts_with("/lib/") {
+    if path.starts_with(LIB_ROOT_PREFIX) {
         return component_root_with_segments(path, 4).or(Some(LIB_ROOT));
     }
 
-    if path.starts_with("/service/") {
+    if path.starts_with(SERVICE_ROOT_PREFIX) {
         return component_root_with_segments(path, 5).or(Some(SERVICE_ROOT));
     }
 
-    if path.starts_with("/host/") {
+    if path.starts_with(HOST_ROOT_PREFIX) {
         return Some(HOST_ROOT);
     }
 

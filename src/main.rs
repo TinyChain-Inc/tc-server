@@ -4,6 +4,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(feature = "mdns")]
 use std::time::Duration;
 
@@ -65,6 +66,11 @@ struct Config {
     #[arg(long = "no-replicate", action = clap::ArgAction::SetTrue)]
     no_replicate: bool,
 
+    #[arg(long = "max-request-bytes", env = "TC_MAX_REQUEST_BYTES", default_value_t = 1 * 1024 * 1024)]
+    max_request_bytes: usize,
+
+    #[arg(long = "request-ttl-secs", env = "TC_REQUEST_TTL_SECS", default_value_t = 3)]
+    request_ttl_secs: u64,
 }
 
 impl Config {
@@ -108,7 +114,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kernel_config = HttpKernelConfig::default()
         .with_data_dir(config.data_dir.clone())
         .with_initial_schema(tinychain::library::default_library_schema())
-        .with_host_id(config.host_id.clone());
+        .with_host_id(config.host_id.clone())
+        .with_txn_ttl(Duration::from_secs(config.request_ttl_secs))
+        .with_max_request_bytes_unauth(config.max_request_bytes);
 
     let keyring = KeyringActorResolver::default();
     let public_keys = PublicKeyStore::default();
@@ -129,12 +137,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ok_handler(),
         health_handler(),
         move |registry, builder| {
-            let public: Arc<dyn KernelHandler> =
-                Arc::new(host_handler_with_public_keys(public_keys_for_kernel.clone()));
+            let public: Arc<dyn KernelHandler> = Arc::new(host_handler_with_public_keys(
+                public_keys_for_kernel.clone(),
+            ));
             let token: Arc<dyn KernelHandler> =
                 Arc::new(replication_token_handler(issuer_for_kernel.clone()));
-            let export: Arc<dyn KernelHandler> =
-                Arc::new(export_handler(registry.clone()));
+            let export: Arc<dyn KernelHandler> = Arc::new(export_handler(registry.clone()));
             let host_handler = combined_host_handler(public, token, export);
 
             builder
@@ -177,29 +185,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let server = HttpServer::new(kernel);
+    let server = HttpServer::new_with_limits(kernel, config.max_request_bytes);
     server.serve(bind).await?;
     Ok(())
 }
 
 fn ok_handler() -> impl KernelHandler {
-    |_req: Request<Body>| async move {
-        Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::empty())
-            .expect("ok response")
+    |_req: Request<Body>| {
+        async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .expect("ok response")
+        }
+        .boxed()
     }
-    .boxed()
 }
 
 fn health_handler() -> impl KernelHandler {
-    |_req: Request<Body>| async move {
-        Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::from("ok"))
-            .expect("health response")
+    |_req: Request<Body>| {
+        async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from("ok"))
+                .expect("health response")
+        }
+        .boxed()
     }
-    .boxed()
 }
 
 async fn replicate_from_peers(
@@ -339,7 +351,7 @@ async fn discover_k8s_peers(dns: &str, port: u16) -> Vec<String> {
 #[cfg(feature = "mdns")]
 async fn discover_mdns_peers(timeout_duration: Duration) -> Vec<String> {
     use mdns_sd::{ServiceDaemon, ServiceEvent};
-    use tokio::time::{timeout, Instant};
+    use tokio::time::{Instant, timeout};
 
     let mut out = Vec::new();
     let daemon = match ServiceDaemon::new() {

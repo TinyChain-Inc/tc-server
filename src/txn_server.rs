@@ -74,7 +74,7 @@ impl TxnServer {
 
 impl Default for TxnServer {
     fn default() -> Self {
-        Self::new(Duration::from_secs(30))
+        Self::new(Duration::from_secs(3))
     }
 }
 

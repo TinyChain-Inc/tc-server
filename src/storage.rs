@@ -1,12 +1,16 @@
-use std::{io, path::{Path, PathBuf}, str::FromStr};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
-use freqfs::{Cache, DirEntry, DirLock, FileLock, FileLoad, FileSave};
+use crate::ir::{IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE};
+use freqfs::{Cache, DirEntry, DirLock, FileLoad, FileLock, FileSave};
 use pathlink::Link;
-use serde::{Deserialize, Serialize};
 use safecast::AsType;
+use serde::{Deserialize, Serialize};
 use tc_error::{TCError, TCResult};
 use tc_ir::LibrarySchema;
-use crate::ir::{IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const LIB_ROOT: &str = "lib";
@@ -113,7 +117,11 @@ impl LibraryStore {
         write_file(&self.dir, SCHEMA_FILE, bytes).await
     }
 
-    pub async fn persist_artifact(&self, schema: &LibrarySchema, artifact: &Artifact) -> TCResult<()> {
+    pub async fn persist_artifact(
+        &self,
+        schema: &LibrarySchema,
+        artifact: &Artifact,
+    ) -> TCResult<()> {
         if artifact.content_type == WASM_ARTIFACT_CONTENT_TYPE {
             return self.persist_wasm_library(schema, &artifact.bytes).await;
         }
@@ -180,9 +188,10 @@ pub(crate) async fn load_library_root(root: PathBuf) -> TCResult<LibraryRoot> {
     cache.load(lib_root).map_err(map_io)
 }
 
-
-
-async fn discover_schemas(dir: &DirLock<LibraryFile>, schemas: &mut Vec<LibrarySchema>) -> TCResult<()> {
+async fn discover_schemas(
+    dir: &DirLock<LibraryFile>,
+    schemas: &mut Vec<LibrarySchema>,
+) -> TCResult<()> {
     let mut pending = vec![dir.clone()];
     while let Some(current) = pending.pop() {
         let entries = read_dir_entries(&current).await?;
@@ -202,9 +211,14 @@ async fn discover_schemas(dir: &DirLock<LibraryFile>, schemas: &mut Vec<LibraryS
     Ok(())
 }
 
-async fn read_dir_entries(dir: &DirLock<LibraryFile>) -> TCResult<Vec<(String, DirEntry<LibraryFile>)>> {
+async fn read_dir_entries(
+    dir: &DirLock<LibraryFile>,
+) -> TCResult<Vec<(String, DirEntry<LibraryFile>)>> {
     let guard = dir.read().await;
-    Ok(guard.iter().map(|(name, entry)| (name.clone(), entry.clone())).collect())
+    Ok(guard
+        .iter()
+        .map(|(name, entry)| (name.clone(), entry.clone()))
+        .collect())
 }
 
 async fn read_file(dir: &DirLock<LibraryFile>, name: &str) -> TCResult<Option<Vec<u8>>> {
@@ -264,9 +278,9 @@ fn library_segments(link: &Link) -> TCResult<Vec<String>> {
     let path = if path.starts_with('/') {
         path
     } else if let Some((_, rest)) = path.split_once("://") {
-        rest.find('/').map(|idx| &rest[idx..]).ok_or_else(|| {
-            TCError::bad_request("library id must be a path")
-        })?
+        rest.find('/')
+            .map(|idx| &rest[idx..])
+            .ok_or_else(|| TCError::bad_request("library id must be a path"))?
     } else {
         return Err(TCError::bad_request("library id must be a path"));
     };
