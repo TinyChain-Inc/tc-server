@@ -201,7 +201,7 @@ pub(super) fn is_scalar_reflect_path(target: &pathlink::Link) -> bool {
         return false;
     };
     path == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_CLASS)
-        || path == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_IF_PARTS)
+        || path == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_REF_PARTS)
         || path == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_FORM)
         || path == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_LAST_ID)
         || path == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_SCALARS)
@@ -212,7 +212,7 @@ pub(super) fn is_scalar_reflect_path_str(path: &str) -> bool {
         return false;
     };
     parsed == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_CLASS)
-        || parsed == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_IF_PARTS)
+        || parsed == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_REF_PARTS)
         || parsed == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_FORM)
         || parsed == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_LAST_ID)
         || parsed == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_SCALARS)
@@ -261,10 +261,7 @@ pub(super) async fn decode_host_state_response(
     Err(status_to_error(status, message))
 }
 
-pub(super) fn status_to_error(
-    status: hyper::StatusCode,
-    message: String,
-) -> tc_error::TCError {
+pub(super) fn status_to_error(status: hyper::StatusCode, message: String) -> tc_error::TCError {
     match status {
         hyper::StatusCode::BAD_REQUEST => tc_error::TCError::bad_request(message),
         hyper::StatusCode::CONFLICT => tc_error::TCError::conflict(message),

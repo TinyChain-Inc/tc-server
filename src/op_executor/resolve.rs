@@ -6,11 +6,12 @@ use number_general::Number;
 use pathlink::Link;
 use safecast::CastInto;
 use tc_error::{TCError, TCResult};
-use tc_ir::{Id, IfRef, Map, OpDef, OpRef, Scalar, Subject, TCRef, While};
+use tc_ir::{CondOp, ForEach, Id, IfRef, Map, OpDef, OpRef, Scalar, Subject, TCRef, While};
 use tc_state::State;
 use tc_value::Value;
 
 use crate::gateway::RpcGateway;
+use crate::op_plan::opdef_free_ids;
 
 use super::execute::execute_post_with_self;
 use super::reflect::reflect_link;
@@ -48,7 +49,11 @@ pub(super) fn resolve_scalar<'a>(
                     .ok_or_else(|| TCError::not_found(format!("unknown id ${}", id_ref.as_str()))),
                 TCRef::Op(op) => resolve_opref(op, values, txn, self_link).await,
                 TCRef::If(if_ref) => resolve_if(*if_ref, values, txn, self_link).await,
+                TCRef::Cond(cond_op) => resolve_cond(*cond_op, values, txn, self_link).await,
                 TCRef::While(while_ref) => resolve_while(*while_ref, values, txn, self_link).await,
+                TCRef::ForEach(for_each) => {
+                    resolve_for_each(*for_each, values, txn, self_link).await
+                }
             },
         }
     })
@@ -147,8 +152,8 @@ fn resolve_opref(
                                 .await?;
 
                         let is_equal = match (&left, &right) {
-                            (Value::Link(l), Value::String(r)) => l.to_string() == *r,
-                            (Value::String(l), Value::Link(r)) => *l == r.to_string(),
+                            (Value::Link(l), Value::String(r)) => l == r,
+                            (Value::String(l), Value::Link(r)) => r == l,
                             _ => left == right,
                         };
 
@@ -178,19 +183,144 @@ fn resolve_opref(
                         };
 
                         Ok(State::from(Value::Number(Number::from(left > right))))
+                    } else if segments.len() == 1
+                        && matches!(segments[0].as_str(), "and" | "or" | "xor")
+                    {
+                        let left = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
+                            TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
+                        })?;
+
+                        let State::Scalar(Scalar::Value(Value::Number(left))) = left else {
+                            return Err(TCError::bad_request(
+                                "expected boolean subject to be a number".to_string(),
+                            ));
+                        };
+
+                        let r_id: Id = "r".parse().expect("Id");
+                        let Some(r_value) = params.get(&r_id) else {
+                            return Err(TCError::bad_request(
+                                "missing boolean parameter r".to_string(),
+                            ));
+                        };
+                        let r_value =
+                            scalar_to_value(r_value.clone(), &values, &txn, self_link.as_ref())
+                                .await?;
+                        let Value::Number(right) = r_value else {
+                            return Err(TCError::bad_request(
+                                "expected boolean parameter r to be a number".to_string(),
+                            ));
+                        };
+
+                        let left_bool = left != Number::from(0);
+                        let right_bool = right != Number::from(0);
+                        let result = match segments[0].as_str() {
+                            "and" => left_bool && right_bool,
+                            "or" => left_bool || right_bool,
+                            "xor" => left_bool ^ right_bool,
+                            _ => unreachable!("boolean op checked above"),
+                        };
+                        Ok(State::from(Value::Number(Number::from(result))))
+                    } else if segments.len() == 1 && segments[0].as_str() == "not" {
+                        let left = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
+                            TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
+                        })?;
+
+                        let State::Scalar(Scalar::Value(Value::Number(left))) = left else {
+                            return Err(TCError::bad_request(
+                                "expected boolean subject to be a number".to_string(),
+                            ));
+                        };
+
+                        let left_bool = left != Number::from(0);
+                        Ok(State::from(Value::Number(Number::from(!left_bool))))
                     } else if segments.len() == 1 && segments[0].as_str() == "len" {
                         let tuple_state =
                             values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                                 TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
                             })?;
-                        let items = tuple_state_to_items(tuple_state)?;
+                        let items = tuple_state_to_items(tuple_state, "slice")?;
                         Ok(State::from(Value::Number(Number::from(items.len() as u64))))
+                    } else if segments.len() == 1 && segments[0].as_str() == "slice" {
+                        let state = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
+                            TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
+                        })?;
+                        if let State::Scalar(Scalar::Value(value)) = &state {
+                            return Err(TCError::bad_request(format!(
+                                "slice subject ${} resolved to scalar value {value:?}",
+                                id_ref.as_str()
+                            )));
+                        }
+                        let items = tuple_state_to_items(state, "slice")?;
+
+                        let start_id: Id = "start".parse().expect("Id");
+                        let stop_id: Id = "stop".parse().expect("Id");
+                        let Some(start_value) = params.get(&start_id) else {
+                            return Err(TCError::bad_request(
+                                "missing slice parameter start".to_string(),
+                            ));
+                        };
+                        let Some(stop_value) = params.get(&stop_id) else {
+                            return Err(TCError::bad_request(
+                                "missing slice parameter stop".to_string(),
+                            ));
+                        };
+
+                        let start_value =
+                            scalar_to_value(start_value.clone(), &values, &txn, self_link.as_ref())
+                                .await?;
+                        let stop_value =
+                            scalar_to_value(stop_value.clone(), &values, &txn, self_link.as_ref())
+                                .await?;
+
+                        let Value::Number(start_num) = start_value else {
+                            return Err(TCError::bad_request(
+                                "expected slice parameter start to be a number".to_string(),
+                            ));
+                        };
+                        let Value::Number(stop_num) = stop_value else {
+                            return Err(TCError::bad_request(
+                                "expected slice parameter stop to be a number".to_string(),
+                            ));
+                        };
+
+                        let len = items.len() as i64;
+                        let mut start: i64 = start_num.cast_into();
+                        let mut stop: i64 = stop_num.cast_into();
+                        if start < 0 {
+                            start += len;
+                        }
+                        if stop < 0 {
+                            stop += len;
+                        }
+                        if start < 0 {
+                            start = 0;
+                        }
+                        if stop < 0 {
+                            stop = 0;
+                        }
+                        if start > len {
+                            start = len;
+                        }
+                        if stop > len {
+                            stop = len;
+                        }
+                        if stop < start {
+                            stop = start;
+                        }
+
+                        let sliced = items
+                            .into_iter()
+                            .skip(start as usize)
+                            .take((stop - start) as usize)
+                            .map(state_to_scalar)
+                            .collect::<TCResult<Vec<_>>>()?;
+                        Ok(State::Scalar(Scalar::Tuple(sliced)))
                     } else if segments.len() == 1 && segments[0].as_str() == "head" {
                         let tuple_state =
                             values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                                 TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
                             })?;
-                        let mut items = tuple_state_to_items(tuple_state)?;
+                        let mut items = tuple_state_to_items(tuple_state, "head")?;
                         let head = items.drain(..1).next().ok_or_else(|| {
                             TCError::bad_request("cannot take head of empty tuple".to_string())
                         })?;
@@ -201,7 +331,7 @@ fn resolve_opref(
                             values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                                 TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
                             })?;
-                        let items = tuple_state_to_items(tuple_state)?;
+                        let items = tuple_state_to_items(tuple_state, "tail")?;
                         let tail = items
                             .into_iter()
                             .skip(1)
@@ -212,7 +342,7 @@ fn resolve_opref(
                         let left_state = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                             TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
                         })?;
-                        let mut left = tuple_state_to_items(left_state)?
+                        let mut left = tuple_state_to_items(left_state, "concat")?
                             .into_iter()
                             .map(state_to_scalar)
                             .collect::<TCResult<Vec<_>>>()?;
@@ -226,18 +356,16 @@ fn resolve_opref(
                         let right_state =
                             resolve_scalar(r_value.clone(), &values, &txn, self_link.as_ref())
                                 .await?;
-                        let mut right = tuple_state_to_items(right_state)?
+                        let mut right = tuple_state_to_items(right_state, "concat")?
                             .into_iter()
                             .map(state_to_scalar)
                             .collect::<TCResult<Vec<_>>>()?;
                         left.append(&mut right);
                         Ok(State::Scalar(Scalar::Tuple(left)))
                     } else if segments.len() == 1 && segments[0].as_str() == "get" {
-                        let tuple_state =
-                            values.get(id_ref.as_str()).cloned().ok_or_else(|| {
-                                TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
-                            })?;
-                        let items = tuple_state_to_items(tuple_state)?;
+                        let state = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
+                            TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
+                        })?;
 
                         let i_id: Id = "i".parse().expect("Id");
                         let Some(i_value) = params.get(&i_id) else {
@@ -248,17 +376,66 @@ fn resolve_opref(
                         let idx_value =
                             scalar_to_value(i_value.clone(), &values, &txn, self_link.as_ref())
                                 .await?;
-                        let Value::Number(idx_num) = idx_value else {
-                            return Err(TCError::bad_request(
-                                "expected get parameter i to be a number".to_string(),
-                            ));
-                        };
-                        let idx: usize = idx_num.cast_into();
-                        let item = items.get(idx).cloned().ok_or_else(|| {
-                            TCError::bad_request("tuple index out of bounds".to_string())
-                        })?;
-                        let item = state_to_scalar(item)?;
-                        Ok(State::Scalar(item))
+
+                        match state {
+                            State::Tuple(items) => {
+                                let Value::Number(idx_num) = idx_value else {
+                                    return Err(TCError::bad_request(
+                                        "expected get parameter i to be a number".to_string(),
+                                    ));
+                                };
+                                let idx: usize = idx_num.cast_into();
+                                let item = items.get(idx).cloned().ok_or_else(|| {
+                                    TCError::bad_request("tuple index out of bounds".to_string())
+                                })?;
+                                let item = state_to_scalar(item)?;
+                                Ok(State::Scalar(item))
+                            }
+                            State::Scalar(Scalar::Tuple(items)) => {
+                                let Value::Number(idx_num) = idx_value else {
+                                    return Err(TCError::bad_request(
+                                        "expected get parameter i to be a number".to_string(),
+                                    ));
+                                };
+                                let idx: usize = idx_num.cast_into();
+                                let item = items.get(idx).cloned().ok_or_else(|| {
+                                    TCError::bad_request("tuple index out of bounds".to_string())
+                                })?;
+                                Ok(State::Scalar(item))
+                            }
+                            State::Map(map) => {
+                                let Value::String(key) = idx_value else {
+                                    return Err(TCError::bad_request(
+                                        "expected get parameter i to be a string".to_string(),
+                                    ));
+                                };
+                                let id: Id = key.parse().map_err(|err| {
+                                    TCError::bad_request(format!("invalid map key: {err}"))
+                                })?;
+                                let value = map.get(&id).cloned().ok_or_else(|| {
+                                    TCError::bad_request("map key not found".to_string())
+                                })?;
+                                Ok(value)
+                            }
+                            State::Scalar(Scalar::Map(map)) => {
+                                let Value::String(key) = idx_value else {
+                                    return Err(TCError::bad_request(
+                                        "expected get parameter i to be a string".to_string(),
+                                    ));
+                                };
+                                let id: Id = key.parse().map_err(|err| {
+                                    TCError::bad_request(format!("invalid map key: {err}"))
+                                })?;
+                                let value = map.get(&id).cloned().ok_or_else(|| {
+                                    TCError::bad_request("map key not found".to_string())
+                                })?;
+                                Ok(State::Scalar(value))
+                            }
+                            other => Err(TCError::bad_request(format!(
+                                "expected tuple or map for get on ${} but found {other:?}",
+                                id_ref.as_str()
+                            ))),
+                        }
                     } else if segments.len() == 1
                         && (segments[0].as_str() == "reduce" || segments[0].as_str() == "fold")
                     {
@@ -266,7 +443,7 @@ fn resolve_opref(
                             values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                                 TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
                             })?;
-                        let items = tuple_state_to_items(tuple_state)?;
+                        let items = tuple_state_to_items(tuple_state, "slice")?;
 
                         let item_name = param_id(&params, "item_name")?;
                         let op_def =
@@ -361,8 +538,14 @@ fn scalar_to_value(
                     TCRef::If(if_ref) => {
                         resolve_if(*if_ref, &values, &txn, self_link.as_ref()).await?
                     }
+                    TCRef::Cond(cond_op) => {
+                        resolve_cond(*cond_op, &values, &txn, self_link.as_ref()).await?
+                    }
                     TCRef::While(while_ref) => {
                         resolve_while(*while_ref, &values, &txn, self_link.as_ref()).await?
+                    }
+                    TCRef::ForEach(for_each) => {
+                        resolve_for_each(*for_each, &values, &txn, self_link.as_ref()).await?
                     }
                 };
 
@@ -405,8 +588,14 @@ fn scalar_to_state(
                     .ok_or_else(|| TCError::not_found(format!("unknown id ${}", id_ref.as_str()))),
                 TCRef::Op(op) => resolve_opref(op, &values, &txn, self_link.as_ref()).await,
                 TCRef::If(if_ref) => resolve_if(*if_ref, &values, &txn, self_link.as_ref()).await,
+                TCRef::Cond(cond_op) => {
+                    resolve_cond(*cond_op, &values, &txn, self_link.as_ref()).await
+                }
                 TCRef::While(while_ref) => {
                     resolve_while(*while_ref, &values, &txn, self_link.as_ref()).await
+                }
+                TCRef::ForEach(for_each) => {
+                    resolve_for_each(*for_each, &values, &txn, self_link.as_ref()).await
                 }
             },
         }
@@ -431,6 +620,25 @@ async fn resolve_if(
     } else {
         resolve_scalar(or_else, values, txn, self_link).await
     }
+}
+
+async fn resolve_cond(
+    cond_op: CondOp,
+    values: &Arc<HashMap<Id, State>>,
+    txn: &crate::txn::TxnHandle,
+    self_link: Option<&Link>,
+) -> TCResult<State> {
+    let CondOp {
+        cond,
+        then,
+        or_else,
+    } = cond_op;
+
+    let cond_state = resolve_scalar(Scalar::from(cond), values, txn, self_link).await?;
+    let cond_value = resolve_bool_state(cond_state, values, txn, self_link).await?;
+    let op_def = if cond_value { then } else { or_else };
+    let params = values_to_params_for_opdef(values, &op_def);
+    execute_post_with_self(txn, op_def, params, self_link.cloned()).await
 }
 
 async fn resolve_while(
@@ -478,6 +686,35 @@ async fn resolve_while(
     }
 }
 
+async fn resolve_for_each(
+    for_each: ForEach,
+    values: &Arc<HashMap<Id, State>>,
+    txn: &crate::txn::TxnHandle,
+    self_link: Option<&Link>,
+) -> TCResult<State> {
+    let ForEach {
+        items,
+        op,
+        item_name,
+    } = for_each;
+
+    let items = resolve_scalar(items, values, txn, self_link).await?;
+    let items = tuple_state_to_items(items, "for_each")?;
+    let op_def = resolve_scalar(op, values, txn, self_link)
+        .await
+        .and_then(state_to_opdef)?;
+
+    let mut last_state: Option<State> = None;
+    for item in items {
+        let mut params = Map::new();
+        params.insert(item_name.clone(), item);
+        last_state =
+            Some(execute_post_with_self(txn, op_def.clone(), params, self_link.cloned()).await?);
+    }
+
+    Ok(last_state.unwrap_or_default())
+}
+
 fn while_params(state: State) -> TCResult<Map<State>> {
     let mut params = Map::new();
     let state_id: Id = "state"
@@ -485,6 +722,16 @@ fn while_params(state: State) -> TCResult<Map<State>> {
         .map_err(|err| TCError::internal(format!("invalid while state id: {err}")))?;
     params.insert(state_id, state);
     Ok(params)
+}
+
+fn values_to_params_for_opdef(values: &Arc<HashMap<Id, State>>, opdef: &OpDef) -> Map<State> {
+    let mut params = Map::new();
+    for id in opdef_free_ids(opdef) {
+        if let Some(value) = values.get(&id) {
+            params.insert(id.clone(), value.clone());
+        }
+    }
+    params
 }
 
 fn state_to_opdef(state: State) -> TCResult<OpDef> {
@@ -499,12 +746,20 @@ fn state_to_opdef(state: State) -> TCResult<OpDef> {
     }
 }
 
-fn tuple_state_to_items(state: State) -> TCResult<Vec<State>> {
+fn tuple_state_to_items(state: State, context: &str) -> TCResult<Vec<State>> {
     match state {
         State::Tuple(items) => Ok(items),
         State::Scalar(Scalar::Tuple(items)) => Ok(items.into_iter().map(State::Scalar).collect()),
+        State::Map(map) => Ok(map
+            .into_iter()
+            .map(|(id, _value)| State::Scalar(Scalar::Value(Value::String(id.to_string()))))
+            .collect()),
+        State::Scalar(Scalar::Map(map)) => Ok(map
+            .into_iter()
+            .map(|(id, _value)| State::Scalar(Scalar::Value(Value::String(id.to_string()))))
+            .collect()),
         other => Err(TCError::bad_request(format!(
-            "expected tuple for reduce but found {other:?}"
+            "expected tuple or map for {context} but found {other:?}"
         ))),
     }
 }

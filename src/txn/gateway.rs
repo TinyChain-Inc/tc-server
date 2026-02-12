@@ -17,7 +17,9 @@ impl RpcGateway for TxnHandle {
     ) -> BoxFuture<'static, tc_error::TCResult<State>> {
         match &self.resolver {
             Some(resolver) => resolver.get(target, txn, key),
-            None => Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) }),
+            None => {
+                Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) })
+            }
         }
     }
 
@@ -30,7 +32,9 @@ impl RpcGateway for TxnHandle {
     ) -> BoxFuture<'static, tc_error::TCResult<()>> {
         match &self.resolver {
             Some(resolver) => resolver.put(target, txn, key, value),
-            None => Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) }),
+            None => {
+                Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) })
+            }
         }
     }
 
@@ -42,7 +46,9 @@ impl RpcGateway for TxnHandle {
     ) -> BoxFuture<'static, tc_error::TCResult<State>> {
         match &self.resolver {
             Some(resolver) => resolver.post(target, txn, params),
-            None => Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) }),
+            None => {
+                Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) })
+            }
         }
     }
 
@@ -54,7 +60,9 @@ impl RpcGateway for TxnHandle {
     ) -> BoxFuture<'static, tc_error::TCResult<()>> {
         match &self.resolver {
             Some(resolver) => resolver.delete(target, txn, key),
-            None => Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) }),
+            None => {
+                Box::pin(async move { Err(TCError::bad_gateway("no txn resolver configured")) })
+            }
         }
     }
 }

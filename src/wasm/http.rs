@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
 use tc_error::{ErrorKind, TCError, TCResult};
-use tc_ir::{parse_route_path, LibrarySchema, TxnHeader};
+use tc_ir::{LibrarySchema, TxnHeader, parse_route_path};
 use tokio::sync::Mutex;
 
+use crate::KernelHandler;
 use crate::http::{Body, Request, Response, StatusCode};
 use crate::library::{RouteMetadata, SchemaRoutes};
 use crate::resolve::Resolve;
 use crate::txn::TxnHandle;
-use crate::KernelHandler;
 
-use super::decode::try_decode_wasm_ref;
 use super::WasmLibrary;
+use super::decode::try_decode_wasm_ref;
 
 pub fn http_wasm_route_handler_from_bytes(
     bytes: Vec<u8>,
@@ -116,9 +116,19 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request) -> Respo
                             "cannot resolve TCRef::If without a scope".to_string(),
                         ));
                     }
+                    tc_ir::TCRef::Cond(_) => {
+                        return error_response(TCError::bad_request(
+                            "cannot resolve TCRef::Cond without a scope".to_string(),
+                        ));
+                    }
                     tc_ir::TCRef::While(_) => {
                         return error_response(TCError::bad_request(
                             "cannot resolve TCRef::While without a scope".to_string(),
+                        ));
+                    }
+                    tc_ir::TCRef::ForEach(_) => {
+                        return error_response(TCError::bad_request(
+                            "cannot resolve TCRef::ForEach without a scope".to_string(),
                         ));
                     }
                 }

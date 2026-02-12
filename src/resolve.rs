@@ -62,9 +62,19 @@ impl Resolve for TCRef {
                     "cannot resolve TCRef::If without a scope".to_string(),
                 ))
             }),
+            TCRef::Cond(_) => Box::pin(async move {
+                Err(TCError::bad_request(
+                    "cannot resolve TCRef::Cond without a scope".to_string(),
+                ))
+            }),
             TCRef::While(_) => Box::pin(async move {
                 Err(TCError::bad_request(
                     "cannot resolve TCRef::While without a scope".to_string(),
+                ))
+            }),
+            TCRef::ForEach(_) => Box::pin(async move {
+                Err(TCError::bad_request(
+                    "cannot resolve TCRef::ForEach without a scope".to_string(),
                 ))
             }),
         }

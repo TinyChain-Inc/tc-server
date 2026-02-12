@@ -17,4 +17,4 @@ pub use client::{
     request_replication_token,
 };
 pub use handler::{export_handler, replication_token_handler};
-pub use issuer::{parse_psk_keys, parse_psk_list, ReplicationIssuer};
+pub use issuer::{ReplicationIssuer, parse_psk_keys, parse_psk_list};

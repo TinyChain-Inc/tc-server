@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use crate::Request;
 use crate::egress::EgressPolicy;
 use crate::library::{LibraryHandlers, LibraryRegistry};
 use crate::txn_server::TxnServer;
-use crate::Request;
 
 use super::{Kernel, KernelHandler};
 

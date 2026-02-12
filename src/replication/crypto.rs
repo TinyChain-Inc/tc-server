@@ -1,8 +1,8 @@
 use aes_gcm_siv::aead::rand_core::RngCore;
 use aes_gcm_siv::aead::{Aead, OsRng};
 use aes_gcm_siv::{Aes256GcmSiv, Key, KeyInit, Nonce};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use tc_error::{TCError, TCResult};
 
@@ -12,9 +12,7 @@ struct EncryptedPayload {
     data: String,
 }
 
-pub(super) fn decode_encrypted_payload(
-    body: hyper::body::Bytes,
-) -> TCResult<(Vec<u8>, Vec<u8>)> {
+pub(super) fn decode_encrypted_payload(body: hyper::body::Bytes) -> TCResult<(Vec<u8>, Vec<u8>)> {
     if body.is_empty() || body.iter().all(|b| b.is_ascii_whitespace()) {
         return Err(TCError::bad_request("empty replication payload"));
     }
@@ -74,11 +72,7 @@ pub(super) fn decrypt_path(
         .map_err(|cause| TCError::bad_request(format!("invalid UTF8: {cause}")))
 }
 
-fn decrypt_token(
-    cipher: &Aes256GcmSiv,
-    nonce: &[u8],
-    token_encrypted: &[u8],
-) -> TCResult<String> {
+fn decrypt_token(cipher: &Aes256GcmSiv, nonce: &[u8], token_encrypted: &[u8]) -> TCResult<String> {
     match cipher.decrypt(Nonce::from_slice(nonce), token_encrypted) {
         Ok(token_decrypted) => String::from_utf8(token_decrypted)
             .map_err(|cause| TCError::bad_request(format!("invalid UTF8: {cause}"))),

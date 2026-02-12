@@ -49,7 +49,7 @@ impl Default for KernelLimits {
     fn default() -> Self {
         Self {
             txn_ttl: std::time::Duration::from_secs(3),
-            max_request_bytes_unauth: 1 * 1024 * 1024,
+            max_request_bytes_unauth: 1024 * 1024,
         }
     }
 }

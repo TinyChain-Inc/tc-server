@@ -31,7 +31,10 @@ fn enforces_canonical_claim_position() {
         pathlink::Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim"),
         umask::USER_EXEC,
     );
-    let auth_claim = Claim::new(pathlink::Link::from_str("/lib/auth").expect("auth link"), Mode::all());
+    let auth_claim = Claim::new(
+        pathlink::Link::from_str("/lib/auth").expect("auth link"),
+        Mode::all(),
+    );
 
     let host = pathlink::Link::from_str("/host").expect("host link");
     let actor = Actor::new(Value::from("actor-a"));

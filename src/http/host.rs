@@ -32,7 +32,7 @@ pub fn host_handler_with_public_keys(
                     };
 
                     parsed == LinkPathBuf::from(tc_ir::SCALAR_REFLECT_CLASS)
-                        || parsed == LinkPathBuf::from(tc_ir::SCALAR_REFLECT_IF_PARTS)
+                        || parsed == LinkPathBuf::from(tc_ir::SCALAR_REFLECT_REF_PARTS)
                         || parsed == LinkPathBuf::from(tc_ir::OPDEF_REFLECT_FORM)
                         || parsed == LinkPathBuf::from(tc_ir::OPDEF_REFLECT_LAST_ID)
                         || parsed == LinkPathBuf::from(tc_ir::OPDEF_REFLECT_SCALARS)

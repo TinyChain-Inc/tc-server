@@ -3,7 +3,7 @@ use std::str::FromStr;
 use pathlink::PathSegment;
 use serde::Deserialize;
 use tc_error::{TCError, TCResult};
-use tc_ir::{parse_route_path, LibrarySchema};
+use tc_ir::{LibrarySchema, parse_route_path};
 
 #[derive(Debug)]
 pub(super) struct WasmManifest {

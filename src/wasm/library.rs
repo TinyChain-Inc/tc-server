@@ -5,7 +5,7 @@ use tc_error::{TCError, TCResult};
 use tc_ir::{LibrarySchema, TxnHeader};
 use wasmtime::{Engine, Func, Instance, Memory, Module, Store};
 
-use super::manifest::{decode_manifest, format_path, RouteBinding};
+use super::manifest::{RouteBinding, decode_manifest, format_path};
 
 /// Loads a TinyChain-compatible Library embedded in a WASM module.
 pub struct WasmLibrary {

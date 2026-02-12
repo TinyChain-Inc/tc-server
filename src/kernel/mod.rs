@@ -1,5 +1,6 @@
 mod builder;
 mod dispatch;
+#[allow(clippy::module_inception)]
 mod kernel;
 mod resolver;
 mod types;

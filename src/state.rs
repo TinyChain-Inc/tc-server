@@ -68,13 +68,13 @@ async fn number_add(req: Request) -> Response {
     if let Ok(params) = params {
         if let Some(value) = params.get(&l_key) {
             left = match value {
-                Scalar::Value(Value::Number(number)) => Some(number.clone()),
+                Scalar::Value(Value::Number(number)) => Some(*number),
                 _ => return bad_request_response("expected l to be a number"),
             };
         }
         if let Some(value) = params.get(&r_key) {
             right = match value {
-                Scalar::Value(Value::Number(number)) => Some(number.clone()),
+                Scalar::Value(Value::Number(number)) => Some(*number),
                 _ => return bad_request_response("expected r to be a number"),
             };
         }
@@ -85,11 +85,11 @@ async fn number_add(req: Request) -> Response {
             Ok(items) => match items.as_slice() {
                 [l, r] => {
                     left = match l {
-                        Scalar::Value(Value::Number(number)) => Some(number.clone()),
+                        Scalar::Value(Value::Number(number)) => Some(*number),
                         _ => return bad_request_response("expected l to be a number"),
                     };
                     right = match r {
-                        Scalar::Value(Value::Number(number)) => Some(number.clone()),
+                        Scalar::Value(Value::Number(number)) => Some(*number),
                         _ => return bad_request_response("expected r to be a number"),
                     };
                 }
@@ -184,13 +184,13 @@ async fn number_gt(req: Request) -> Response {
     if let Ok(params) = params {
         if let Some(value) = params.get(&l_key) {
             left = match value {
-                Scalar::Value(Value::Number(number)) => Some(number.clone()),
+                Scalar::Value(Value::Number(number)) => Some(*number),
                 _ => return bad_request_response("expected l to be a number"),
             };
         }
         if let Some(value) = params.get(&r_key) {
             right = match value {
-                Scalar::Value(Value::Number(number)) => Some(number.clone()),
+                Scalar::Value(Value::Number(number)) => Some(*number),
                 _ => return bad_request_response("expected r to be a number"),
             };
         }
@@ -201,11 +201,11 @@ async fn number_gt(req: Request) -> Response {
             Ok(items) => match items.as_slice() {
                 [l, r] => {
                     left = match l {
-                        Scalar::Value(Value::Number(number)) => Some(number.clone()),
+                        Scalar::Value(Value::Number(number)) => Some(*number),
                         _ => return bad_request_response("expected l to be a number"),
                     };
                     right = match r {
-                        Scalar::Value(Value::Number(number)) => Some(number.clone()),
+                        Scalar::Value(Value::Number(number)) => Some(*number),
                         _ => return bad_request_response("expected r to be a number"),
                     };
                 }
@@ -271,6 +271,7 @@ async fn number_gt_get(req: Request) -> Response {
     state_response(state)
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_number_param(raw: &str) -> Result<Number, Response> {
     let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(
         raw.as_bytes(),

@@ -308,15 +308,13 @@ pub fn http_ir_route_handler_from_bytes(
     }
 
     async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> {
-        if let Some(body) = req.extensions().get::<RequestBody>() {
-            if !body.is_empty() {
-                let stream =
-                    futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(body.clone_bytes())]);
-                return destream_json::try_decode((), stream)
-                    .await
-                    .map(Some)
-                    .map_err(|err| TCError::bad_request(err.to_string()));
-            }
+        if let Some(body) = req.extensions().get::<RequestBody>() && !body.is_empty() {
+            let stream =
+                futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(body.clone_bytes())]);
+            return destream_json::try_decode((), stream)
+                .await
+                .map(Some)
+                .map_err(|err| TCError::bad_request(err.to_string()));
         }
 
         let query = req.uri().query().unwrap_or("");

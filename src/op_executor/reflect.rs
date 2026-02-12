@@ -36,18 +36,33 @@ pub(super) fn reflect_link(
             };
             State::from(Value::Link(class))
         }
-        ReflectKind::ScalarIfParts => {
+        ReflectKind::ScalarRefParts => {
             let Scalar::Ref(r) = &scalar else {
                 return Ok(Some(State::Scalar(Scalar::Tuple(vec![]))));
             };
-            let TCRef::If(if_ref) = r.as_ref() else {
-                return Ok(Some(State::Scalar(Scalar::Tuple(vec![]))));
+            let parts = match r.as_ref() {
+                TCRef::If(if_ref) => Scalar::Tuple(vec![
+                    Scalar::from(if_ref.cond.clone()),
+                    if_ref.then.clone(),
+                    if_ref.or_else.clone(),
+                ]),
+                TCRef::Cond(cond_op) => Scalar::Tuple(vec![
+                    Scalar::from(cond_op.cond.clone()),
+                    Scalar::Op(cond_op.then.clone()),
+                    Scalar::Op(cond_op.or_else.clone()),
+                ]),
+                TCRef::While(while_ref) => Scalar::Tuple(vec![
+                    while_ref.cond.clone(),
+                    while_ref.closure.clone(),
+                    while_ref.state.clone(),
+                ]),
+                TCRef::ForEach(for_each) => Scalar::Tuple(vec![
+                    for_each.items.clone(),
+                    for_each.op.clone(),
+                    Scalar::Value(Value::String(for_each.item_name.to_string())),
+                ]),
+                _ => Scalar::Tuple(vec![]),
             };
-            let parts = Scalar::Tuple(vec![
-                Scalar::from(if_ref.cond.clone()),
-                if_ref.then.clone(),
-                if_ref.or_else.clone(),
-            ]);
             State::Scalar(parts)
         }
         ReflectKind::OpDefForm => {
@@ -73,7 +88,9 @@ pub(super) fn reflect_link(
             State::Scalar(Scalar::Value(value))
         }
         ReflectKind::OpDefScalars => {
-            let opdef = opdef_from_scalar_param(&scalar)?;
+            let Scalar::Op(opdef) = &scalar else {
+                return Ok(Some(State::Scalar(Scalar::Tuple(vec![]))));
+            };
             let scalars = opdef.walk_scalars().cloned().collect();
             State::Scalar(Scalar::Tuple(scalars))
         }
@@ -84,7 +101,7 @@ pub(super) fn reflect_link(
 
 enum ReflectKind {
     ScalarClass,
-    ScalarIfParts,
+    ScalarRefParts,
     OpDefForm,
     OpDefLastId,
     OpDefScalars,
@@ -94,7 +111,7 @@ fn reflect_kind(link: &Link) -> Option<ReflectKind> {
     let normalized = link.path().to_string();
     match normalized.trim_start_matches('/') {
         "state/scalar/reflect/class" => Some(ReflectKind::ScalarClass),
-        "state/scalar/reflect/if_parts" => Some(ReflectKind::ScalarIfParts),
+        "state/scalar/reflect/ref_parts" => Some(ReflectKind::ScalarRefParts),
         "state/scalar/op/reflect/form" => Some(ReflectKind::OpDefForm),
         "state/scalar/op/reflect/last_id" => Some(ReflectKind::OpDefLastId),
         "state/scalar/op/reflect/scalars" => Some(ReflectKind::OpDefScalars),
@@ -143,7 +160,9 @@ fn class_from_opdef(opdef: &OpDef) -> Link {
 fn class_from_tcref(tc_ref: &TCRef) -> Link {
     let path = match tc_ref {
         TCRef::If(_) => pathlink::PathBuf::from(tc_ir::TCREF_IF).to_string(),
+        TCRef::Cond(_) => pathlink::PathBuf::from(tc_ir::TCREF_COND).to_string(),
         TCRef::While(_) => pathlink::PathBuf::from(tc_ir::TCREF_WHILE).to_string(),
+        TCRef::ForEach(_) => pathlink::PathBuf::from(tc_ir::TCREF_FOR_EACH).to_string(),
         TCRef::Id(_) => pathlink::PathBuf::from(tc_ir::SCALAR_REF_PREFIX).to_string(),
         TCRef::Op(opref) => match opref {
             OpRef::Get(_) => pathlink::PathBuf::from(tc_ir::OPREF_GET).to_string(),

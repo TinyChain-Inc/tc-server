@@ -13,7 +13,7 @@ use tc_value::Value;
 
 enum ReflectPath {
     ScalarClass,
-    ScalarIfParts,
+    ScalarRefParts,
     OpDefForm,
     OpDefLastId,
     OpDefScalars,
@@ -24,8 +24,8 @@ fn reflect_path(path: &str) -> Option<ReflectPath> {
     if normalized == "state/scalar/reflect/class" {
         return Some(ReflectPath::ScalarClass);
     }
-    if normalized == "state/scalar/reflect/if_parts" {
-        return Some(ReflectPath::ScalarIfParts);
+    if normalized == "state/scalar/reflect/ref_parts" {
+        return Some(ReflectPath::ScalarRefParts);
     }
 
     if normalized == "state/scalar/op/reflect/form" {
@@ -73,7 +73,7 @@ async fn dispatch(req: Request) -> Response {
 
     match reflect_path(req.uri().path()) {
         Some(ReflectPath::ScalarClass) => return scalar_class(req).await,
-        Some(ReflectPath::ScalarIfParts) => return scalar_if_parts(req).await,
+        Some(ReflectPath::ScalarRefParts) => return scalar_ref_parts(req).await,
         Some(ReflectPath::OpDefForm) => return opdef_form(req).await,
         Some(ReflectPath::OpDefLastId) => return opdef_last_id(req).await,
         Some(ReflectPath::OpDefScalars) => return opdef_scalars(req).await,
@@ -100,7 +100,8 @@ async fn decode_params(req: Request) -> Result<Map<Scalar>, Response> {
     Ok(params)
 }
 
-fn extract_scalar<'a>(params: &'a Map<Scalar>) -> Result<&'a Scalar, Response> {
+#[allow(clippy::result_large_err)]
+fn extract_scalar(params: &Map<Scalar>) -> Result<&Scalar, Response> {
     let scalar_key = Id::from_str("scalar")
         .map_err(|err| internal_error_response(&format!("invalid scalar key id: {err}")))?;
     let op_key = Id::from_str("op")
@@ -172,7 +173,9 @@ fn class_from_opdef(opdef: &OpDef) -> Link {
 fn class_from_tcref(tc_ref: &TCRef) -> Link {
     let path = match tc_ref {
         TCRef::If(_) => pathlink::PathBuf::from(tc_ir::TCREF_IF).to_string(),
+        TCRef::Cond(_) => pathlink::PathBuf::from(tc_ir::TCREF_COND).to_string(),
         TCRef::While(_) => pathlink::PathBuf::from(tc_ir::TCREF_WHILE).to_string(),
+        TCRef::ForEach(_) => pathlink::PathBuf::from(tc_ir::TCREF_FOR_EACH).to_string(),
         TCRef::Id(_) => pathlink::PathBuf::from(tc_ir::SCALAR_REF_PREFIX).to_string(),
         TCRef::Op(opref) => match opref {
             OpRef::Get(_) => pathlink::PathBuf::from(tc_ir::OPREF_GET).to_string(),
@@ -184,7 +187,7 @@ fn class_from_tcref(tc_ref: &TCRef) -> Link {
     Link::from_str(&path).expect("tcref class link")
 }
 
-async fn scalar_if_parts(req: Request) -> Response {
+async fn scalar_ref_parts(req: Request) -> Response {
     let params = match decode_params(req).await {
         Ok(params) => params,
         Err(resp) => return resp,
@@ -199,15 +202,30 @@ async fn scalar_if_parts(req: Request) -> Response {
         return state_response(State::Scalar(Scalar::Tuple(vec![])));
     };
 
-    let TCRef::If(if_ref) = r.as_ref() else {
-        return state_response(State::Scalar(Scalar::Tuple(vec![])));
+    let parts = match r.as_ref() {
+        TCRef::If(if_ref) => Scalar::Tuple(vec![
+            Scalar::from(if_ref.cond.clone()),
+            if_ref.then.clone(),
+            if_ref.or_else.clone(),
+        ]),
+        TCRef::Cond(cond_op) => Scalar::Tuple(vec![
+            Scalar::from(cond_op.cond.clone()),
+            Scalar::Op(cond_op.then.clone()),
+            Scalar::Op(cond_op.or_else.clone()),
+        ]),
+        TCRef::While(while_ref) => Scalar::Tuple(vec![
+            while_ref.cond.clone(),
+            while_ref.closure.clone(),
+            while_ref.state.clone(),
+        ]),
+        TCRef::ForEach(for_each) => Scalar::Tuple(vec![
+            for_each.items.clone(),
+            for_each.op.clone(),
+            Scalar::Value(Value::String(for_each.item_name.to_string())),
+        ]),
+        _ => Scalar::Tuple(vec![]),
     };
 
-    let parts = Scalar::Tuple(vec![
-        Scalar::from(if_ref.cond.clone()),
-        if_ref.then.clone(),
-        if_ref.or_else.clone(),
-    ]);
     state_response(State::Scalar(parts))
 }
 

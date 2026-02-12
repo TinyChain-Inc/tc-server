@@ -290,6 +290,7 @@ impl KernelHandle {
 
     #[classmethod]
     #[pyo3(signature = (schema_json, token_host, actor_id, public_key_b64, data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_library_schema_rjwt(
         _cls: &Bound<'_, PyType>,
         schema_json: &str,

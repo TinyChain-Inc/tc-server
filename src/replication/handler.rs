@@ -1,19 +1,17 @@
 use std::sync::Arc;
 
-use aes_gcm_siv::aead::rand_core::RngCore;
 use aes_gcm_siv::aead::OsRng;
+use aes_gcm_siv::aead::rand_core::RngCore;
 use futures::FutureExt;
 use hyper::body::to_bytes;
 use hyper::{Body, Request, Response, StatusCode};
 
-use crate::library::{encode_install_payload_bytes, LibraryRegistry};
-use crate::txn::TxnHandle;
 use crate::KernelHandler;
+use crate::library::{LibraryRegistry, encode_install_payload_bytes};
+use crate::txn::TxnHandle;
 
-use super::crypto::{
-    decode_encrypted_payload, encode_encrypted_payload, encrypt_token_with_key,
-};
-use super::{ReplicationIssuer, LIBRARY_EXPORT_PATH, TOKEN_PATH};
+use super::crypto::{decode_encrypted_payload, encode_encrypted_payload, encrypt_token_with_key};
+use super::{LIBRARY_EXPORT_PATH, ReplicationIssuer, TOKEN_PATH};
 
 pub fn replication_token_handler(issuer: Arc<ReplicationIssuer>) -> impl KernelHandler {
     move |req: Request<Body>| {

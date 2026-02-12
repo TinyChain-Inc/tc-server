@@ -99,6 +99,12 @@ impl OpPlan {
     }
 }
 
+pub fn opdef_free_ids(opdef: &tc_ir::OpDef) -> HashSet<Id> {
+    let mut deps = HashSet::new();
+    opdef_requires(opdef, &mut deps);
+    deps
+}
+
 fn scalar_requires(scalar: &Scalar, deps: &mut HashSet<Id>) {
     match scalar {
         Scalar::Ref(r) => match r.as_ref() {
@@ -113,10 +119,19 @@ fn scalar_requires(scalar: &Scalar, deps: &mut HashSet<Id>) {
                 scalar_requires(&if_ref.then, deps);
                 scalar_requires(&if_ref.or_else, deps);
             }
+            TCRef::Cond(cond_op) => {
+                tcref_requires(&cond_op.cond, deps);
+                opdef_requires(&cond_op.then, deps);
+                opdef_requires(&cond_op.or_else, deps);
+            }
             TCRef::While(while_ref) => {
                 scalar_requires(&while_ref.cond, deps);
                 scalar_requires(&while_ref.closure, deps);
                 scalar_requires(&while_ref.state, deps);
+            }
+            TCRef::ForEach(for_each) => {
+                scalar_requires(&for_each.items, deps);
+                scalar_requires(&for_each.op, deps);
             }
         },
         Scalar::Map(map) => {
@@ -146,10 +161,19 @@ fn tcref_requires(r: &TCRef, deps: &mut HashSet<Id>) {
             scalar_requires(&if_ref.then, deps);
             scalar_requires(&if_ref.or_else, deps);
         }
+        TCRef::Cond(cond_op) => {
+            tcref_requires(&cond_op.cond, deps);
+            opdef_requires(&cond_op.then, deps);
+            opdef_requires(&cond_op.or_else, deps);
+        }
         TCRef::While(while_ref) => {
             scalar_requires(&while_ref.cond, deps);
             scalar_requires(&while_ref.closure, deps);
             scalar_requires(&while_ref.state, deps);
+        }
+        TCRef::ForEach(for_each) => {
+            scalar_requires(&for_each.items, deps);
+            scalar_requires(&for_each.op, deps);
         }
     }
 }
@@ -176,6 +200,24 @@ fn opref_requires(op: &OpRef, deps: &mut HashSet<Id>) {
             scalar_requires(key, deps);
         }
     }
+}
+
+fn opdef_requires(opdef: &tc_ir::OpDef, deps: &mut HashSet<Id>) {
+    let mut defined = HashSet::new();
+    for (id, _scalar) in opdef.form() {
+        defined.insert(id.clone());
+    }
+
+    let mut required = HashSet::new();
+    for scalar in opdef.walk_scalars() {
+        scalar_requires(scalar, &mut required);
+    }
+
+    for id in defined {
+        required.remove(&id);
+    }
+
+    deps.extend(required);
 }
 
 fn subject_requires(subject: &Subject, deps: &mut HashSet<Id>) {
