@@ -77,8 +77,10 @@ pub(crate) async fn parse_body(
     let body_bytes = to_bytes(body)
         .await
         .map_err(|_| internal_error_response("failed to read request body"))?;
-    if let Some(limit) = max_bytes && body_bytes.len() > limit {
-        return Err(payload_too_large_response("request payload too large"));
+    if let Some(limit) = max_bytes {
+        if body_bytes.len() > limit {
+            return Err(payload_too_large_response("request payload too large"));
+        }
     }
 
     let body_is_none = body_bytes.iter().all(|b| b.is_ascii_whitespace());
