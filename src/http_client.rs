@@ -277,8 +277,8 @@ fn encode_state_body(state: State) -> TCResult<Vec<u8>> {
 fn encode_params_body(params: Map<State>) -> TCResult<Vec<u8>> {
     use futures::TryStreamExt;
 
-    let stream =
-        destream_json::encode(params).map_err(|err| TCError::bad_request(err.to_string()))?;
+    let stream = destream_json::encode(State::Map(params))
+        .map_err(|err| TCError::bad_request(err.to_string()))?;
     futures::executor::block_on(async move {
         stream
             .map_err(|err| std::io::Error::other(err.to_string()))

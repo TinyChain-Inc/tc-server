@@ -144,8 +144,15 @@ impl Kernel {
 
         let is_component_root =
             component_root(path).is_some_and(|component_root| component_root == path);
+        let token_has_txn_claim = |token: &crate::auth::TokenContext| {
+            token
+                .claims
+                .iter()
+                .any(|(_, _, claim)| claim.link.to_string().starts_with("/txn/"))
+        };
+
         let (owner_id, bearer_token, claims) = match (txn_id, token) {
-            (Some(txn_id), Some(token)) if !token.claims.is_empty() => {
+            (Some(txn_id), Some(token)) if token_has_txn_claim(token) => {
                 let owner_id = crate::txn::owner_id_from_token(txn_id, token)?;
                 let claims = token
                     .claims
