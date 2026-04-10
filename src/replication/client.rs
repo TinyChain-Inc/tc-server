@@ -16,7 +16,10 @@ use super::crypto::{
     decode_encrypted_payload, decrypt_token_with_key, encode_encrypted_payload,
     encrypt_path_with_key,
 };
-use super::{LIBRARY_EXPORT_PATH, TOKEN_PATH};
+use super::{
+    FORWARDED_HEADER, LIBRARY_EXPORT_PATH, PEERS_HEARTBEAT_PATH, PEERS_JOIN_PATH, PEERS_LEAVE_PATH,
+    PEERS_PATH, TOKEN_PATH,
+};
 
 pub async fn fetch_library_export(peer: &str, token: &str) -> TCResult<Option<InstallArtifacts>> {
     let mut url = peer_to_url(peer)?;
@@ -179,6 +182,117 @@ pub async fn request_replication_token(
     Err(TCError::bad_gateway("no replication key succeeded"))
 }
 
+pub fn normalize_peer(peer: &str) -> TCResult<String> {
+    let url = peer_to_url(peer)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| TCError::bad_request("peer URL missing host"))?;
+    let mut normalized = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        normalized.push(':');
+        normalized.push_str(&port.to_string());
+    }
+    Ok(normalized)
+}
+
+pub async fn register_with_peer(
+    seed: &str,
+    joiner: &str,
+    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+) -> TCResult<Vec<String>> {
+    post_encrypted_peer_action(seed, PEERS_JOIN_PATH, joiner, keys).await?;
+    list_peer_cluster(seed).await
+}
+
+pub async fn leave_peer_cluster(
+    seed: &str,
+    peer: &str,
+    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+) -> TCResult<()> {
+    post_encrypted_peer_action(seed, PEERS_LEAVE_PATH, peer, keys).await
+}
+
+pub async fn heartbeat_peer(
+    seed: &str,
+    peer: &str,
+    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+) -> TCResult<()> {
+    post_encrypted_peer_action(seed, PEERS_HEARTBEAT_PATH, peer, keys).await
+}
+
+pub async fn list_peer_cluster(seed: &str) -> TCResult<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct PeerList {
+        peers: Vec<String>,
+    }
+
+    let mut url = peer_to_url(seed)?;
+    url.set_path(PEERS_PATH);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(url.as_str())
+        .body(Body::empty())
+        .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
+
+    let response = hyper::Client::new()
+        .request(req)
+        .await
+        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+
+    let status = response.status();
+    let body_bytes = to_bytes(response.into_body())
+        .await
+        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+
+    if !status.is_success() {
+        return Err(TCError::bad_gateway(format!(
+            "peer {seed} list request failed with status {status}"
+        )));
+    }
+
+    let listing: PeerList = serde_json::from_slice(&body_bytes)
+        .map_err(|err| TCError::bad_gateway(format!("invalid peer list response: {err}")))?;
+
+    listing
+        .peers
+        .into_iter()
+        .map(|peer| normalize_peer(&peer))
+        .collect()
+}
+
+pub(crate) async fn push_install_payload(
+    peer: &str,
+    token: &str,
+    payload: Vec<u8>,
+) -> TCResult<()> {
+    let mut url = peer_to_url(peer)?;
+    url.set_path(crate::uri::LIB_ROOT);
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(url.as_str())
+        .header(hyper::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(FORWARDED_HEADER, "1")
+        .body(Body::from(payload))
+        .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
+
+    let response = hyper::Client::new()
+        .request(req)
+        .await
+        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(TCError::bad_gateway(format!(
+            "peer {peer} install failed with status {}",
+            response.status()
+        )))
+    }
+}
+
 fn peer_to_url(peer: &str) -> TCResult<Url> {
     let value = if peer.contains("://") {
         peer.to_string()
@@ -187,6 +301,47 @@ fn peer_to_url(peer: &str) -> TCResult<Url> {
     };
 
     Url::parse(&value).map_err(|err| TCError::bad_request(format!("invalid peer url: {err}")))
+}
+
+async fn post_encrypted_peer_action(
+    seed: &str,
+    path: &str,
+    peer: &str,
+    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+) -> TCResult<()> {
+    let peer = normalize_peer(peer)?;
+    let mut url = peer_to_url(seed)?;
+    url.set_path(path);
+
+    for key in keys {
+        let (nonce, encrypted_peer) = encrypt_path_with_key(&peer, key)?;
+        let body = encode_encrypted_payload(&nonce, &encrypted_peer)?;
+        let req = Request::builder()
+            .method("POST")
+            .uri(url.as_str())
+            .body(Body::from(body))
+            .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
+
+        let response = hyper::Client::new()
+            .request(req)
+            .await
+            .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        let body = to_bytes(response.into_body())
+            .await
+            .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+        let message = String::from_utf8_lossy(&body);
+        return Err(TCError::bad_gateway(format!(
+            "peer action {path} failed with status {status}: {message}"
+        )));
+    }
+
+    Err(TCError::bad_gateway("peer action failed for all PSK keys"))
 }
 
 fn build_export_request(url: Url, token: &str) -> TCResult<Request<Body>> {

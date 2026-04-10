@@ -25,8 +25,10 @@ use tinychain::http::{
 };
 use tinychain::kernel::KernelHandler;
 use tinychain::replication::{
-    ReplicationIssuer, discover_library_paths, export_handler, fetch_library_export,
-    parse_psk_keys, parse_psk_list, replication_token_handler, request_replication_token,
+    PEERS_HEARTBEAT_PATH, PEERS_JOIN_PATH, PEERS_LEAVE_PATH, PEERS_PATH, PeerMembership,
+    ReplicationIssuer, announce_self_to_cluster, export_handler,
+    live_replicating_install_put_handler, parse_psk_keys, parse_psk_list, peer_membership_handler,
+    replicate_from_peers, replication_token_handler,
 };
 
 const DEFAULT_BIND: &str = "0.0.0.0:8702";
@@ -280,34 +282,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         public_keys.clone(),
     ));
 
-    let keyring_for_kernel = keyring.clone();
-    let issuer_for_kernel = issuer.clone();
-    let public_keys_for_kernel = public_keys.clone();
-    let installer_policy_for_kernel = installer_policy.clone();
-    let (kernel, registry) = build_http_kernel_and_registry_with_config_and_builder(
-        kernel_config,
-        ok_handler(),
-        health_handler(),
-        move |registry, builder| {
-            let public: Arc<dyn KernelHandler> = Arc::new(host_handler_with_public_keys(
-                public_keys_for_kernel.clone(),
-            ));
-            let token: Arc<dyn KernelHandler> =
-                Arc::new(replication_token_handler(issuer_for_kernel.clone()));
-            let export: Arc<dyn KernelHandler> = Arc::new(export_handler(registry.clone()));
-            let host_handler = combined_host_handler(public, token, export);
-            let verifier = TrustedInstallerTokenVerifier::new(
-                RjwtTokenVerifier::new(Arc::new(keyring_for_kernel)),
-                installer_policy_for_kernel,
-            );
-
-            builder
-                .with_kernel_handler(host_handler)
-                .with_token_verifier(verifier)
-        },
-    )
-    .await?;
-
     let mut peers = config.peers.clone();
 
     if let Some(k8s_dns) = &config.k8s_dns {
@@ -324,9 +298,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     peers = dedupe_peers(peers);
     peers.retain(|peer| !is_self(peer, bind.ip(), config.advertise_ip, bind.port()));
+    peers = peers
+        .into_iter()
+        .filter_map(|peer| tinychain::replication::normalize_peer(&peer).ok())
+        .collect();
+
+    let membership = PeerMembership::new(peers.clone());
+
+    let keyring_for_kernel = keyring.clone();
+    let issuer_for_kernel = issuer.clone();
+    let public_keys_for_kernel = public_keys.clone();
+    let installer_policy_for_kernel = installer_policy.clone();
+    let membership_for_kernel = membership.clone();
+    let keys_for_kernel = keys.clone();
+    let (kernel, registry) = build_http_kernel_and_registry_with_config_and_builder(
+        kernel_config,
+        ok_handler(),
+        health_handler(),
+        move |registry, builder| {
+            let public: Arc<dyn KernelHandler> = Arc::new(host_handler_with_public_keys(
+                public_keys_for_kernel.clone(),
+            ));
+            let token: Arc<dyn KernelHandler> =
+                Arc::new(replication_token_handler(issuer_for_kernel.clone()));
+            let export: Arc<dyn KernelHandler> = Arc::new(export_handler(registry.clone()));
+            let peers_handler: Arc<dyn KernelHandler> = Arc::new(peer_membership_handler(
+                membership_for_kernel.clone(),
+                issuer_for_kernel.clone(),
+            ));
+            let host_handler = combined_host_handler(public, token, export, peers_handler);
+            let verifier = TrustedInstallerTokenVerifier::new(
+                RjwtTokenVerifier::new(Arc::new(keyring_for_kernel)),
+                installer_policy_for_kernel,
+            );
+            let live_put = live_replicating_install_put_handler(
+                registry.clone(),
+                membership_for_kernel.clone(),
+                keys_for_kernel.clone(),
+            );
+
+            builder
+                .with_kernel_handler(host_handler)
+                .with_lib_put_handler(live_put)
+                .with_token_verifier(verifier)
+        },
+    )
+    .await?;
 
     if config.replicate && !peers.is_empty() {
         replicate_from_peers(&registry, &peers, issuer.keys()).await;
+    }
+
+    if let Some(self_peer) = self_peer(bind, config.advertise_ip) {
+        announce_self_to_cluster(&membership, &self_peer, issuer.keys()).await;
     }
 
     #[cfg(feature = "mdns")]
@@ -370,63 +394,40 @@ fn health_handler() -> impl KernelHandler {
     }
 }
 
-async fn replicate_from_peers(
-    registry: &Arc<tinychain::library::LibraryRegistry>,
-    peers: &[String],
-    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-) {
-    for peer in peers {
-        let library_paths = match discover_library_paths(peer).await {
-            Ok(paths) => paths,
-            Err(err) => {
-                eprintln!("replication from {peer} failed: {err}");
-                continue;
-            }
-        };
-
-        for path in library_paths {
-            let token = match request_replication_token(peer, &path, keys).await {
-                Ok(token) => token,
-                Err(err) => {
-                    eprintln!("replication from {peer} failed: {err}");
-                    continue;
-                }
-            };
-
-            match fetch_library_export(peer, &token).await {
-                Ok(Some(payload)) => {
-                    if let Err(err) = registry.install_payload(payload).await {
-                        eprintln!("replication from {peer} failed: {}", err.message());
-                    } else {
-                        eprintln!("replicated library {path} from {peer}");
-                    }
-                }
-                Ok(None) => eprintln!("peer {peer} has no exportable library for {path}"),
-                Err(err) => eprintln!("replication from {peer} failed: {err}"),
-            }
-        }
-    }
-}
-
 fn combined_host_handler(
     public: Arc<dyn KernelHandler>,
     token: Arc<dyn KernelHandler>,
     export: Arc<dyn KernelHandler>,
+    peers: Arc<dyn KernelHandler>,
 ) -> impl KernelHandler {
     move |req: Request<Body>| {
         let path = req.uri().path().to_string();
         let public = Arc::clone(&public);
         let token = Arc::clone(&token);
         let export = Arc::clone(&export);
+        let peers = Arc::clone(&peers);
         async move {
             match path.as_str() {
                 "/" => token.call(req).await,
                 "/host/library/export" => export.call(req).await,
+                PEERS_PATH | PEERS_JOIN_PATH | PEERS_LEAVE_PATH | PEERS_HEARTBEAT_PATH => {
+                    peers.call(req).await
+                }
                 _ => public.call(req).await,
             }
         }
         .boxed()
     }
+}
+
+fn self_peer(bind: SocketAddr, advertise_ip: Option<IpAddr>) -> Option<String> {
+    let ip = if bind.ip().is_unspecified() {
+        advertise_ip
+    } else {
+        Some(bind.ip())
+    }?;
+
+    Some(format!("http://{}:{}", ip, bind.port()))
 }
 
 fn flatten_list(items: Vec<String>) -> Vec<String> {
