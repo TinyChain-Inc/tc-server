@@ -1,18 +1,24 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use clap::Parser;
 use futures::FutureExt;
 use hyper::{Body, Request, Response, StatusCode};
+use serde::Deserialize;
 use tc_error::{TCError, TCResult};
+use tc_value::Value;
 
 use pathlink::Link;
-use tinychain::auth::{KeyringActorResolver, PublicKeyStore};
+use tinychain::auth::{
+    KeyringActorResolver, PublicKeyStore, RjwtTokenVerifier, TokenContext, TokenVerifier,
+};
 use tinychain::http::{
     HttpKernelConfig, HttpServer, build_http_kernel_and_registry_with_config_and_builder,
     host_handler_with_public_keys,
@@ -27,6 +33,125 @@ const DEFAULT_BIND: &str = "0.0.0.0:8702";
 const DEFAULT_DATA_DIR: &str = "/tmp/tinychain";
 #[cfg(feature = "mdns")]
 const SERVICE_TYPE: &str = "_tinychain._tcp.local.";
+
+#[derive(Clone, Debug, Deserialize)]
+struct TrustedInstaller {
+    host: String,
+    actor_id: String,
+    public_key_b64: String,
+    #[serde(default, alias = "allowed_lib_roots")]
+    allowed_lib_prefixes: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct TrustedInstallerPolicy {
+    by_actor: HashMap<(String, String), Vec<String>>,
+}
+
+impl TrustedInstallerPolicy {
+    fn from_installers(installers: &[TrustedInstaller]) -> TCResult<Self> {
+        let mut by_actor = HashMap::new();
+
+        for installer in installers {
+            let host = Link::from_str(&installer.host).map_err(|err| {
+                TCError::bad_request(format!("invalid trusted installer host: {err}"))
+            })?;
+            let actor_id = installer.actor_id.trim();
+            if actor_id.is_empty() {
+                return Err(TCError::bad_request(
+                    "trusted installer actor_id must not be empty",
+                ));
+            }
+
+            let mut prefixes = Vec::new();
+            for prefix in &installer.allowed_lib_prefixes {
+                prefixes.push(normalize_lib_prefix(prefix)?);
+            }
+
+            if prefixes.is_empty() {
+                return Err(TCError::bad_request(format!(
+                    "trusted installer {actor_id} must define at least one allowed_lib_prefix"
+                )));
+            }
+
+            by_actor.insert((host.to_string(), actor_id.to_string()), prefixes);
+        }
+
+        Ok(Self { by_actor })
+    }
+
+    fn validate_context(&self, ctx: &TokenContext) -> Result<(), tinychain::txn::TxnError> {
+        if self.by_actor.is_empty() {
+            return Ok(());
+        }
+
+        for (host, actor_id, claim) in &ctx.claims {
+            let path = claim.link.to_string();
+
+            if path.starts_with("/txn/") {
+                continue;
+            }
+
+            // Replication tokens are host-internal and issued by the kernel.
+            if host == "/host" {
+                continue;
+            }
+
+            let Some(prefixes) = self.by_actor.get(&(host.clone(), actor_id.clone())) else {
+                return Err(tinychain::txn::TxnError::Unauthorized);
+            };
+
+            if !path.starts_with("/lib/") {
+                return Err(tinychain::txn::TxnError::Unauthorized);
+            }
+
+            if !prefixes
+                .iter()
+                .any(|prefix| path_matches_prefix(&path, prefix))
+            {
+                return Err(tinychain::txn::TxnError::Unauthorized);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct TrustedInstallerTokenVerifier {
+    inner: RjwtTokenVerifier,
+    policy: TrustedInstallerPolicy,
+}
+
+impl TrustedInstallerTokenVerifier {
+    fn new(inner: RjwtTokenVerifier, policy: TrustedInstallerPolicy) -> Self {
+        Self { inner, policy }
+    }
+}
+
+impl TokenVerifier for TrustedInstallerTokenVerifier {
+    fn verify(
+        &self,
+        bearer_token: String,
+    ) -> futures::future::BoxFuture<'static, Result<TokenContext, tinychain::txn::TxnError>> {
+        let inner = self.inner.clone();
+        let policy = self.policy.clone();
+        async move {
+            let ctx = inner.verify(bearer_token).await?;
+            policy.validate_context(&ctx)?;
+            Ok(ctx)
+        }
+        .boxed()
+    }
+
+    fn grant(
+        &self,
+        token: TokenContext,
+        claim: tc_ir::Claim,
+    ) -> futures::future::BoxFuture<'static, Result<TokenContext, tinychain::txn::TxnError>> {
+        self.inner.grant(token, claim)
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "tc-server", about = "TinyChain node runtime")]
@@ -73,6 +198,15 @@ struct Config {
         default_value_t = 3
     )]
     request_ttl_secs: u64,
+
+    #[arg(long = "trusted-installers-json", env = "TC_TRUSTED_INSTALLERS_JSON")]
+    trusted_installers_json: Option<String>,
+
+    #[arg(
+        long = "trusted-installers-json-path",
+        env = "TC_TRUSTED_INSTALLERS_JSON_PATH"
+    )]
+    trusted_installers_json_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -98,6 +232,13 @@ impl Config {
             config.replicate = false;
         }
 
+        if config.trusted_installers_json.is_some() && config.trusted_installers_json_path.is_some()
+        {
+            return Err(TCError::bad_request(
+                "set only one of TC_TRUSTED_INSTALLERS_JSON or TC_TRUSTED_INSTALLERS_JSON_PATH",
+            ));
+        }
+
         Ok(config)
     }
 
@@ -120,8 +261,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_txn_ttl(Duration::from_secs(config.request_ttl_secs))
         .with_max_request_bytes_unauth(config.max_request_bytes);
 
-    let keyring = KeyringActorResolver::default();
+    let trusted_installers = load_trusted_installers(&config)?;
+    let installer_policy = TrustedInstallerPolicy::from_installers(&trusted_installers)?;
+
     let public_keys = PublicKeyStore::default();
+    let keyring = bootstrap_trusted_installers(
+        KeyringActorResolver::default(),
+        &public_keys,
+        &trusted_installers,
+    )?;
+
     let keys = parse_psk_keys(&config.psk_keys)?;
     let host = Link::from_str("/host")?;
     let issuer = Arc::new(ReplicationIssuer::new(
@@ -134,6 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keyring_for_kernel = keyring.clone();
     let issuer_for_kernel = issuer.clone();
     let public_keys_for_kernel = public_keys.clone();
+    let installer_policy_for_kernel = installer_policy.clone();
     let (kernel, registry) = build_http_kernel_and_registry_with_config_and_builder(
         kernel_config,
         ok_handler(),
@@ -146,10 +296,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::new(replication_token_handler(issuer_for_kernel.clone()));
             let export: Arc<dyn KernelHandler> = Arc::new(export_handler(registry.clone()));
             let host_handler = combined_host_handler(public, token, export);
+            let verifier = TrustedInstallerTokenVerifier::new(
+                RjwtTokenVerifier::new(Arc::new(keyring_for_kernel)),
+                installer_policy_for_kernel,
+            );
 
             builder
                 .with_kernel_handler(host_handler)
-                .with_rjwt_keyring_token_verifier(keyring_for_kernel)
+                .with_token_verifier(verifier)
         },
     )
     .await?;
@@ -294,6 +448,104 @@ fn flatten_psk_list(items: Vec<String>) -> Vec<String> {
         .into_iter()
         .flat_map(|value| parse_psk_list(&value))
         .collect()
+}
+
+fn load_trusted_installers(config: &Config) -> TCResult<Vec<TrustedInstaller>> {
+    let raw = match (
+        config.trusted_installers_json.as_ref(),
+        config.trusted_installers_json_path.as_ref(),
+    ) {
+        (Some(json), None) => Some(json.clone()),
+        (None, Some(path)) => Some(fs::read_to_string(path).map_err(|err| {
+            TCError::bad_request(format!("failed to read trusted installers file: {err}"))
+        })?),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err(TCError::bad_request(
+                "set only one of TC_TRUSTED_INSTALLERS_JSON or TC_TRUSTED_INSTALLERS_JSON_PATH",
+            ));
+        }
+    };
+
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_str(trimmed).map_err(|err| {
+        TCError::bad_request(format!(
+            "invalid trusted installers JSON (expected array of installer entries): {err}"
+        ))
+    })
+}
+
+fn bootstrap_trusted_installers(
+    mut keyring: KeyringActorResolver,
+    public_keys: &PublicKeyStore,
+    installers: &[TrustedInstaller],
+) -> TCResult<KeyringActorResolver> {
+    for installer in installers {
+        let host = Link::from_str(&installer.host).map_err(|err| {
+            TCError::bad_request(format!("invalid trusted installer host: {err}"))
+        })?;
+
+        let actor_id = installer.actor_id.trim();
+        if actor_id.is_empty() {
+            return Err(TCError::bad_request(
+                "trusted installer actor_id must not be empty",
+            ));
+        }
+
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(installer.public_key_b64.trim())
+            .map_err(|err| {
+                TCError::bad_request(format!("invalid installer public_key_b64: {err}"))
+            })?;
+
+        let verifying_key = rjwt::VerifyingKey::try_from(key_bytes.as_slice()).map_err(|err| {
+            TCError::bad_request(format!("invalid installer public key bytes: {err}"))
+        })?;
+
+        let actor = tinychain::auth::Actor::with_public_key(
+            Value::from(actor_id.to_string()),
+            verifying_key,
+        );
+
+        keyring = keyring.with_actor(host, actor);
+        public_keys.insert(actor_id.to_string(), verifying_key);
+    }
+
+    Ok(keyring)
+}
+
+fn normalize_lib_prefix(prefix: &str) -> TCResult<String> {
+    let trimmed = prefix.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(TCError::bad_request(
+            "trusted installer prefix must not be empty",
+        ));
+    }
+
+    if !trimmed.starts_with("/lib/") {
+        return Err(TCError::bad_request(format!(
+            "trusted installer prefix must start with /lib/: {trimmed}"
+        )));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    if path == prefix {
+        return true;
+    }
+
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn parse_replicate_env(value: &str) -> Result<bool, String> {
