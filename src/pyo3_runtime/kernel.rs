@@ -305,11 +305,10 @@ impl KernelHandle {
 
         let schema = decode_schema_from_json(schema_json)?;
         let storage_root = data_dir.clone();
-        let module = block_on_tokio(http_library::build_http_library_module(
-            schema,
-            storage_root,
-        ))
-        .expect("module");
+        let module =
+            block_on_tokio(http_library::build_http_library_module(schema, storage_root))
+                .expect("module");
+        block_on_tokio(module.hydrate_from_storage()).expect("library hydrate");
         let handlers = http_library::http_library_handlers(&module);
         let host =
             Link::from_str(token_host).map_err(|_| PyValueError::new_err("invalid token host"))?;
@@ -353,11 +352,10 @@ impl KernelHandle {
             .map_err(|_| PyValueError::new_err("invalid dependency route authority"))?;
         let schema = decode_schema_from_json(schema_json)?;
         let storage_root = data_dir.clone();
-        let module = block_on_tokio(http_library::build_http_library_module(
-            schema,
-            storage_root,
-        ))
-        .expect("module");
+        let module =
+            block_on_tokio(http_library::build_http_library_module(schema, storage_root))
+                .expect("module");
+        block_on_tokio(module.hydrate_from_storage()).expect("library hydrate");
         let handlers = http_library::http_library_handlers(&module);
         let config = PyKernelConfig {
             data_dir,
@@ -396,11 +394,10 @@ impl KernelHandle {
             .map_err(|_| PyValueError::new_err("invalid dependency route authority"))?;
         let schema = decode_schema_from_json(schema_json)?;
         let storage_root = data_dir.clone();
-        let module = block_on_tokio(http_library::build_http_library_module(
-            schema,
-            storage_root,
-        ))
-        .expect("module");
+        let module =
+            block_on_tokio(http_library::build_http_library_module(schema, storage_root))
+                .expect("module");
+        block_on_tokio(module.hydrate_from_storage()).expect("library hydrate");
         let handlers = http_library::http_library_handlers(&module);
         let host =
             Link::from_str(token_host).map_err(|_| PyValueError::new_err("invalid token host"))?;
