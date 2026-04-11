@@ -345,13 +345,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    if config.replicate && !peers.is_empty() {
-        replicate_from_peers(&registry, &peers, issuer.keys()).await;
-    }
+    let bootstrap_registry = Arc::clone(&registry);
+    let bootstrap_membership = membership.clone();
+    let bootstrap_peers = peers.clone();
+    let bootstrap_keys = keys.clone();
+    let bootstrap_replicate = config.replicate;
+    let bootstrap_self_peer = self_peer(bind, config.advertise_ip);
+    tokio::spawn(async move {
+        if bootstrap_replicate && !bootstrap_peers.is_empty() {
+            replicate_from_peers(&bootstrap_registry, &bootstrap_peers, &bootstrap_keys).await;
+        }
 
-    if let Some(self_peer) = self_peer(bind, config.advertise_ip) {
-        announce_self_to_cluster(&membership, &self_peer, issuer.keys()).await;
-    }
+        if let Some(self_peer) = bootstrap_self_peer {
+            announce_self_to_cluster(&bootstrap_membership, &self_peer, &bootstrap_keys).await;
+        }
+    });
 
     #[cfg(feature = "mdns")]
     if let Some(advertise_ip) = if config.mdns {

@@ -1,7 +1,8 @@
 use std::str::FromStr;
+use std::time::Duration;
 
 use hyper::body::to_bytes;
-use hyper::{Body, Request, StatusCode};
+use hyper::{Body, Request, Response, StatusCode};
 use number_general::Number;
 use pathlink::Link;
 use tc_error::{TCError, TCResult};
@@ -21,17 +22,29 @@ use super::{
     PEERS_PATH, TOKEN_PATH,
 };
 
+const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn send_peer_request(req: Request<Body>) -> TCResult<Response<Body>> {
+    let client = hyper::Client::new();
+    let response = tokio::time::timeout(PEER_REQUEST_TIMEOUT, client.request(req))
+        .await
+        .map_err(|_| {
+            TCError::bad_gateway(format!(
+                "peer request timed out after {}s",
+                PEER_REQUEST_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+
+    Ok(response)
+}
+
 pub async fn fetch_library_export(peer: &str, token: &str) -> TCResult<Option<InstallArtifacts>> {
     let mut url = peer_to_url(peer)?;
     url.set_path(LIBRARY_EXPORT_PATH);
 
     let req = build_export_request(url, token)?;
-    let client = hyper::Client::new();
-
-    let response = client
-        .request(req)
-        .await
-        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+    let response = send_peer_request(req).await?;
 
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(None);
@@ -67,11 +80,7 @@ pub async fn fetch_library_schema(peer: &str, path: &str) -> TCResult<tc_ir::Lib
         .body(Body::empty())
         .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-    let client = hyper::Client::new();
-    let response = client
-        .request(req)
-        .await
-        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+    let response = send_peer_request(req).await?;
 
     let status = response.status();
     let body_bytes = to_bytes(response.into_body())
@@ -97,11 +106,7 @@ pub async fn fetch_library_listing(peer: &str, path: &str) -> TCResult<tc_ir::Ma
         .body(Body::empty())
         .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-    let client = hyper::Client::new();
-    let response = client
-        .request(req)
-        .await
-        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+    let response = send_peer_request(req).await?;
 
     let status = response.status();
     let body_bytes = to_bytes(response.into_body())
@@ -148,38 +153,55 @@ pub async fn request_replication_token(
 ) -> TCResult<String> {
     let mut url = peer_to_url(peer)?;
     url.set_path(TOKEN_PATH);
+    let mut last_error = String::new();
 
-    for key in keys {
-        let (nonce, encrypted_path) = encrypt_path_with_key(path, key)?;
-        let body = encode_encrypted_payload(&nonce, &encrypted_path)?;
-        let req = Request::builder()
-            .method("GET")
-            .uri(url.as_str())
-            .body(Body::from(body))
-            .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
+    for (idx, key) in keys.iter().enumerate() {
+        for method in [hyper::Method::POST, hyper::Method::GET] {
+            let (nonce, encrypted_path) = encrypt_path_with_key(path, key)?;
+            let body = encode_encrypted_payload(&nonce, &encrypted_path)?;
+            let req = Request::builder()
+                .method(method.clone())
+                .uri(url.as_str())
+                .body(Body::from(body))
+                .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-        let client = hyper::Client::new();
-        let response = client
-            .request(req)
-            .await
-            .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+            let response = send_peer_request(req).await?;
 
-        let status = response.status();
-        let body_bytes = to_bytes(response.into_body())
-            .await
-            .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+            let status = response.status();
+            let body_bytes = to_bytes(response.into_body())
+                .await
+                .map_err(|err| TCError::bad_gateway(err.to_string()))?;
 
-        if !status.is_success() {
-            continue;
-        }
+            if !status.is_success() {
+                let message = String::from_utf8_lossy(&body_bytes);
+                last_error = format!("key[{idx}] {} status {status}: {message}", method);
+                continue;
+            }
 
-        let (nonce, encrypted_token) = decode_encrypted_payload(body_bytes)?;
-        if let Ok(token) = decrypt_token_with_key(key, &nonce, &encrypted_token) {
-            return Ok(token);
+            let (nonce, encrypted_token) = match decode_encrypted_payload(body_bytes) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    last_error = format!("key[{idx}] {} invalid encrypted payload: {err}", method);
+                    continue;
+                }
+            };
+
+            if let Ok(token) = decrypt_token_with_key(key, &nonce, &encrypted_token) {
+                return Ok(token);
+            }
+            last_error = format!("key[{idx}] {} could not decrypt token", method);
         }
     }
 
-    Err(TCError::bad_gateway("no replication key succeeded"))
+    if last_error.is_empty() {
+        Err(TCError::bad_gateway(
+            "no replication key succeeded: no keys configured",
+        ))
+    } else {
+        Err(TCError::bad_gateway(format!(
+            "no replication key succeeded: {last_error}"
+        )))
+    }
 }
 
 pub fn normalize_peer(peer: &str) -> TCResult<String> {
@@ -235,10 +257,7 @@ pub async fn list_peer_cluster(seed: &str) -> TCResult<Vec<String>> {
         .body(Body::empty())
         .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-    let response = hyper::Client::new()
-        .request(req)
-        .await
-        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+    let response = send_peer_request(req).await?;
 
     let status = response.status();
     let body_bytes = to_bytes(response.into_body())
@@ -278,10 +297,7 @@ pub(crate) async fn push_install_payload(
         .body(Body::from(payload))
         .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-    let response = hyper::Client::new()
-        .request(req)
-        .await
-        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+    let response = send_peer_request(req).await?;
 
     if response.status().is_success() {
         Ok(())
@@ -322,10 +338,7 @@ async fn post_encrypted_peer_action(
             .body(Body::from(body))
             .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-        let response = hyper::Client::new()
-            .request(req)
-            .await
-            .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+        let response = send_peer_request(req).await?;
 
         if response.status().is_success() {
             return Ok(());
@@ -433,23 +446,104 @@ fn schema_from_state(state: State) -> TCResult<tc_ir::LibrarySchema> {
 }
 
 fn listing_from_state(state: State) -> TCResult<tc_ir::Map<bool>> {
-    let State::Map(map) = state else {
-        return Err(TCError::bad_request("expected listing state map"));
+    let map = unwrap_map_state(state)?;
+    let listing_map = if map.len() == 1 {
+        if let Some((name, value)) = map.iter().next() {
+            if name.as_str() == "/state/scalar/map" {
+                unwrap_map_state(value.clone())?
+            } else {
+                map
+            }
+        } else {
+            map
+        }
+    } else {
+        map
     };
 
     let mut listing = tc_ir::Map::new();
-    for (name, value) in map {
-        let is_dir = match value {
-            State::Scalar(tc_ir::Scalar::Value(Value::Number(Number::Bool(value)))) => {
-                bool::from(value)
-            }
-            State::Scalar(tc_ir::Scalar::Value(Value::String(value))) => {
-                value.eq_ignore_ascii_case("true")
-            }
-            _ => false,
+    for (name, value) in listing_map {
+        if name.as_str() == "default" {
+            continue;
+        }
+
+        let Some(is_dir) = parse_listing_bool(value) else {
+            continue;
         };
+
         listing.insert(name, is_dir);
     }
 
     Ok(listing)
+}
+
+fn unwrap_map_state(state: State) -> TCResult<tc_ir::Map<State>> {
+    let State::Map(map) = state else {
+        return Err(TCError::bad_request("expected listing state map"));
+    };
+    Ok(map)
+}
+
+fn parse_listing_bool(value: State) -> Option<bool> {
+    match value {
+        State::Scalar(tc_ir::Scalar::Value(Value::Number(Number::Bool(value)))) => {
+            Some(bool::from(value))
+        }
+        State::Scalar(tc_ir::Scalar::Value(Value::String(value))) => {
+            Some(value.eq_ignore_ascii_case("true"))
+        }
+        State::Map(map) if map.len() == 1 => {
+            let (_, wrapped) = map.into_iter().next().expect("single-item map");
+            parse_listing_bool(wrapped)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{listing_from_state, parse_listing_bool};
+    use futures::stream;
+    use number_general::Number;
+    use tc_state::State;
+    use tc_state::null_transaction;
+
+    fn decode_state(json: &str) -> State {
+        futures::executor::block_on(async {
+            let bytes = hyper::body::Bytes::from(json.as_bytes().to_vec());
+            let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(bytes)]);
+            destream_json::try_decode(null_transaction(), stream)
+                .await
+                .expect("decode")
+        })
+    }
+
+    #[test]
+    fn parse_wrapped_listing_bool() {
+        let value = decode_state(r#"{"/state/scalar/value/number":true}"#);
+        assert_eq!(parse_listing_bool(value), Some(true));
+        assert_eq!(
+            parse_listing_bool(State::from(Number::from(true))),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn listing_ignores_typed_empty_map_default() {
+        let listing_state = decode_state(
+            r#"{
+                "/state/scalar/map": {
+                    "default": {
+                        "/state/scalar/value/number": false
+                    }
+                }
+            }"#,
+        );
+
+        let listing = listing_from_state(listing_state).expect("decode listing");
+        assert!(
+            listing.is_empty(),
+            "empty typed listing should decode empty"
+        );
+    }
 }
