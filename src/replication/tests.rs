@@ -72,6 +72,7 @@ async fn issues_replication_token() {
             encrypt_path_with_key(schema.id().to_string().as_str(), &keys[0]).expect("encrypt");
         let body = encode_encrypted_payload(&nonce, &encrypted).expect("encode body");
         let req = Request::builder()
+            .method(hyper::Method::POST)
             .uri(TOKEN_PATH)
             .body(Body::from(body))
             .expect("request");

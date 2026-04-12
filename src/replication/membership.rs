@@ -120,23 +120,4 @@ impl PeerMembership {
         out.sort_by(|left, right| left.peer.cmp(&right.peer));
         out
     }
-
-    pub fn active_identities(&self) -> Vec<PeerIdentity> {
-        let peers = self.peers.read().expect("peer membership read");
-        let mut out = peers
-            .iter()
-            .filter_map(|(peer, health)| {
-                match (health.actor_id.as_ref(), health.public_key_b64.as_ref()) {
-                    (Some(actor_id), Some(public_key_b64)) => Some(PeerIdentity {
-                        peer: peer.clone(),
-                        actor_id: actor_id.clone(),
-                        public_key_b64: public_key_b64.clone(),
-                    }),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
-        out.sort_by(|left, right| left.peer.cmp(&right.peer));
-        out
-    }
 }

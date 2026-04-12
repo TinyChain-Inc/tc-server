@@ -17,6 +17,10 @@ use tinychain::replication::{
 };
 use tinychain::storage::{Artifact, LibraryStore};
 
+mod support;
+
+use support::combine_host_handlers;
+
 #[tokio::test]
 async fn rotates_psk_keys_for_export_integration() {
     let dir = std::env::temp_dir().join(format!(
@@ -152,28 +156,4 @@ async fn start_server(
 
     tokio::time::sleep(Duration::from_millis(20)).await;
     addr
-}
-
-fn combine_host_handlers(
-    public: impl tinychain::KernelHandler,
-    token: impl tinychain::KernelHandler,
-    export: impl tinychain::KernelHandler,
-) -> impl tinychain::KernelHandler {
-    let public: Arc<dyn tinychain::KernelHandler> = Arc::new(public);
-    let token: Arc<dyn tinychain::KernelHandler> = Arc::new(token);
-    let export: Arc<dyn tinychain::KernelHandler> = Arc::new(export);
-
-    move |req: tinychain::Request| {
-        let path = req.uri().path().to_string();
-        let public = Arc::clone(&public);
-        let token = Arc::clone(&token);
-        let export = Arc::clone(&export);
-        async move {
-            match path.as_str() {
-                "/" => token.call(req).await,
-                "/host/library/export" => export.call(req).await,
-                _ => public.call(req).await,
-            }
-        }
-    }
 }

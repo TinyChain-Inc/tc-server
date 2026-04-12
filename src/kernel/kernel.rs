@@ -57,13 +57,15 @@ impl Kernel {
             return Some(self.service_handler.call(req));
         }
 
+        if path == crate::uri::HOST_ROOT || path.starts_with(crate::uri::HOST_ROOT_PREFIX) {
+            return Some(self.kernel_handler.call(req));
+        }
+
         match (method, path) {
             (Method::Get, crate::uri::LIB_ROOT) => Some(self.lib_get_handler.call(req)),
             (Method::Put, crate::uri::LIB_ROOT) => Some(self.lib_put_handler.call(req)),
             (Method::Get, "/") => Some(self.kernel_handler.call(req)),
-            (Method::Get, crate::uri::HOST_METRICS) => Some(self.kernel_handler.call(req)),
-            (Method::Get, crate::uri::HOST_PUBLIC_KEY) => Some(self.kernel_handler.call(req)),
-            (Method::Get, crate::uri::HOST_LIBRARY_EXPORT) => Some(self.kernel_handler.call(req)),
+            (Method::Post, "/") => Some(self.kernel_handler.call(req)),
             (Method::Post, path) if is_scalar_reflect_path_str(path) => {
                 Some(self.kernel_handler.call(req))
             }

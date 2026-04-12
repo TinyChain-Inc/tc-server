@@ -1,6 +1,7 @@
 mod client;
 mod crypto;
 mod handler;
+mod http_util;
 mod issuer;
 mod membership;
 mod peers;
@@ -8,18 +9,22 @@ mod peers;
 #[cfg(test)]
 mod tests;
 
-use std::str::FromStr;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::library::LibraryRegistry;
+use crate::library::{
+    LibraryRegistry, decode_authorize_and_stage_install, stage_install_error_response,
+};
 use aes_gcm_siv::{Aes256GcmSiv, Key};
 use futures::FutureExt;
 use hyper::body::to_bytes;
-use hyper::{Body, Request, Response, StatusCode};
+use hyper::{Body, Request, StatusCode};
 use parking_lot::Mutex;
 use tc_error::TCResult;
 use tc_ir::TxnId;
+
+use self::http_util::{bad_request, empty_response, text_response};
 
 pub const LIBRARY_EXPORT_PATH: &str = crate::uri::HOST_LIBRARY_EXPORT;
 pub const PEERS_PATH: &str = "/host/peers";
@@ -161,79 +166,20 @@ pub fn live_replicating_install_put_handler(
             let txn = match req.extensions().get::<crate::txn::TxnHandle>().cloned() {
                 Some(txn) => txn,
                 None => {
-                    return Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .body(Body::from("missing transaction context"))
-                        .expect("unauthorized");
+                    return text_response(StatusCode::UNAUTHORIZED, "missing transaction context");
                 }
             };
 
             let body = match to_bytes(req.into_body()).await {
                 Ok(body) => body,
-                Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Body::from(err.to_string()))
-                        .expect("bad request");
-                }
+                Err(err) => return bad_request(err.to_string()),
             };
 
-            let install_request = match crate::library::decode_install_request_bytes(&body) {
-                Ok(request) => request,
-                Err(err) => {
-                    let status = if err.is_bad_request() {
-                        StatusCode::BAD_REQUEST
-                    } else {
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    };
-                    return Response::builder()
-                        .status(status)
-                        .body(Body::from(err.message().to_string()))
-                        .expect("install error");
-                }
-            };
-
-            let schema_path = match &install_request {
-                crate::library::InstallRequest::SchemaOnly(schema) => schema.id().to_string(),
-                crate::library::InstallRequest::WithArtifacts(payload) => {
-                    payload.schema.id().to_string()
-                }
-            };
-
-            let schema_link = match pathlink::Link::from_str(&schema_path) {
-                Ok(link) => link,
-                Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Body::from(format!("invalid schema path: {err}")))
-                        .expect("bad request");
-                }
-            };
-
-            if !txn.has_claim(&schema_link, umask::USER_WRITE) {
-                return Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .body(Body::from("unauthorized library install"))
-                    .expect("unauthorized");
-            }
-
-            match registry
-                .stage_install_request(txn.id(), install_request)
-                .await
+            let schema_path = match decode_authorize_and_stage_install(&registry, &txn, &body).await
             {
-                Ok(_) => {}
-                Err(err) => {
-                    let status = if err.is_bad_request() {
-                        StatusCode::BAD_REQUEST
-                    } else {
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    };
-                    return Response::builder()
-                        .status(status)
-                        .body(Body::from(err.message().to_string()))
-                        .expect("install error");
-                }
-            }
+                Ok(schema_path) => schema_path,
+                Err(err) => return stage_install_error_response(err),
+            };
 
             if !forwarded {
                 let install_bytes = body.to_vec();
@@ -249,18 +195,12 @@ pub fn live_replicating_install_put_handler(
                     Ok(()) => tracker.mark(txn.id()),
                     Err(err) => {
                         registry.discard_txn(txn.id());
-                        return Response::builder()
-                            .status(StatusCode::BAD_GATEWAY)
-                            .body(Body::from(err.to_string()))
-                            .expect("bad gateway");
+                        return text_response(StatusCode::BAD_GATEWAY, err.to_string());
                     }
                 }
             }
 
-            Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(Body::empty())
-                .expect("no content")
+            empty_response(StatusCode::NO_CONTENT)
         }
         .boxed()
     }
@@ -275,31 +215,26 @@ pub async fn forward_install_to_peers(
 ) -> TCResult<()> {
     let token = txn
         .raw_token()
-        .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?;
-    let peers = membership.active_peers();
-    for peer in peers {
-        let _replication_token = match request_replication_token(&peer, schema_path, keys).await {
-            Ok(token) => token,
-            Err(_) => {
-                eprintln!("live replication: failed to request token from {peer}");
-                membership.mark_failure(&peer);
-                return Err(tc_error::TCError::bad_gateway(format!(
-                    "failed to request replication token from {peer}"
-                )));
-            }
-        };
+        .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?
+        .to_string();
+    let txn_id = txn.id();
 
-        match client::push_install_payload(&peer, token, txn.id(), install_payload.clone()).await {
-            Ok(()) => membership.mark_success(&peer),
-            Err(err) => {
-                eprintln!("live replication: failed to push payload to {peer}: {err}");
-                membership.mark_failure(&peer);
-                return Err(err);
-            }
+    fanout_peers(membership, "install payload", |peer| {
+        let token = token.clone();
+        let payload = install_payload.clone();
+        async move {
+            request_replication_token(&peer, schema_path, keys)
+                .await
+                .map_err(|err| {
+                    tc_error::TCError::bad_gateway(format!(
+                        "failed to request replication token from {peer}: {err}"
+                    ))
+                })?;
+
+            client::push_install_payload(&peer, &token, txn_id, payload).await
         }
-    }
-
-    Ok(())
+    })
+    .await
 }
 
 pub fn live_replicating_finalize_hook(
@@ -330,13 +265,31 @@ pub async fn forward_finalize_to_peers(
 ) -> TCResult<()> {
     let token = txn
         .raw_token()
-        .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?;
-    let peers = membership.active_peers();
-    for peer in peers {
-        match client::finalize_install_txn(&peer, token, txn.id(), commit).await {
+        .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?
+        .to_string();
+    let txn_id = txn.id();
+
+    fanout_peers(membership, "finalize transaction", |peer| {
+        let token = token.clone();
+        async move { client::finalize_install_txn(&peer, &token, txn_id, commit).await }
+    })
+    .await
+}
+
+async fn fanout_peers<F, Fut>(
+    membership: &PeerMembership,
+    operation: &str,
+    mut apply: F,
+) -> TCResult<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = TCResult<()>>,
+{
+    for peer in membership.active_peers() {
+        match apply(peer.clone()).await {
             Ok(()) => membership.mark_success(&peer),
             Err(err) => {
-                eprintln!("live replication: failed to finalize txn on {peer}: {err}");
+                eprintln!("live replication: failed to {operation} on {peer}: {err}");
                 membership.mark_failure(&peer);
                 return Err(err);
             }

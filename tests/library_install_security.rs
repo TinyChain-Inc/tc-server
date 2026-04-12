@@ -4,11 +4,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper::{Body, Client, Request, StatusCode};
+use hyper::{Body, StatusCode};
 use pathlink::Link;
-use tc_ir::{Claim, LibrarySchema, TxnId};
+use tc_ir::LibrarySchema;
 use tc_value::Value;
-use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore, Token};
+use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
 use tinychain::library::LibraryRegistry;
@@ -20,6 +20,13 @@ use tinychain::replication::{
 };
 use tinychain::storage::Artifact;
 use umask::{USER_READ, USER_WRITE};
+
+mod support;
+
+use support::{
+    begin_transaction, combine_host_handlers, finalize_install, get_library_status,
+    put_install_payload, token_for_schema, token_for_schema_and_txn,
+};
 
 #[tokio::test]
 async fn install_rejects_missing_token() {
@@ -67,6 +74,45 @@ async fn install_accepts_write_token() {
     let schema = sample_schema("/lib/example-devco/alpha/0.1.0");
     let server = start_server("write-allowed").await;
     install_library_with_write_token(&server, &schema).await;
+
+    let status = get_library_status(server.addr, &schema.id().to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn install_rejects_txn_hijack_by_different_authorized_actor() {
+    let schema = sample_schema("/lib/example-devco/txn-hijack/0.1.0");
+    let (server, attacker_actor) = start_server_with_secondary_actor("txn-hijack").await;
+
+    let owner_begin = token_for_schema(&server.actor, &schema, USER_WRITE);
+    let txn_id = begin_transaction(server.addr, owner_begin).await;
+
+    // Attacker has a valid signer + write claim for the same schema, but does not own this txn.
+    let attacker_token = token_for_schema_and_txn(&attacker_actor, &schema, USER_WRITE, txn_id);
+    let payload = install_payload_for_schema(&schema, ir_bytes_for_schema(&schema));
+    let hijack_put = put_install_payload(
+        server.addr,
+        Some(attacker_token.clone()),
+        payload.clone(),
+        Some(txn_id),
+    )
+    .await;
+    assert_eq!(hijack_put.status(), StatusCode::UNAUTHORIZED);
+
+    let hijack_finalize = finalize_install(server.addr, &attacker_token, txn_id, true).await;
+    assert_eq!(hijack_finalize.status(), StatusCode::UNAUTHORIZED);
+
+    let owner_token = token_for_schema_and_txn(&server.actor, &schema, USER_WRITE, txn_id);
+    let owner_put = put_install_payload(
+        server.addr,
+        Some(owner_token.clone()),
+        payload,
+        Some(txn_id),
+    )
+    .await;
+    assert_eq!(owner_put.status(), StatusCode::NO_CONTENT);
+    let owner_commit = finalize_install(server.addr, &owner_token, txn_id, true).await;
+    assert_eq!(owner_commit.status(), StatusCode::NO_CONTENT);
 
     let status = get_library_status(server.addr, &schema.id().to_string()).await;
     assert_eq!(status, StatusCode::OK);
@@ -284,6 +330,66 @@ async fn start_server(label: &str) -> RunningServer {
     start_server_with_storage(label, storage_dir).await
 }
 
+async fn start_server_with_secondary_actor(label: &str) -> (RunningServer, Actor) {
+    let storage_dir = temp_storage_dir(label);
+    let schema = default_library_schema();
+    let module = build_http_library_module(schema.clone(), Some(storage_dir.clone()))
+        .await
+        .expect("module");
+    module.hydrate_from_storage().await.expect("hydrate");
+    let handlers = http_library_handlers(&module);
+
+    let host = Link::from_str("/host").expect("host link");
+    let actor = Actor::new(Value::from(format!("install-tester-{label}")));
+    let secondary_actor = Actor::new(Value::from(format!("install-attacker-{label}")));
+    let keyring = KeyringActorResolver::default()
+        .with_actor(host.clone(), actor.clone())
+        .with_actor(host, secondary_actor.clone());
+    let public_keys = PublicKeyStore::default();
+    let replication_issuer = Arc::new(ReplicationIssuer::new(
+        Link::from_str("/host").expect("host link"),
+        shared_replication_keys(),
+        Actor::new(Value::from(format!("replication:security:{label}"))),
+        keyring.clone(),
+        public_keys.clone(),
+    ));
+
+    let kernel = Kernel::builder()
+        .with_host_id(format!("test-install-security-{label}"))
+        .with_http_rpc_gateway()
+        .with_rjwt_keyring_token_verifier(keyring.clone())
+        .with_library_module(module.clone(), handlers)
+        .with_service_handler(|_req| async move { hyper::Response::new(Body::empty()) })
+        .with_kernel_handler(combine_host_handlers(
+            host_handler_with_public_keys(public_keys),
+            replication_token_handler(replication_issuer),
+            export_handler(module.clone()),
+        ))
+        .with_health_handler(|_req| async move { hyper::Response::new(Body::empty()) })
+        .finish();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let addr = listener.local_addr().expect("addr");
+
+    let server = HttpServer::new(kernel);
+    let server_task = tokio::spawn(async move {
+        let _ = server.serve_listener(listener).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (
+        RunningServer {
+            label: label.to_string(),
+            addr,
+            storage_dir,
+            actor,
+            registry: module,
+            server_task: Some(server_task),
+        },
+        secondary_actor,
+    )
+}
+
 async fn start_server_with_storage(label: &str, storage_dir: PathBuf) -> RunningServer {
     let schema = default_library_schema();
     let module = build_http_library_module(schema.clone(), Some(storage_dir.clone()))
@@ -337,122 +443,6 @@ async fn start_server_with_storage(label: &str, storage_dir: PathBuf) -> Running
     }
 }
 
-fn token_for_schema(actor: &Actor, schema: &LibrarySchema, mask: umask::Mode) -> String {
-    let host = Link::from_str("/host").expect("host link");
-    let claim = Claim::new(schema.id().clone(), mask);
-    let token = Token::new(
-        host,
-        std::time::SystemTime::now(),
-        Duration::from_secs(30),
-        actor.id().clone(),
-        claim,
-    );
-    let signed = actor.sign_token(token).expect("sign token");
-    signed.into_jwt()
-}
-
-fn token_for_schema_and_txn(
-    actor: &Actor,
-    schema: &LibrarySchema,
-    mask: umask::Mode,
-    txn_id: TxnId,
-) -> String {
-    let host = Link::from_str("/host").expect("host link");
-    let claim = Claim::new(schema.id().clone(), mask);
-    let token = Token::new(
-        host.clone(),
-        std::time::SystemTime::now(),
-        Duration::from_secs(30),
-        actor.id().clone(),
-        claim,
-    );
-    let token = actor.sign_token(token).expect("sign token");
-
-    let txn_claim = Claim::new(
-        Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim link"),
-        umask::USER_EXEC | umask::USER_WRITE,
-    );
-    let token = actor
-        .consume_and_sign(token, host, txn_claim, std::time::SystemTime::now())
-        .expect("sign txn token");
-
-    token.into_jwt()
-}
-
-async fn put_install_payload(
-    addr: std::net::SocketAddr,
-    bearer: Option<String>,
-    payload: Vec<u8>,
-    txn_id: Option<TxnId>,
-) -> hyper::Response<Body> {
-    let uri = match txn_id {
-        Some(txn_id) => format!("http://{addr}/lib?txn_id={txn_id}"),
-        None => format!("http://{addr}/lib"),
-    };
-    let mut req = Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header(hyper::header::CONTENT_TYPE, "application/json");
-    if let Some(token) = bearer {
-        req = req.header(hyper::header::AUTHORIZATION, format!("Bearer {token}"));
-    }
-    let request = req.body(Body::from(payload)).expect("request");
-    Client::new().request(request).await.expect("response")
-}
-
-async fn begin_transaction(addr: std::net::SocketAddr, bearer: String) -> TxnId {
-    let request = Request::builder()
-        .method("GET")
-        .uri(format!("http://{addr}/lib"))
-        .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
-        .body(Body::empty())
-        .expect("begin request");
-    let response = Client::new()
-        .request(request)
-        .await
-        .expect("begin response");
-    assert_eq!(response.status(), StatusCode::OK);
-    let raw = response
-        .headers()
-        .get("x-tc-txn-id")
-        .and_then(|value| value.to_str().ok())
-        .expect("missing x-tc-txn-id");
-    TxnId::from_str(raw).expect("parse txn id")
-}
-
-async fn finalize_install(
-    addr: std::net::SocketAddr,
-    bearer: &str,
-    txn_id: TxnId,
-    commit: bool,
-) -> hyper::Response<Body> {
-    let method = if commit { "POST" } else { "DELETE" };
-    let request = Request::builder()
-        .method(method)
-        .uri(format!("http://{addr}/lib?txn_id={txn_id}"))
-        .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
-        .body(Body::empty())
-        .expect("finalize request");
-    Client::new()
-        .request(request)
-        .await
-        .expect("finalize response")
-}
-
-async fn get_library_status(addr: std::net::SocketAddr, path: &str) -> StatusCode {
-    let uri = format!("http://{addr}{path}");
-    let request = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .expect("request");
-    Client::new()
-        .request(request)
-        .await
-        .expect("response")
-        .status()
-}
-
 async fn install_library_with_write_token(server: &RunningServer, schema: &LibrarySchema) {
     let begin_token = token_for_schema(&server.actor, schema, USER_WRITE);
     let txn_id = begin_transaction(server.addr, begin_token).await;
@@ -463,28 +453,4 @@ async fn install_library_with_write_token(server: &RunningServer, schema: &Libra
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let commit = finalize_install(server.addr, &token, txn_id, true).await;
     assert_eq!(commit.status(), StatusCode::NO_CONTENT);
-}
-
-fn combine_host_handlers(
-    public: impl tinychain::KernelHandler,
-    token: impl tinychain::KernelHandler,
-    export: impl tinychain::KernelHandler,
-) -> impl tinychain::KernelHandler {
-    let public: Arc<dyn tinychain::KernelHandler> = Arc::new(public);
-    let token: Arc<dyn tinychain::KernelHandler> = Arc::new(token);
-    let export: Arc<dyn tinychain::KernelHandler> = Arc::new(export);
-
-    move |req: tinychain::Request| {
-        let path = req.uri().path().to_string();
-        let public = Arc::clone(&public);
-        let token = Arc::clone(&token);
-        let export = Arc::clone(&export);
-        async move {
-            match path.as_str() {
-                "/" => token.call(req).await,
-                "/host/library/export" => export.call(req).await,
-                _ => public.call(req).await,
-            }
-        }
-    }
 }

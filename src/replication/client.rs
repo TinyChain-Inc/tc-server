@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -159,55 +161,49 @@ pub async fn request_replication_token(
 ) -> TCResult<String> {
     let mut url = peer_to_url(peer)?;
     url.set_path(TOKEN_PATH);
-    let mut last_error = String::new();
+    with_psk_key_retries(
+        keys,
+        "no replication key succeeded: no keys configured",
+        "no replication key succeeded",
+        |idx, key| {
+            let url = url.clone();
+            async move {
+                let (nonce, encrypted_path) =
+                    encrypt_path_with_key(path, &key).map_err(|err| err.to_string())?;
+                let body = encode_encrypted_payload(&nonce, &encrypted_path)
+                    .map_err(|err| err.to_string())?;
+                let req = Request::builder()
+                    .method(hyper::Method::POST)
+                    .uri(url.as_str())
+                    .body(Body::from(body))
+                    .map_err(|err| format!("key[{idx}] invalid request: {err}"))?;
 
-    for (idx, key) in keys.iter().enumerate() {
-        for method in [hyper::Method::POST, hyper::Method::GET] {
-            let (nonce, encrypted_path) = encrypt_path_with_key(path, key)?;
-            let body = encode_encrypted_payload(&nonce, &encrypted_path)?;
-            let req = Request::builder()
-                .method(method.clone())
-                .uri(url.as_str())
-                .body(Body::from(body))
-                .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
+                let response = send_peer_request(req)
+                    .await
+                    .map_err(|err| format!("key[{idx}] request failed: {err}"))?;
 
-            let response = send_peer_request(req).await?;
+                let status = response.status();
+                let body_bytes = to_bytes(response.into_body())
+                    .await
+                    .map_err(|err| format!("key[{idx}] response body read failed: {err}"))?;
 
-            let status = response.status();
-            let body_bytes = to_bytes(response.into_body())
-                .await
-                .map_err(|err| TCError::bad_gateway(err.to_string()))?;
-
-            if !status.is_success() {
-                let message = String::from_utf8_lossy(&body_bytes);
-                last_error = format!("key[{idx}] {} status {status}: {message}", method);
-                continue;
-            }
-
-            let (nonce, encrypted_token) = match decode_encrypted_payload(body_bytes) {
-                Ok(decoded) => decoded,
-                Err(err) => {
-                    last_error = format!("key[{idx}] {} invalid encrypted payload: {err}", method);
-                    continue;
+                if !status.is_success() {
+                    let message = String::from_utf8_lossy(&body_bytes);
+                    return Err(format!("key[{idx}] status {status}: {message}"));
                 }
-            };
 
-            if let Ok(token) = decrypt_token_with_key(key, &nonce, &encrypted_token) {
-                return Ok(token);
+                let (nonce, encrypted_token) = decode_encrypted_payload(body_bytes)
+                    .map_err(|err| format!("key[{idx}] invalid encrypted payload: {err}"))?;
+
+                if let Ok(token) = decrypt_token_with_key(&key, &nonce, &encrypted_token) {
+                    return Ok(Some(token));
+                }
+
+                Err(format!("key[{idx}] could not decrypt token"))
             }
-            last_error = format!("key[{idx}] {} could not decrypt token", method);
-        }
-    }
-
-    if last_error.is_empty() {
-        Err(TCError::bad_gateway(
-            "no replication key succeeded: no keys configured",
-        ))
-    } else {
-        Err(TCError::bad_gateway(format!(
-            "no replication key succeeded: {last_error}"
-        )))
-    }
+        },
+    )
+    .await
 }
 
 pub fn normalize_peer(peer: &str) -> TCResult<String> {
@@ -282,9 +278,9 @@ pub async fn list_peer_cluster(seed: &str) -> TCResult<PeerClusterListing> {
     #[derive(serde::Deserialize)]
     struct PeerListResponse {
         #[serde(default)]
-        peers: Vec<String>,
-        #[serde(default)]
         replicas: Vec<PeerIdentityRaw>,
+        #[serde(default)]
+        peers: Vec<String>,
     }
 
     #[derive(serde::Deserialize)]
@@ -319,28 +315,34 @@ pub async fn list_peer_cluster(seed: &str) -> TCResult<PeerClusterListing> {
     let listing: PeerListResponse = serde_json::from_slice(&body_bytes)
         .map_err(|err| TCError::bad_gateway(format!("invalid peer list response: {err}")))?;
 
-    let peers = listing
-        .peers
-        .into_iter()
-        .map(|peer| normalize_peer(&peer))
-        .collect::<TCResult<Vec<_>>>()?;
-
-    let mut identities = Vec::new();
+    let mut peers = BTreeSet::new();
+    let mut identities = BTreeMap::new();
     for identity in listing.replicas {
         let peer = normalize_peer(&identity.peer)?;
+        peers.insert(peer.clone());
         if let (Some(actor_id), Some(public_key_b64)) = (identity.actor_id, identity.public_key_b64)
         {
             if !actor_id.trim().is_empty() && !public_key_b64.trim().is_empty() {
-                identities.push(PeerIdentity {
-                    peer,
-                    actor_id,
-                    public_key_b64,
-                });
+                identities.insert(
+                    peer.clone(),
+                    PeerIdentity {
+                        peer,
+                        actor_id,
+                        public_key_b64,
+                    },
+                );
             }
         }
     }
 
-    Ok(PeerClusterListing { peers, identities })
+    for peer in listing.peers {
+        peers.insert(normalize_peer(&peer)?);
+    }
+
+    Ok(PeerClusterListing {
+        peers: peers.into_iter().collect(),
+        identities: identities.into_values().collect(),
+    })
 }
 
 pub(crate) async fn push_install_payload(
@@ -435,32 +437,71 @@ async fn post_encrypted_peer_action(
     let mut url = peer_to_url(seed)?;
     url.set_path(path);
 
-    for key in keys {
-        let (nonce, encrypted_peer) = encrypt_path_with_key(&payload, key)?;
-        let body = encode_encrypted_payload(&nonce, &encrypted_peer)?;
-        let req = Request::builder()
-            .method("POST")
-            .uri(url.as_str())
-            .body(Body::from(body))
-            .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
+    let failure_prefix = format!("peer action {path} failed");
+    with_psk_key_retries(
+        keys,
+        "peer action failed for all PSK keys",
+        &failure_prefix,
+        |idx, key| {
+            let payload = payload.clone();
+            let url = url.clone();
+            async move {
+                let (nonce, encrypted_peer) =
+                    encrypt_path_with_key(&payload, &key).map_err(|err| err.to_string())?;
+                let body = encode_encrypted_payload(&nonce, &encrypted_peer)
+                    .map_err(|err| err.to_string())?;
+                let req = Request::builder()
+                    .method(hyper::Method::POST)
+                    .uri(url.as_str())
+                    .body(Body::from(body))
+                    .map_err(|err| format!("key[{idx}] invalid request: {err}"))?;
 
-        let response = send_peer_request(req).await?;
+                let response = send_peer_request(req)
+                    .await
+                    .map_err(|err| format!("key[{idx}] request failed: {err}"))?;
+                if response.status().is_success() {
+                    return Ok(Some(()));
+                }
 
-        if response.status().is_success() {
-            return Ok(());
+                let status = response.status();
+                let body = to_bytes(response.into_body())
+                    .await
+                    .map_err(|err| format!("key[{idx}] response body read failed: {err}"))?;
+                let message = String::from_utf8_lossy(&body);
+                Err(format!("key[{idx}] status {status}: {message}"))
+            }
+        },
+    )
+    .await
+}
+
+async fn with_psk_key_retries<T, F, Fut>(
+    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+    no_keys_message: &str,
+    failure_prefix: &str,
+    mut attempt: F,
+) -> TCResult<T>
+where
+    F: FnMut(usize, aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>) -> Fut,
+    Fut: Future<Output = Result<Option<T>, String>>,
+{
+    let mut last_error = String::new();
+
+    for (idx, key) in keys.iter().enumerate() {
+        match attempt(idx, *key).await {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) => {}
+            Err(err) => last_error = err,
         }
-
-        let status = response.status();
-        let body = to_bytes(response.into_body())
-            .await
-            .map_err(|err| TCError::bad_gateway(err.to_string()))?;
-        let message = String::from_utf8_lossy(&body);
-        return Err(TCError::bad_gateway(format!(
-            "peer action {path} failed with status {status}: {message}"
-        )));
     }
 
-    Err(TCError::bad_gateway("peer action failed for all PSK keys"))
+    if last_error.is_empty() {
+        Err(TCError::bad_gateway(no_keys_message))
+    } else {
+        Err(TCError::bad_gateway(format!(
+            "{failure_prefix}: {last_error}"
+        )))
+    }
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]

@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::{
-    InstallError, InstallRequest, LibraryFactory, LibraryHandlers, LibraryRegistry,
-    decode_install_request_bytes,
+    LibraryFactory, LibraryHandlers, LibraryRegistry, StageInstallError,
+    decode_authorize_and_stage_install, stage_install_error_response,
 };
 
 pub async fn build_http_library_module(
@@ -86,26 +86,18 @@ pub fn schema_put_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler 
                 None => return unauthorized_response("missing transaction context"),
             };
 
-            match decode_body(req).await {
-                Ok(InstallRequest::SchemaOnly(schema)) => {
-                    if !txn.has_claim(schema.id(), umask::USER_WRITE) {
-                        return unauthorized_response("unauthorized library install");
-                    }
-                    match registry.stage_install_schema(txn.id(), schema).await {
-                        Ok(_) => no_content_response(),
-                        Err(err) => install_error_response(err),
-                    }
+            let body_bytes = match body::to_bytes(req.into_body()).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    return stage_install_error_response(StageInstallError::Internal(
+                        err.to_string(),
+                    ));
                 }
-                Ok(InstallRequest::WithArtifacts(payload)) => {
-                    if !txn.has_claim(payload.schema.id(), umask::USER_WRITE) {
-                        return unauthorized_response("unauthorized library install");
-                    }
-                    match registry.stage_install_payload(txn.id(), payload).await {
-                        Ok(_) => no_content_response(),
-                        Err(err) => install_error_response(err),
-                    }
-                }
-                Err(err) => install_error_response(err),
+            };
+
+            match decode_authorize_and_stage_install(&registry, &txn, &body_bytes).await {
+                Ok(_) => no_content_response(),
+                Err(err) => stage_install_error_response(err),
             }
         }
         .boxed()
@@ -191,20 +183,6 @@ fn listing_to_state(listing: &tc_ir::Map<bool>) -> State {
     State::Map(map)
 }
 
-async fn decode_body(req: Request) -> Result<InstallRequest, InstallError> {
-    let body_bytes = body::to_bytes(req.into_body())
-        .await
-        .map_err(|err| InstallError::internal(err.to_string()))?;
-    decode_install_request_bytes(&body_bytes)
-}
-
-fn bad_request(message: String) -> Response {
-    http::Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .body(Body::from(message))
-        .expect("bad request response")
-}
-
 fn internal_error(message: String) -> Response {
     http::Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -224,13 +202,6 @@ fn no_content_response() -> Response {
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
         .expect("library install response")
-}
-
-fn install_error_response(error: InstallError) -> Response {
-    match error {
-        InstallError::BadRequest(message) => bad_request(message),
-        InstallError::Internal(message) => internal_error(message),
-    }
 }
 
 pub fn routes_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
@@ -262,7 +233,10 @@ pub fn routes_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
 mod tests {
     use super::*;
     use crate::http::{Body, header};
-    use crate::library::{InstallArtifacts, encode_install_payload_bytes};
+    use crate::library::{
+        InstallArtifacts, InstallRequest, decode_install_request_bytes,
+        encode_install_payload_bytes,
+    };
     use crate::storage::Artifact;
     use crate::{Method, kernel::Kernel};
     use futures::stream;
