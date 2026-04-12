@@ -1,14 +1,34 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Default)]
 pub struct PeerMembership {
     peers: Arc<RwLock<HashMap<String, PeerHealth>>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct PeerIdentity {
+    pub peer: String,
+    pub actor_id: String,
+    pub public_key_b64: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct PeerDescriptor {
+    pub peer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key_b64: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 struct PeerHealth {
     failures: u8,
+    actor_id: Option<String>,
+    public_key_b64: Option<String>,
 }
 
 impl PeerMembership {
@@ -24,7 +44,33 @@ impl PeerMembership {
     pub fn upsert_active(&self, peer: String) -> bool {
         let mut peers = self.peers.write().expect("peer membership write");
         let was_new = !peers.contains_key(&peer);
-        peers.insert(peer, PeerHealth { failures: 0 });
+        peers
+            .entry(peer)
+            .and_modify(|health| health.failures = 0)
+            .or_insert(PeerHealth {
+                failures: 0,
+                actor_id: None,
+                public_key_b64: None,
+            });
+        was_new
+    }
+
+    pub fn upsert_identity(&self, identity: PeerIdentity) -> bool {
+        let mut peers = self.peers.write().expect("peer membership write");
+        let was_new = !peers.contains_key(&identity.peer);
+        peers
+            .entry(identity.peer)
+            .and_modify(|health| {
+                health.failures = 0;
+                health.actor_id = Some(identity.actor_id.clone());
+                health.public_key_b64 = Some(identity.public_key_b64.clone());
+            })
+            .or_insert(PeerHealth {
+                failures: 0,
+                actor_id: Some(identity.actor_id),
+                public_key_b64: Some(identity.public_key_b64),
+            });
+
         was_new
     }
 
@@ -59,5 +105,38 @@ impl PeerMembership {
         let mut peers = peers.keys().cloned().collect::<Vec<_>>();
         peers.sort();
         peers
+    }
+
+    pub fn peer_descriptors(&self) -> Vec<PeerDescriptor> {
+        let peers = self.peers.read().expect("peer membership read");
+        let mut out = peers
+            .iter()
+            .map(|(peer, health)| PeerDescriptor {
+                peer: peer.clone(),
+                actor_id: health.actor_id.clone(),
+                public_key_b64: health.public_key_b64.clone(),
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|left, right| left.peer.cmp(&right.peer));
+        out
+    }
+
+    pub fn active_identities(&self) -> Vec<PeerIdentity> {
+        let peers = self.peers.read().expect("peer membership read");
+        let mut out = peers
+            .iter()
+            .filter_map(|(peer, health)| {
+                match (health.actor_id.as_ref(), health.public_key_b64.as_ref()) {
+                    (Some(actor_id), Some(public_key_b64)) => Some(PeerIdentity {
+                        peer: peer.clone(),
+                        actor_id: actor_id.clone(),
+                        public_key_b64: public_key_b64.clone(),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|left, right| left.peer.cmp(&right.peer));
+        out
     }
 }

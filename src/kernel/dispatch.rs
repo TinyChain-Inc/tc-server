@@ -6,7 +6,7 @@ pub enum KernelDispatch {
     Response(BoxFuture<'static, Response>),
     Finalize {
         commit: bool,
-        result: Result<(), crate::txn::TxnError>,
+        txn: crate::txn::TxnHandle,
     },
     NotFound,
 }

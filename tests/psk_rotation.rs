@@ -6,7 +6,8 @@ use std::time::Duration;
 use pathlink::Link;
 use serde_json::json;
 use tc_ir::LibrarySchema;
-use tinychain::auth::{KeyringActorResolver, PublicKeyStore};
+use tc_value::Value;
+use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
 use tinychain::library::http::{build_http_library_module, http_library_handlers};
@@ -120,6 +121,7 @@ async fn start_server(
     let issuer = Arc::new(ReplicationIssuer::new(
         Link::from_str("/host").expect("host"),
         keys,
+        Actor::new(Value::from("replication:psk:test")),
         keyring.clone(),
         public_keys.clone(),
     ));

@@ -180,7 +180,8 @@ impl Service<Request> for KernelService {
 
                     Ok(response)
                 }
-                Ok(KernelDispatch::Finalize { commit: _, result }) => {
+                Ok(KernelDispatch::Finalize { commit, txn }) => {
+                    let result = kernel.finalize_transaction(txn, commit).await;
                     Ok(handle_finalize_result(result))
                 }
                 Ok(KernelDispatch::NotFound) => Ok(not_found()),

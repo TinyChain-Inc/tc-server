@@ -91,8 +91,8 @@ pub fn schema_put_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler 
                     if !txn.has_claim(schema.id(), umask::USER_WRITE) {
                         return unauthorized_response("unauthorized library install");
                     }
-                    match registry.install_schema(schema).await {
-                        Ok(()) => no_content_response(),
+                    match registry.stage_install_schema(txn.id(), schema).await {
+                        Ok(_) => no_content_response(),
                         Err(err) => install_error_response(err),
                     }
                 }
@@ -100,8 +100,8 @@ pub fn schema_put_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler 
                     if !txn.has_claim(payload.schema.id(), umask::USER_WRITE) {
                         return unauthorized_response("unauthorized library install");
                     }
-                    match registry.install_payload(payload).await {
-                        Ok(()) => no_content_response(),
+                    match registry.stage_install_payload(txn.id(), payload).await {
+                        Ok(_) => no_content_response(),
                         Err(err) => install_error_response(err),
                     }
                 }

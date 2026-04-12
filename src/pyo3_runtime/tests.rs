@@ -107,7 +107,8 @@ mod tests {
                     },
                 ) {
                     Ok(crate::KernelDispatch::Response(resp)) => Ok(resp.await),
-                    Ok(crate::KernelDispatch::Finalize { commit: _, result }) => {
+                    Ok(crate::KernelDispatch::Finalize { commit, txn }) => {
+                        let result = kernel.finalize_transaction(txn, commit).await;
                         let status = if result.is_ok() {
                             StatusCode::NO_CONTENT
                         } else {

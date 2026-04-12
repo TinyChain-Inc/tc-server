@@ -1,6 +1,6 @@
 use super::*;
 use crate::KernelHandler;
-use crate::auth::{KeyringActorResolver, PublicKeyStore};
+use crate::auth::{Actor, KeyringActorResolver, PublicKeyStore};
 use crate::library::http::build_http_library_module;
 use crate::replication::crypto::{
     decode_encrypted_payload, decrypt_token_with_key, encode_encrypted_payload,
@@ -61,6 +61,7 @@ async fn issues_replication_token() {
     let issuer = Arc::new(ReplicationIssuer::new(
         host,
         keys.clone(),
+        Actor::new(tc_value::Value::String("replication:test".to_string())),
         keyring,
         public_keys,
     ));

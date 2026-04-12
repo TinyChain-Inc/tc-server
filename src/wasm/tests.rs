@@ -39,7 +39,6 @@ mod http_tests {
         HttpServer,
         kernel::{Kernel, Method},
         library::http::{build_http_library_module, http_library_handlers},
-        txn::TxnManager,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use hyper::{Client, body};
@@ -85,12 +84,14 @@ mod http_tests {
             }]
         });
 
-        let txn_manager = TxnManager::with_host_id("tc-wasm-test");
         let install_claim = Claim::new(
             Link::from_str("/lib/example-devco/example/0.1.0").expect("install link"),
             umask::USER_WRITE,
         );
-        let txn = txn_manager.begin().with_claims(vec![install_claim]);
+        let txn = kernel
+            .txn_manager()
+            .begin()
+            .with_claims(vec![install_claim]);
 
         let mut install_request = ::http::Request::builder()
             .method("PUT")
@@ -105,6 +106,10 @@ mod http_tests {
             .expect("install handler")
             .await;
         assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
+        kernel
+            .finalize_transaction(txn.clone(), true)
+            .await
+            .expect("commit install");
 
         let mut request = ::http::Request::builder()
             .method("GET")
@@ -365,7 +370,9 @@ mod http_tests {
             .txn_manager()
             .begin()
             .with_claims(vec![install_claim_b]);
-        install_request_b.extensions_mut().insert(install_txn_b);
+        install_request_b
+            .extensions_mut()
+            .insert(install_txn_b.clone());
 
         let install_response_b = b_kernel
             .dispatch(Method::Put, "/lib", install_request_b)
@@ -373,6 +380,7 @@ mod http_tests {
             .await;
 
         assert_eq!(install_response_b.status(), StatusCode::NO_CONTENT);
+        b_kernel.finalize_transaction(install_txn_b, true).await?;
 
         let b_listener = TcpListener::bind("127.0.0.1:0")?;
         let b_addr = b_listener.local_addr()?;
@@ -445,7 +453,9 @@ mod http_tests {
             .txn_manager()
             .begin()
             .with_claims(vec![install_claim_a]);
-        install_request_a.extensions_mut().insert(install_txn_a);
+        install_request_a
+            .extensions_mut()
+            .insert(install_txn_a.clone());
 
         let install_response_a = a_kernel
             .dispatch(Method::Put, "/lib", install_request_a)
@@ -453,6 +463,7 @@ mod http_tests {
             .await;
 
         assert_eq!(install_response_a.status(), StatusCode::NO_CONTENT);
+        a_kernel.finalize_transaction(install_txn_a, true).await?;
 
         let a_listener = TcpListener::bind("127.0.0.1:0")?;
         let a_addr = a_listener.local_addr()?;

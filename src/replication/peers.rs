@@ -3,17 +3,25 @@ use std::sync::Arc;
 use futures::FutureExt;
 use hyper::body::to_bytes;
 use hyper::{Body, Request, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::crypto::decode_encrypted_payload;
 use super::{PEERS_HEARTBEAT_PATH, PEERS_JOIN_PATH, PEERS_LEAVE_PATH, PEERS_PATH};
-use super::{PeerMembership, ReplicationIssuer, normalize_peer};
+use super::{PeerIdentity, PeerMembership, ReplicationIssuer, normalize_peer};
 use crate::KernelHandler;
 use crate::Response;
 
 #[derive(Serialize)]
 struct PeerList {
     peers: Vec<String>,
+    replicas: Vec<super::PeerDescriptor>,
+}
+
+#[derive(Deserialize)]
+struct PeerAnnouncement {
+    peer: String,
+    actor_id: Option<String>,
+    public_key_b64: Option<String>,
 }
 
 pub fn peer_membership_handler(
@@ -26,10 +34,7 @@ pub fn peer_membership_handler(
         async move {
             match (req.method().as_str(), req.uri().path()) {
                 ("GET", PEERS_PATH) => {
-                    let body = serde_json::to_vec(&PeerList {
-                        peers: membership.active_peers(),
-                    })
-                    .expect("peer list");
+                    let body = peer_list_body(&membership);
 
                     hyper::Response::builder()
                         .status(StatusCode::OK)
@@ -53,17 +58,22 @@ pub fn peer_membership_handler(
                         Err(err) => return bad_request(err.to_string()),
                     };
 
-                    let peer = match normalize_peer(&peer) {
-                        Ok(peer) => peer,
+                    let announcement = match parse_announcement(&peer) {
+                        Ok(announcement) => announcement,
+                        Err(err) => return bad_request(err),
+                    };
+
+                    let identity = match normalize_identity(announcement) {
+                        Ok(identity) => identity,
                         Err(err) => return bad_request(err.to_string()),
                     };
 
-                    membership.upsert_active(peer);
+                    if let Err(err) = issuer.register_peer_identity(&identity) {
+                        return bad_request(err.to_string());
+                    }
+                    membership.upsert_identity(identity);
 
-                    let body = serde_json::to_vec(&PeerList {
-                        peers: membership.active_peers(),
-                    })
-                    .expect("peer list");
+                    let body = peer_list_body(&membership);
 
                     hyper::Response::builder()
                         .status(StatusCode::OK)
@@ -87,12 +97,20 @@ pub fn peer_membership_handler(
                         Err(err) => return bad_request(err.to_string()),
                     };
 
-                    let peer = match normalize_peer(&peer) {
-                        Ok(peer) => peer,
+                    let announcement = match parse_announcement(&peer) {
+                        Ok(announcement) => announcement,
+                        Err(err) => return bad_request(err),
+                    };
+
+                    let identity = match normalize_identity(announcement) {
+                        Ok(identity) => identity,
                         Err(err) => return bad_request(err.to_string()),
                     };
 
-                    membership.upsert_active(peer);
+                    if let Err(err) = issuer.register_peer_identity(&identity) {
+                        return bad_request(err.to_string());
+                    }
+                    membership.upsert_identity(identity);
 
                     hyper::Response::builder()
                         .status(StatusCode::NO_CONTENT)
@@ -115,7 +133,11 @@ pub fn peer_membership_handler(
                         Err(err) => return bad_request(err.to_string()),
                     };
 
-                    let peer = match normalize_peer(&peer) {
+                    let announcement = match parse_announcement(&peer) {
+                        Ok(announcement) => announcement,
+                        Err(err) => return bad_request(err),
+                    };
+                    let peer = match normalize_peer(&announcement.peer) {
                         Ok(peer) => peer,
                         Err(err) => return bad_request(err.to_string()),
                     };
@@ -142,4 +164,49 @@ fn bad_request(message: String) -> Response {
         .status(StatusCode::BAD_REQUEST)
         .body(Body::from(message))
         .expect("bad request")
+}
+
+fn peer_list_body(membership: &PeerMembership) -> Vec<u8> {
+    serde_json::to_vec(&PeerList {
+        peers: membership.active_peers(),
+        replicas: membership.peer_descriptors(),
+    })
+    .expect("peer list")
+}
+
+fn parse_announcement(raw: &str) -> Result<PeerAnnouncement, String> {
+    if raw.trim_start().starts_with('{') {
+        serde_json::from_str(raw).map_err(|err| format!("invalid peer announcement: {err}"))
+    } else {
+        Ok(PeerAnnouncement {
+            peer: raw.to_string(),
+            actor_id: None,
+            public_key_b64: None,
+        })
+    }
+}
+
+fn normalize_identity(announcement: PeerAnnouncement) -> tc_error::TCResult<PeerIdentity> {
+    let peer = normalize_peer(&announcement.peer)?;
+    let actor_id = announcement
+        .actor_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| tc_error::TCError::bad_request("missing peer actor_id"))?;
+    if !actor_id.starts_with("replication:") {
+        return Err(tc_error::TCError::bad_request(
+            "peer actor_id must start with replication:",
+        ));
+    }
+    let public_key_b64 = announcement
+        .public_key_b64
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| tc_error::TCError::bad_request("missing peer public_key_b64"))?;
+
+    Ok(PeerIdentity {
+        peer,
+        actor_id,
+        public_key_b64,
+    })
 }

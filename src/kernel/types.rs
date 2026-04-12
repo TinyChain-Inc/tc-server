@@ -1,6 +1,7 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use futures::future::BoxFuture;
+use tc_error::TCResult;
 
 use crate::{Request, Response};
 
@@ -42,3 +43,6 @@ where
         Box::pin((self)(req))
     }
 }
+
+pub type TxnFinalizeHook =
+    Arc<dyn Fn(crate::txn::TxnHandle, bool) -> BoxFuture<'static, TCResult<()>> + Send + Sync>;

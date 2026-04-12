@@ -414,13 +414,17 @@ mod tests {
             .txn_manager()
             .begin()
             .with_claims(vec![install_claim]);
-        install_request.extensions_mut().insert(install_txn);
+        install_request.extensions_mut().insert(install_txn.clone());
 
         let install_response = remote_kernel
             .dispatch(Method::Put, "/lib", install_request)
             .expect("install handler")
             .await;
         assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
+        remote_kernel
+            .finalize_transaction(install_txn, true)
+            .await
+            .expect("commit install");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");

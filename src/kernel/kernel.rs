@@ -1,6 +1,7 @@
 use std::{str::FromStr, sync::Arc};
 
 use futures::future::BoxFuture;
+use tc_error::TCResult;
 use tc_ir::TxnId;
 
 use crate::egress::EgressPolicy;
@@ -27,6 +28,7 @@ pub struct Kernel {
     pub(crate) rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     pub(crate) token_verifier: Arc<dyn crate::auth::TokenVerifier>,
     pub(crate) kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
+    pub(crate) txn_finalize_hook: Option<super::TxnFinalizeHook>,
 }
 
 impl Kernel {
@@ -109,9 +111,48 @@ impl Kernel {
     pub(crate) fn expire_transactions_at(&self, now: std::time::Instant) -> Vec<TxnId> {
         let expired = self.txn_server.expire_at(now);
         for txn_id in &expired {
+            if let Some(module) = &self.library_module {
+                module.discard_txn(*txn_id);
+            }
             let _ = self.txn_manager.rollback(*txn_id);
         }
         expired
+    }
+
+    pub async fn finalize_transaction(
+        &self,
+        txn: crate::txn::TxnHandle,
+        commit: bool,
+    ) -> TCResult<()> {
+        if let Some(finalize_hook) = &self.txn_finalize_hook {
+            if commit {
+                finalize_hook(txn.clone(), true).await?;
+            } else if let Err(err) = finalize_hook(txn.clone(), false).await {
+                eprintln!("rollback finalize hook failed: {err}");
+            }
+        }
+
+        if let Some(module) = &self.library_module {
+            module.finalize_txn(txn.id(), commit).await?;
+        }
+
+        self.txn_server.forget(&txn.id());
+
+        let result = if commit {
+            self.txn_manager.commit(txn.id())
+        } else {
+            self.txn_manager.rollback(txn.id())
+        };
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(crate::txn::TxnError::NotFound) => {
+                Err(tc_error::TCError::bad_request("unknown transaction id"))
+            }
+            Err(crate::txn::TxnError::Unauthorized) => Err(tc_error::TCError::unauthorized(
+                "unauthorized transaction owner",
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -204,7 +245,14 @@ impl Kernel {
                 Some(claims) => handle.with_claims(claims),
                 None => handle,
             };
-            if bearer_token.is_none() {
+            let bearer_token = match bearer_token {
+                Some(token) => token,
+                None => {
+                    return Err(crate::txn::TxnError::Unauthorized);
+                }
+            };
+            let handle = handle.with_bearer_token(bearer_token.to_string());
+            if bearer_token.is_empty() {
                 return Err(crate::txn::TxnError::Unauthorized);
             }
 
@@ -214,15 +262,9 @@ impl Kernel {
                 return Err(crate::txn::TxnError::Unauthorized);
             }
 
-            self.txn_server.forget(&handle.id());
-
             return Ok(KernelDispatch::Finalize {
                 commit: method == Method::Post,
-                result: match method {
-                    Method::Post => self.txn_manager.commit(handle.id()),
-                    Method::Delete => self.txn_manager.rollback(handle.id()),
-                    _ => unreachable!("checked above"),
-                },
+                txn: handle,
             });
         } else {
             self.txn_manager
@@ -280,6 +322,7 @@ impl Clone for Kernel {
             rpc_gateway: self.rpc_gateway.as_ref().map(Arc::clone),
             token_verifier: Arc::clone(&self.token_verifier),
             kernel_actor: self.kernel_actor.clone(),
+            txn_finalize_hook: self.txn_finalize_hook.as_ref().map(Arc::clone),
         }
     }
 }

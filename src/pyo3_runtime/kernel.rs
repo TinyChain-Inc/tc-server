@@ -553,7 +553,8 @@ impl KernelHandle {
                     Ok(KernelDispatch::Response(resp)) => {
                         self.block_on(async move { py_response_from_http(resp.await).await })
                     }
-                    Ok(KernelDispatch::Finalize { commit: _, result }) => {
+                    Ok(KernelDispatch::Finalize { commit, txn }) => {
+                        let result = self.block_on(self.inner.finalize_transaction(txn, commit));
                         let status = if result.is_ok() { 204 } else { 400 };
                         Ok(PyKernelResponse::new(status, None, None))
                     }
@@ -638,7 +639,8 @@ impl KernelHandle {
                 }
                 Ok(response)
             }
-            Ok(KernelDispatch::Finalize { commit: _, result }) => {
+            Ok(KernelDispatch::Finalize { commit, txn }) => {
+                let result = self.block_on(self.inner.finalize_transaction(txn, commit));
                 let status = if result.is_ok() { 204 } else { 400 };
                 Ok(PyKernelResponse::new(status, None, None))
             }

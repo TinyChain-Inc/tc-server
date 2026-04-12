@@ -1,11 +1,12 @@
 use std::net::TcpListener;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use hyper::{Body, Client, Request, StatusCode};
 use pathlink::Link;
-use tc_ir::{Claim, LibrarySchema};
+use tc_ir::{Claim, LibrarySchema, TxnId};
 use tc_value::Value;
 use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore, Token};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
@@ -15,8 +16,9 @@ use tinychain::library::http::{build_http_library_module, http_library_handlers}
 use tinychain::library::{InstallArtifacts, default_library_schema, encode_install_payload_bytes};
 use tinychain::replication::{
     PEERS_HEARTBEAT_PATH, PEERS_JOIN_PATH, PEERS_LEAVE_PATH, PEERS_PATH, PeerMembership,
-    ReplicationIssuer, export_handler, leave_peer_cluster, live_replicating_install_put_handler,
-    parse_psk_keys, peer_membership_handler, register_with_peer, replication_token_handler,
+    ReplicatedTxnTracker, ReplicationIssuer, export_handler, leave_peer_cluster,
+    live_replicating_finalize_hook, live_replicating_install_put_handler, parse_psk_keys,
+    peer_membership_handler, register_with_peer, replication_token_handler,
 };
 use tinychain::storage::Artifact;
 use umask::USER_WRITE;
@@ -27,13 +29,9 @@ async fn join_enables_live_write_forwarding() {
     let replica = start_live_server("live-replica", vec![]).await;
     let keys = shared_replication_keys();
 
-    register_with_peer(
-        &format!("http://{}", leader.addr),
-        &format!("http://{}", replica.addr),
-        &keys,
-    )
-    .await
-    .expect("join cluster");
+    register_with_peer(&format!("http://{}", leader.addr), &replica.identity, &keys)
+        .await
+        .expect("join cluster");
 
     let schema = sample_schema("/lib/example-devco/live-forward/0.1.0");
     install_with_write_token(&leader, &schema).await;
@@ -47,13 +45,9 @@ async fn leave_stops_live_write_forwarding() {
     let replica = start_live_server("leave-replica", vec![]).await;
     let keys = shared_replication_keys();
 
-    register_with_peer(
-        &format!("http://{}", leader.addr),
-        &format!("http://{}", replica.addr),
-        &keys,
-    )
-    .await
-    .expect("join cluster");
+    register_with_peer(&format!("http://{}", leader.addr), &replica.identity, &keys)
+        .await
+        .expect("join cluster");
 
     let schema_a = sample_schema("/lib/example-devco/live-leave/0.1.0");
     install_with_write_token(&leader, &schema_a).await;
@@ -77,9 +71,14 @@ async fn leave_stops_live_write_forwarding() {
 
 struct RunningServer {
     addr: std::net::SocketAddr,
-    actor: Actor,
+    identity: tinychain::replication::PeerIdentity,
     _registry: Arc<LibraryRegistry>,
     _membership: PeerMembership,
+}
+
+fn shared_installer_actor() -> &'static Actor {
+    static SHARED_ACTOR: OnceLock<Actor> = OnceLock::new();
+    SHARED_ACTOR.get_or_init(|| Actor::new(Value::from("installer-shared")))
 }
 
 fn sample_schema(id: &str) -> LibrarySchema {
@@ -131,18 +130,27 @@ async fn start_live_server(label: &str, initial_peers: Vec<String>) -> RunningSe
     let handlers = http_library_handlers(&module);
 
     let host = Link::from_str("/host").expect("host link");
-    let actor = Actor::new(Value::from(format!("installer-{label}")));
+    let actor = shared_installer_actor();
     let keyring = KeyringActorResolver::default().with_actor(host, actor.clone());
     let public_keys = PublicKeyStore::default();
     let keys = shared_replication_keys();
+    let replication_actor = Actor::new(Value::from(format!("replication:{label}")));
     let issuer = Arc::new(ReplicationIssuer::new(
         Link::from_str("/host").expect("host link"),
         keys.clone(),
+        replication_actor,
         keyring.clone(),
         public_keys.clone(),
     ));
     let membership = PeerMembership::new(initial_peers);
-    let live_put = live_replicating_install_put_handler(module.clone(), membership.clone(), keys);
+    let tracker = ReplicatedTxnTracker::default();
+    let live_put = live_replicating_install_put_handler(
+        module.clone(),
+        membership.clone(),
+        keys,
+        tracker.clone(),
+    );
+    let finalize_hook = live_replicating_finalize_hook(membership.clone(), tracker);
 
     let kernel = Kernel::builder()
         .with_host_id(format!("live-replication-{label}"))
@@ -150,12 +158,13 @@ async fn start_live_server(label: &str, initial_peers: Vec<String>) -> RunningSe
         .with_rjwt_keyring_token_verifier(keyring.clone())
         .with_library_module(module.clone(), handlers)
         .with_lib_put_handler(live_put)
+        .with_txn_finalize_hook(finalize_hook)
         .with_service_handler(|_req| async move { hyper::Response::new(Body::empty()) })
         .with_kernel_handler(combine_host_handlers(
             host_handler_with_public_keys(public_keys),
             replication_token_handler(issuer.clone()),
             export_handler(module.clone()),
-            peer_membership_handler(membership.clone(), issuer),
+            peer_membership_handler(membership.clone(), issuer.clone()),
         ))
         .with_health_handler(|_req| async move { hyper::Response::new(Body::empty()) })
         .finish();
@@ -167,20 +176,28 @@ async fn start_live_server(label: &str, initial_peers: Vec<String>) -> RunningSe
         let _ = server.serve_listener(listener).await;
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
+    let identity = issuer
+        .self_identity(format!("http://{}", addr))
+        .expect("replication identity");
 
     RunningServer {
         addr,
-        actor,
+        identity,
         _registry: module,
         _membership: membership,
     }
 }
 
 async fn install_with_write_token(server: &RunningServer, schema: &LibrarySchema) {
-    let token = token_for_schema(&server.actor, schema, USER_WRITE);
+    let begin_token = token_for_schema(shared_installer_actor(), schema, USER_WRITE);
+    let txn_id = begin_transaction(server.addr, begin_token).await;
+    let token = token_for_schema_and_txn(shared_installer_actor(), schema, USER_WRITE, txn_id);
     let payload = install_payload_for_schema(schema, ir_bytes_for_schema(schema));
-    let response = put_install_payload(server.addr, Some(token), payload).await;
+    let response =
+        put_install_payload(server.addr, Some(token.clone()), payload, Some(txn_id)).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let commit = finalize_install(server.addr, &token, txn_id, true).await;
+    assert_eq!(commit.status(), StatusCode::NO_CONTENT);
 }
 
 fn token_for_schema(actor: &Actor, schema: &LibrarySchema, mask: umask::Mode) -> String {
@@ -197,12 +214,66 @@ fn token_for_schema(actor: &Actor, schema: &LibrarySchema, mask: umask::Mode) ->
     signed.into_jwt()
 }
 
+fn token_for_schema_and_txn(
+    actor: &Actor,
+    schema: &LibrarySchema,
+    mask: umask::Mode,
+    txn_id: TxnId,
+) -> String {
+    let host = Link::from_str("/host").expect("host link");
+    let claim = Claim::new(schema.id().clone(), mask);
+    let token = Token::new(
+        host.clone(),
+        std::time::SystemTime::now(),
+        Duration::from_secs(30),
+        actor.id().clone(),
+        claim,
+    );
+    let token = actor.sign_token(token).expect("sign token");
+
+    let txn_claim = Claim::new(
+        Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim link"),
+        umask::USER_EXEC | umask::USER_WRITE,
+    );
+    let token = actor
+        .consume_and_sign(token, host, txn_claim, std::time::SystemTime::now())
+        .expect("sign txn token");
+
+    token.into_jwt()
+}
+
+async fn begin_transaction(addr: std::net::SocketAddr, bearer: String) -> TxnId {
+    let uri = format!("http://{addr}/lib");
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .expect("begin request");
+
+    let response = Client::new()
+        .request(request)
+        .await
+        .expect("begin response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = response
+        .headers()
+        .get("x-tc-txn-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("missing x-tc-txn-id");
+    TxnId::from_str(raw).expect("parse txn id")
+}
+
 async fn put_install_payload(
     addr: std::net::SocketAddr,
     bearer: Option<String>,
     payload: Vec<u8>,
+    txn_id: Option<TxnId>,
 ) -> hyper::Response<Body> {
-    let uri = format!("http://{addr}/lib");
+    let uri = match txn_id {
+        Some(txn_id) => format!("http://{addr}/lib?txn_id={txn_id}"),
+        None => format!("http://{addr}/lib"),
+    };
     let mut req = Request::builder()
         .method("PUT")
         .uri(uri)
@@ -212,6 +283,25 @@ async fn put_install_payload(
     }
     let request = req.body(Body::from(payload)).expect("request");
     Client::new().request(request).await.expect("response")
+}
+
+async fn finalize_install(
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    txn_id: TxnId,
+    commit: bool,
+) -> hyper::Response<Body> {
+    let method = if commit { "POST" } else { "DELETE" };
+    let request = Request::builder()
+        .method(method)
+        .uri(format!("http://{addr}/lib?txn_id={txn_id}"))
+        .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .expect("finalize request");
+    Client::new()
+        .request(request)
+        .await
+        .expect("finalize response")
 }
 
 async fn get_library_status(addr: std::net::SocketAddr, path: &str) -> StatusCode {

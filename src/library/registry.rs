@@ -4,7 +4,7 @@ use std::{
 };
 
 use tc_error::{TCError, TCResult};
-use tc_ir::{Id, LibrarySchema, Map};
+use tc_ir::{Id, LibrarySchema, Map, TxnId};
 
 use crate::{
     storage::{Artifact, LibraryStore},
@@ -13,21 +13,44 @@ use crate::{
 };
 
 use super::LibraryFactory;
-use super::install::{InstallArtifacts, InstallError};
+use super::install::{InstallArtifacts, InstallError, InstallRequest};
 use super::runtime::LibraryRuntime;
 use super::util::{canonical_link, is_path_prefix, normalize_path, schemas_equivalent};
+use super::{HandlerArc, SchemaRoutes};
 
 #[derive(Clone)]
 pub struct LibraryRegistry {
     entries: Arc<RwLock<BTreeMap<String, Arc<LibraryRuntime>>>>,
+    staged: Arc<RwLock<BTreeMap<TxnId, Vec<StagedInstall>>>>,
     store: Option<LibraryStore>,
     factories: BTreeMap<String, LibraryFactory>,
+}
+
+#[derive(Clone)]
+struct StagedInstall {
+    schema_path: String,
+    runtime: Arc<LibraryRuntime>,
+    install: PreparedInstall,
+}
+
+#[derive(Clone)]
+enum PreparedInstall {
+    Schema {
+        schema: LibrarySchema,
+    },
+    Payload {
+        schema: LibrarySchema,
+        routes: SchemaRoutes,
+        handler: HandlerArc,
+        artifact: Artifact,
+    },
 }
 
 impl LibraryRegistry {
     pub fn new(store: Option<LibraryStore>, factories: BTreeMap<String, LibraryFactory>) -> Self {
         Self {
             entries: Arc::new(RwLock::new(BTreeMap::new())),
+            staged: Arc::new(RwLock::new(BTreeMap::new())),
             store,
             factories,
         }
@@ -145,76 +168,112 @@ impl LibraryRegistry {
     }
 
     pub async fn install_schema(&self, schema: LibrarySchema) -> Result<(), InstallError> {
-        let runtime = self
-            .runtime_for_schema(&schema)
-            .await
-            .map_err(|err| InstallError::internal(err.to_string()))?;
-        runtime.state.replace_schema(schema);
-        runtime.routes.clear();
-
-        if let Some(store) = runtime.store.as_ref() {
-            store
-                .persist_schema(&runtime.state.schema())
-                .await
-                .map_err(|err| InstallError::internal(err.to_string()))?;
-        }
-
-        Ok(())
+        let prepared = self.prepare_schema_install(schema).await?;
+        self.apply_prepared_install(&prepared).await
     }
 
     pub async fn install_payload(&self, payload: InstallArtifacts) -> Result<(), InstallError> {
-        let runtime = self
-            .runtime_for_schema(&payload.schema)
-            .await
-            .map_err(|err| InstallError::internal(err.to_string()))?;
+        let prepared = self.prepare_payload_install(payload).await?;
+        self.apply_prepared_install(&prepared).await
+    }
 
-        let artifact = payload
-            .artifacts
-            .into_iter()
-            .find(|artifact| self.factories.contains_key(&artifact.content_type))
-            .ok_or_else(|| {
-                let supported = self
-                    .factories
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                InstallError::bad_request(format!(
-                    "missing supported artifact (expected one of: {supported})"
-                ))
-            })?;
+    pub async fn stage_install_request(
+        &self,
+        txn_id: TxnId,
+        request: InstallRequest,
+    ) -> Result<String, InstallError> {
+        match request {
+            InstallRequest::SchemaOnly(schema) => self.stage_install_schema(txn_id, schema).await,
+            InstallRequest::WithArtifacts(payload) => {
+                self.stage_install_payload(txn_id, payload).await
+            }
+        }
+    }
 
-        let factory = self
-            .factories
-            .get(&artifact.content_type)
-            .ok_or_else(|| InstallError::bad_request("unsupported artifact content type"))?;
-
-        let (manifest_schema, schema_routes, handler) = factory(artifact.bytes.clone())
-            .map_err(|err| InstallError::internal(err.to_string()))?;
-
-        if !schemas_equivalent(&manifest_schema, &payload.schema) {
-            return Err(InstallError::bad_request(
-                "manifest schema does not match descriptor",
-            ));
+    pub async fn stage_install_schema(
+        &self,
+        txn_id: TxnId,
+        schema: LibrarySchema,
+    ) -> Result<String, InstallError> {
+        let prepared = self.prepare_schema_install(schema).await?;
+        if let Err(err) = self.stage_prepared_storage(txn_id, &prepared).await {
+            if let Some(store) = prepared.runtime.store.as_ref() {
+                let _ = store.finalize_txn(txn_id, false).await;
+            }
+            return Err(err);
         }
 
-        runtime
-            .state
-            .replace_with_routes(manifest_schema.clone(), schema_routes);
-        runtime.routes.replace_arc(handler);
+        let schema_path = prepared.schema_path.clone();
+        self.record_staged_install(txn_id, prepared);
+        Ok(schema_path)
+    }
 
-        if let Some(store) = runtime.store.as_ref() {
-            store
-                .persist_artifact(
-                    &manifest_schema,
-                    &Artifact {
-                        content_type: artifact.content_type,
-                        bytes: artifact.bytes,
-                        path: artifact.path,
-                    },
-                )
+    pub async fn stage_install_payload(
+        &self,
+        txn_id: TxnId,
+        payload: InstallArtifacts,
+    ) -> Result<String, InstallError> {
+        let prepared = self.prepare_payload_install(payload).await?;
+        if let Err(err) = self.stage_prepared_storage(txn_id, &prepared).await {
+            if let Some(store) = prepared.runtime.store.as_ref() {
+                let _ = store.finalize_txn(txn_id, false).await;
+            }
+            return Err(err);
+        }
+
+        let schema_path = prepared.schema_path.clone();
+        self.record_staged_install(txn_id, prepared);
+        Ok(schema_path)
+    }
+
+    pub fn has_staged_txn(&self, txn_id: TxnId) -> bool {
+        self.staged
+            .read()
+            .expect("library staged read lock")
+            .contains_key(&txn_id)
+    }
+
+    pub fn discard_txn(&self, txn_id: TxnId) {
+        let staged = self
+            .staged
+            .write()
+            .expect("library staged write lock")
+            .remove(&txn_id)
+            .unwrap_or_default();
+
+        if staged.is_empty() {
+            return;
+        }
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            for install in staged {
+                if let Some(store) = install.runtime.store.clone() {
+                    handle.spawn(async move {
+                        let _ = store.finalize_txn(txn_id, false).await;
+                    });
+                }
+            }
+        }
+    }
+
+    pub async fn finalize_txn(&self, txn_id: TxnId, commit: bool) -> TCResult<()> {
+        let staged = self
+            .staged
+            .write()
+            .expect("library staged write lock")
+            .remove(&txn_id)
+            .unwrap_or_default();
+
+        for install in &staged {
+            self.finalize_prepared_storage(txn_id, commit, install)
                 .await
-                .map_err(|err| InstallError::internal(err.to_string()))?;
+                .map_err(|err| TCError::internal(err.message().to_string()))?;
+        }
+
+        if commit {
+            for install in &staged {
+                self.apply_prepared_runtime(install);
+            }
         }
 
         Ok(())
@@ -266,6 +325,180 @@ impl LibraryRegistry {
         }
 
         Ok(())
+    }
+
+    fn record_staged_install(&self, txn_id: TxnId, install: StagedInstall) {
+        let mut staged = self.staged.write().expect("library staged write lock");
+        let txn = staged.entry(txn_id).or_default();
+        if let Some(existing) = txn
+            .iter_mut()
+            .find(|existing| existing.schema_path == install.schema_path)
+        {
+            *existing = install;
+            return;
+        }
+
+        txn.push(install);
+    }
+
+    async fn prepare_schema_install(
+        &self,
+        schema: LibrarySchema,
+    ) -> Result<StagedInstall, InstallError> {
+        let schema_path = schema.id().to_string();
+        let runtime = self
+            .runtime_for_schema(&schema)
+            .await
+            .map_err(|err| InstallError::internal(err.to_string()))?;
+
+        Ok(StagedInstall {
+            schema_path,
+            runtime,
+            install: PreparedInstall::Schema { schema },
+        })
+    }
+
+    async fn prepare_payload_install(
+        &self,
+        payload: InstallArtifacts,
+    ) -> Result<StagedInstall, InstallError> {
+        let runtime = self
+            .runtime_for_schema(&payload.schema)
+            .await
+            .map_err(|err| InstallError::internal(err.to_string()))?;
+
+        let artifact = payload
+            .artifacts
+            .into_iter()
+            .find(|artifact| self.factories.contains_key(&artifact.content_type))
+            .ok_or_else(|| {
+                let supported = self
+                    .factories
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                InstallError::bad_request(format!(
+                    "missing supported artifact (expected one of: {supported})"
+                ))
+            })?;
+
+        let factory = self
+            .factories
+            .get(&artifact.content_type)
+            .ok_or_else(|| InstallError::bad_request("unsupported artifact content type"))?;
+
+        let (manifest_schema, schema_routes, handler) = factory(artifact.bytes.clone())
+            .map_err(|err| InstallError::internal(err.to_string()))?;
+
+        if !schemas_equivalent(&manifest_schema, &payload.schema) {
+            return Err(InstallError::bad_request(
+                "manifest schema does not match descriptor",
+            ));
+        }
+
+        let schema_path = manifest_schema.id().to_string();
+
+        Ok(StagedInstall {
+            schema_path,
+            runtime,
+            install: PreparedInstall::Payload {
+                schema: manifest_schema,
+                routes: schema_routes,
+                handler,
+                artifact: Artifact {
+                    content_type: artifact.content_type,
+                    bytes: artifact.bytes,
+                    path: artifact.path,
+                },
+            },
+        })
+    }
+
+    async fn apply_prepared_install(&self, install: &StagedInstall) -> Result<(), InstallError> {
+        self.persist_prepared_storage(install).await?;
+        self.apply_prepared_runtime(install);
+
+        Ok(())
+    }
+
+    fn apply_prepared_runtime(&self, install: &StagedInstall) {
+        match &install.install {
+            PreparedInstall::Schema { schema } => {
+                install.runtime.state.replace_schema(schema.clone());
+                install.runtime.routes.clear();
+            }
+            PreparedInstall::Payload {
+                schema,
+                routes,
+                handler,
+                ..
+            } => {
+                install
+                    .runtime
+                    .state
+                    .replace_with_routes(schema.clone(), routes.clone());
+                install.runtime.routes.replace_arc(handler.clone());
+            }
+        }
+    }
+
+    async fn persist_prepared_storage(&self, install: &StagedInstall) -> Result<(), InstallError> {
+        let Some(store) = install.runtime.store.as_ref() else {
+            return Ok(());
+        };
+
+        match &install.install {
+            PreparedInstall::Schema { schema } => store
+                .persist_schema(schema)
+                .await
+                .map_err(|err| InstallError::internal(err.to_string())),
+            PreparedInstall::Payload {
+                schema, artifact, ..
+            } => store
+                .persist_artifact(schema, artifact)
+                .await
+                .map_err(|err| InstallError::internal(err.to_string())),
+        }
+    }
+
+    async fn stage_prepared_storage(
+        &self,
+        txn_id: TxnId,
+        install: &StagedInstall,
+    ) -> Result<(), InstallError> {
+        let Some(store) = install.runtime.store.as_ref() else {
+            return Ok(());
+        };
+
+        match &install.install {
+            PreparedInstall::Schema { schema } => store
+                .stage_schema(txn_id, schema)
+                .await
+                .map_err(|err| InstallError::internal(err.to_string())),
+            PreparedInstall::Payload {
+                schema, artifact, ..
+            } => store
+                .stage_artifact(txn_id, schema, artifact)
+                .await
+                .map_err(|err| InstallError::internal(err.to_string())),
+        }
+    }
+
+    async fn finalize_prepared_storage(
+        &self,
+        txn_id: TxnId,
+        commit: bool,
+        install: &StagedInstall,
+    ) -> Result<(), InstallError> {
+        let Some(store) = install.runtime.store.as_ref() else {
+            return Ok(());
+        };
+
+        store
+            .finalize_txn(txn_id, commit)
+            .await
+            .map_err(|err| InstallError::internal(err.to_string()))
     }
 
     async fn runtime_for_schema(&self, schema: &LibrarySchema) -> TCResult<Arc<LibraryRuntime>> {
