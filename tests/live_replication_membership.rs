@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hyper::{Body, Client, Request, StatusCode};
 use pathlink::Link;
-use tc_ir::{Claim, LibrarySchema};
+use tc_ir::{Claim, LibrarySchema, TxnId};
 use tc_value::Value;
 use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore, Token};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
@@ -137,6 +137,7 @@ async fn start_server(label: &str, storage_root: Option<std::path::PathBuf>) -> 
     let issuer = Arc::new(ReplicationIssuer::new(
         host,
         keys.clone(),
+        Actor::new(Value::from(format!("replication:live:{label}"))),
         keyring.clone(),
         public_keys.clone(),
     ));
@@ -168,9 +169,13 @@ async fn start_server(label: &str, storage_root: Option<std::path::PathBuf>) -> 
 
 async fn install_with_write_token(server: &RunningServer, schema: &LibrarySchema) {
     let token = token_for_schema(&server.actor, schema, USER_WRITE);
+    let txn_id = begin_transaction(server.addr, token).await;
+    let txn_token = token_for_schema_and_txn(&server.actor, schema, USER_WRITE, txn_id);
     let payload = install_payload_for_schema(schema, ir_bytes_for_schema(schema));
-    let response = put_install_payload(server.addr, Some(token), payload).await;
+    let response = put_install_payload(server.addr, Some(txn_token.clone()), payload, Some(txn_id)).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let finalize = finalize_install(server.addr, &txn_token, txn_id, true).await;
+    assert_eq!(finalize.status(), StatusCode::NO_CONTENT);
 }
 
 async fn fetch_payload_for_schema(
@@ -202,12 +207,82 @@ fn token_for_schema(actor: &Actor, schema: &LibrarySchema, mask: umask::Mode) ->
     signed.into_jwt()
 }
 
+fn token_for_schema_and_txn(
+    actor: &Actor,
+    schema: &LibrarySchema,
+    mask: umask::Mode,
+    txn_id: TxnId,
+) -> String {
+    let host = Link::from_str("/host").expect("host link");
+    let claim = Claim::new(schema.id().clone(), mask);
+    let token = Token::new(
+        host.clone(),
+        std::time::SystemTime::now(),
+        Duration::from_secs(30),
+        actor.id().clone(),
+        claim,
+    );
+    let token = actor.sign_token(token).expect("sign token");
+
+    let txn_claim = Claim::new(
+        Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim link"),
+        umask::USER_EXEC | umask::USER_WRITE,
+    );
+    actor
+        .consume_and_sign(token, host, txn_claim, std::time::SystemTime::now())
+        .expect("sign txn token")
+        .into_jwt()
+}
+
+async fn begin_transaction(addr: std::net::SocketAddr, bearer: String) -> TxnId {
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("http://{addr}/lib"))
+        .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .expect("begin request");
+    let response = Client::new()
+        .request(request)
+        .await
+        .expect("begin response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = response
+        .headers()
+        .get("x-tc-txn-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("missing x-tc-txn-id");
+    TxnId::from_str(raw).expect("parse txn id")
+}
+
+async fn finalize_install(
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    txn_id: TxnId,
+    commit: bool,
+) -> hyper::Response<Body> {
+    let method = if commit { "POST" } else { "DELETE" };
+    let request = Request::builder()
+        .method(method)
+        .uri(format!("http://{addr}/lib?txn_id={txn_id}"))
+        .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .expect("finalize request");
+    Client::new()
+        .request(request)
+        .await
+        .expect("finalize response")
+}
+
 async fn put_install_payload(
     addr: std::net::SocketAddr,
     bearer: Option<String>,
     payload: Vec<u8>,
+    txn_id: Option<TxnId>,
 ) -> hyper::Response<Body> {
-    let uri = format!("http://{addr}/lib");
+    let uri = match txn_id {
+        Some(txn_id) => format!("http://{addr}/lib?txn_id={txn_id}"),
+        None => format!("http://{addr}/lib"),
+    };
     let mut req = Request::builder()
         .method("PUT")
         .uri(uri)

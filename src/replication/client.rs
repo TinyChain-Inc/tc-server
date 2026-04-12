@@ -274,6 +274,7 @@ pub async fn heartbeat_peer(
     .await
 }
 
+#[allow(clippy::collapsible_if)]
 pub async fn list_peer_cluster(seed: &str) -> TCResult<PeerClusterListing> {
     #[derive(serde::Deserialize)]
     struct PeerListResponse {

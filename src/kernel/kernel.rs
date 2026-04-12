@@ -231,47 +231,49 @@ impl Kernel {
         let owner_id = owner_id.as_deref();
         let bearer_token = bearer_token.as_deref();
 
-        let flow = if let Some(txn_id) = txn_id
-            && body_is_none
-            && is_component_root
-            && matches!(method, Method::Post | Method::Delete)
-        {
-            let handle = self.txn_manager.get_with_owner(&txn_id, owner_id)?;
+        let flow =
+            if body_is_none && is_component_root && matches!(method, Method::Post | Method::Delete)
+            {
+                if let Some(txn_id) = txn_id {
+                    let handle = self.txn_manager.get_with_owner(&txn_id, owner_id)?;
 
-            let required = match method {
-                Method::Post => umask::USER_EXEC,
-                Method::Delete => umask::USER_WRITE,
-                _ => umask::Mode::new(),
-            };
-            let handle = match claims {
-                Some(claims) => handle.with_claims(claims),
-                None => handle,
-            };
-            let bearer_token = match bearer_token {
-                Some(token) => token,
-                None => {
-                    return Err(crate::txn::TxnError::Unauthorized);
+                    let required = match method {
+                        Method::Post => umask::USER_EXEC,
+                        Method::Delete => umask::USER_WRITE,
+                        _ => umask::Mode::new(),
+                    };
+                    let handle = match claims {
+                        Some(claims) => handle.with_claims(claims),
+                        None => handle,
+                    };
+                    let bearer_token = match bearer_token {
+                        Some(token) => token,
+                        None => {
+                            return Err(crate::txn::TxnError::Unauthorized);
+                        }
+                    };
+                    let handle = handle.with_bearer_token(bearer_token.to_string());
+                    if bearer_token.is_empty() {
+                        return Err(crate::txn::TxnError::Unauthorized);
+                    }
+
+                    let txn_link = pathlink::Link::from_str(&format!("/txn/{}", handle.id()))
+                        .map_err(|_| crate::txn::TxnError::Unauthorized)?;
+                    if !handle.has_claim(&txn_link, required) {
+                        return Err(crate::txn::TxnError::Unauthorized);
+                    }
+                    return Ok(KernelDispatch::Finalize {
+                        commit: method == Method::Post,
+                        txn: handle,
+                    });
                 }
+
+                self.txn_manager
+                    .interpret_request(txn_id, owner_id, bearer_token)?
+            } else {
+                self.txn_manager
+                    .interpret_request(txn_id, owner_id, bearer_token)?
             };
-            let handle = handle.with_bearer_token(bearer_token.to_string());
-            if bearer_token.is_empty() {
-                return Err(crate::txn::TxnError::Unauthorized);
-            }
-
-            let txn_link = pathlink::Link::from_str(&format!("/txn/{}", handle.id()))
-                .map_err(|_| crate::txn::TxnError::Unauthorized)?;
-            if !handle.has_claim(&txn_link, required) {
-                return Err(crate::txn::TxnError::Unauthorized);
-            }
-
-            return Ok(KernelDispatch::Finalize {
-                commit: method == Method::Post,
-                txn: handle,
-            });
-        } else {
-            self.txn_manager
-                .interpret_request(txn_id, owner_id, bearer_token)?
-        };
 
         let dispatch = match flow {
             TxnFlow::Begin(handle) => {

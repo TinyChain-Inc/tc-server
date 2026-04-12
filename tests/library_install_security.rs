@@ -181,7 +181,7 @@ async fn scale_out_joiner_catches_up_after_existing_member_reconciles() {
 
     let seed = start_server("scale-seed").await;
     let leader_peer = format!("http://{}", leader.addr);
-    replicate_from_peers(&seed.registry, &[leader_peer.clone()], &keys).await;
+    replicate_from_peers(&seed.registry, std::slice::from_ref(&leader_peer), &keys).await;
 
     let seed_a = get_library_status(seed.addr, &schema_a.id().to_string()).await;
     assert_eq!(seed_a, StatusCode::OK);
@@ -217,7 +217,7 @@ async fn restart_rehydrates_and_catches_up_after_downtime() {
     let leader_peer = format!("http://{}", leader.addr);
 
     install_library_with_write_token(&leader, &schema_v0).await;
-    replicate_from_peers(&replica.registry, &[leader_peer.clone()], &keys).await;
+    replicate_from_peers(&replica.registry, std::slice::from_ref(&leader_peer), &keys).await;
     let replica_v0_before = get_library_status(replica.addr, &schema_v0.id().to_string()).await;
     assert_eq!(replica_v0_before, StatusCode::OK);
 
@@ -307,7 +307,7 @@ fn install_payload_for_schema(schema: &LibrarySchema, artifact_bytes: Vec<u8>) -
 }
 
 fn shared_replication_keys() -> Vec<aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>> {
-    parse_psk_keys(&vec![
+    parse_psk_keys(&[
         "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
     ])
     .expect("psk keys")
