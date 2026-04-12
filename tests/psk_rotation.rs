@@ -47,7 +47,7 @@ async fn rotates_psk_keys_for_export_integration() {
     }))
     .expect("ir manifest");
 
-    let keys = parse_psk_keys(&vec![
+    let keys = parse_psk_keys(&[
         "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
         "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
     ])
@@ -80,11 +80,11 @@ async fn rotates_psk_keys_for_export_integration() {
         .expect("payload");
     assert_eq!(payload.schema.id(), schema.id());
 
-    let keys_new_only = parse_psk_keys(&vec![
+    let keys_new_only = parse_psk_keys(&[
         "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
     ])
     .expect("keys");
-    let keys_old_only = parse_psk_keys(&vec![
+    let keys_old_only = parse_psk_keys(&[
         "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
     ])
     .expect("keys");

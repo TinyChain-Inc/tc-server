@@ -29,10 +29,10 @@ pub fn parse_psk_keys(values: &[String]) -> tc_error::TCResult<Vec<Key<Aes256Gcm
             let raw = hex::decode(value.trim()).map_err(|_| {
                 TCError::bad_request("invalid PSK: expected hex-encoded 32-byte key")
             })?;
-            if raw.len() != 32 {
-                return Err(TCError::bad_request("invalid PSK: expected 32-byte key"));
-            }
-            Ok(Key::<Aes256GcmSiv>::from_slice(&raw).to_owned())
+            let raw: [u8; 32] = raw
+                .try_into()
+                .map_err(|_| TCError::bad_request("invalid PSK: expected 32-byte key"))?;
+            Ok(raw.into())
         })
         .collect()
 }

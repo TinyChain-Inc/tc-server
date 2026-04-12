@@ -55,14 +55,13 @@ impl Kernel {
             return Some(self.service_handler.call(req));
         }
 
-        if path == crate::uri::HOST_ROOT || path.starts_with(crate::uri::HOST_ROOT_PREFIX) {
-            return Some(self.kernel_handler.call(req));
-        }
-
         match (method, path) {
             (Method::Get, crate::uri::LIB_ROOT) => Some(self.lib_get_handler.call(req)),
             (Method::Put, crate::uri::LIB_ROOT) => Some(self.lib_put_handler.call(req)),
             (Method::Get, "/") => Some(self.kernel_handler.call(req)),
+            (Method::Get, crate::uri::HOST_METRICS) => Some(self.kernel_handler.call(req)),
+            (Method::Get, crate::uri::HOST_PUBLIC_KEY) => Some(self.kernel_handler.call(req)),
+            (Method::Get, crate::uri::HOST_LIBRARY_EXPORT) => Some(self.kernel_handler.call(req)),
             (Method::Post, path) if is_scalar_reflect_path_str(path) => {
                 Some(self.kernel_handler.call(req))
             }
@@ -189,14 +188,12 @@ impl Kernel {
         let owner_id = owner_id.as_deref();
         let bearer_token = bearer_token.as_deref();
 
-        let flow = if txn_id.is_some()
+        let flow = if let Some(txn_id) = txn_id
             && body_is_none
             && is_component_root
             && matches!(method, Method::Post | Method::Delete)
         {
-            let handle = self
-                .txn_manager
-                .get_with_owner(&txn_id.expect("txn_id checked above"), owner_id)?;
+            let handle = self.txn_manager.get_with_owner(&txn_id, owner_id)?;
 
             let required = match method {
                 Method::Post => umask::USER_EXEC,

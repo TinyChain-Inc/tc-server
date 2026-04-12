@@ -65,15 +65,17 @@ pub(super) fn decrypt_path(
     nonce: &[u8],
     path_encrypted: &[u8],
 ) -> TCResult<String> {
+    let nonce = decode_nonce(nonce)?;
     let decrypted = cipher
-        .decrypt(Nonce::from_slice(nonce), path_encrypted)
+        .decrypt(&nonce, path_encrypted)
         .map_err(|_| TCError::bad_request("unable to decrypt replication path"))?;
     String::from_utf8(decrypted)
         .map_err(|cause| TCError::bad_request(format!("invalid UTF8: {cause}")))
 }
 
 fn decrypt_token(cipher: &Aes256GcmSiv, nonce: &[u8], token_encrypted: &[u8]) -> TCResult<String> {
-    match cipher.decrypt(Nonce::from_slice(nonce), token_encrypted) {
+    let nonce = decode_nonce(nonce)?;
+    match cipher.decrypt(&nonce, token_encrypted) {
         Ok(token_decrypted) => String::from_utf8(token_decrypted)
             .map_err(|cause| TCError::bad_request(format!("invalid UTF8: {cause}"))),
         Err(_cause) => Err(TCError::bad_request("unable to decrypt token")),
@@ -84,9 +86,9 @@ fn encrypt_path(cipher: &Aes256GcmSiv, nonce: &[u8], path: &str) -> TCResult<Vec
     let nonce: [u8; 12] = nonce
         .try_into()
         .map_err(|_| TCError::bad_request("invalid nonce length"))?;
-    let nonce = Nonce::from_slice(&nonce);
+    let nonce: Nonce = nonce.into();
     cipher
-        .encrypt(nonce, path.as_bytes())
+        .encrypt(&nonce, path.as_bytes())
         .map_err(|_| TCError::internal("unable to encrypt path"))
 }
 
@@ -94,9 +96,9 @@ fn encrypt_token(cipher: &Aes256GcmSiv, nonce: &[u8], token: String) -> TCResult
     let nonce: [u8; 12] = nonce
         .try_into()
         .map_err(|_| TCError::bad_request("invalid nonce length"))?;
-    let nonce = Nonce::from_slice(&nonce);
+    let nonce: Nonce = nonce.into();
     cipher
-        .encrypt(nonce, token.as_bytes())
+        .encrypt(&nonce, token.as_bytes())
         .map_err(|_| TCError::internal("unable to encrypt token"))
 }
 
@@ -107,4 +109,11 @@ pub(super) fn encrypt_token_with_key(
 ) -> TCResult<Vec<u8>> {
     let cipher = Aes256GcmSiv::new(key);
     encrypt_token(&cipher, nonce, token)
+}
+
+fn decode_nonce(nonce: &[u8]) -> TCResult<Nonce> {
+    let nonce: [u8; 12] = nonce
+        .try_into()
+        .map_err(|_| TCError::bad_request("invalid nonce length"))?;
+    Ok(nonce.into())
 }

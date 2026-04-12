@@ -52,7 +52,7 @@ async fn issues_replication_token() {
     let host = pathlink::Link::from_str("/host").expect("host");
     let keyring = KeyringActorResolver::default();
     let public_keys = PublicKeyStore::default();
-    let keys = parse_psk_keys(&vec![
+    let keys = parse_psk_keys(&[
         "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
         "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
     ])
