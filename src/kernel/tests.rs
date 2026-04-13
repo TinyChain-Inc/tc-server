@@ -1,8 +1,14 @@
 mod tests {
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
     use std::sync::{Arc, Mutex};
 
-    use futures::{future::BoxFuture, FutureExt};
-    use tc_ir::LibrarySchema;
+    use futures::{FutureExt, TryStreamExt, future::BoxFuture};
+    use pathlink::Link;
+    use tc_ir::{Claim, LibrarySchema};
+    use tc_state::State;
+    use tc_value::Value;
+    use umask::USER_READ;
 
     use super::*;
     use crate::resolve::Resolve;
@@ -10,6 +16,15 @@ mod tests {
 
     fn ok_handler() -> impl KernelHandler {
         |_req: Request| async { Response::new(Body::empty()) }.boxed()
+    }
+
+    fn state_response(state: State) -> Response {
+        let stream = destream_json::encode(state).expect("encode state");
+        let body = Body::wrap_stream(stream.map_err(|err| std::io::Error::other(err.to_string())));
+        http::Response::builder()
+            .status(crate::StatusCode::OK)
+            .body(body)
+            .expect("state response")
     }
 
     #[test]
@@ -244,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_requires_txn_claim_even_with_matching_owner() {
+    fn continuation_allows_owner_pinned_token_without_txn_claim() {
         let kernel = Kernel::builder().with_lib_handler(ok_handler()).finish();
 
         let owner_token = crate::auth::TokenContext::new("owner-a", "bearer-a");
@@ -273,10 +288,7 @@ mod tests {
             |_txn, _req| {},
         );
 
-        assert!(matches!(
-            continue_without_claim,
-            Err(crate::txn::TxnError::Unauthorized)
-        ));
+        assert!(continue_without_claim.is_ok());
     }
 
     #[derive(Clone, Default)]
@@ -322,6 +334,205 @@ mod tests {
         ) -> BoxFuture<'static, tc_error::TCResult<()>> {
             Box::pin(async move { Ok(()) })
         }
+    }
+
+    #[test]
+    fn local_path_resolves_locally_without_dependency_routes() {
+        let schema = LibrarySchema::new(
+            "/lib/acme/a/1.0.0".parse().expect("schema id"),
+            "1.0.0",
+            vec![],
+        );
+
+        let registry = crate::library::LibraryRegistry::new(None, BTreeMap::new());
+        futures::executor::block_on(registry.insert_schema(schema)).expect("insert schema");
+        let module = Arc::new(registry);
+        let handlers = crate::library::LibraryHandlers::with_route(
+            ok_handler(),
+            ok_handler(),
+            |_req: Request| async move { state_response(State::from(Value::from("local"))) }.boxed(),
+        );
+
+        let kernel = Kernel::builder()
+            .with_library_module(module, handlers)
+            .finish();
+
+        let op = tc_ir::OpRef::Get((
+            tc_ir::Subject::Link(
+                Link::from_str("/lib/acme/a/1.0.0/echo").expect("local dependency link"),
+            ),
+            tc_ir::Scalar::default(),
+        ));
+
+        let txn = kernel.with_resolver(kernel.txn_manager().begin());
+        let state = futures::executor::block_on(op.resolve(&txn)).expect("local resolve");
+        assert!(matches!(
+            state,
+            State::Scalar(tc_ir::Scalar::Value(Value::String(ref s))) if s == "local"
+        ));
+    }
+
+    #[test]
+    fn unresolved_path_fails_without_route_index_entry() {
+        let schema = LibrarySchema::new(
+            "/lib/acme/a/1.0.0".parse().expect("schema id"),
+            "1.0.0",
+            vec![],
+        );
+
+        let registry = crate::library::LibraryRegistry::new(None, BTreeMap::new());
+        futures::executor::block_on(registry.insert_schema(schema)).expect("insert schema");
+        let module = Arc::new(registry);
+        let handlers = crate::library::LibraryHandlers::without_route(ok_handler(), ok_handler());
+
+        let kernel = Kernel::builder()
+            .with_library_module(module, handlers)
+            .finish();
+
+        let op = tc_ir::OpRef::Get((
+            tc_ir::Subject::Link(
+                Link::from_str("/lib/acme/b/1.0.0/echo").expect("unresolved dependency link"),
+            ),
+            tc_ir::Scalar::default(),
+        ));
+
+        let txn = kernel.with_resolver(kernel.txn_manager().begin());
+        let err = futures::executor::block_on(op.resolve(&txn)).expect_err("expected failure");
+        assert_eq!(err.code(), tc_error::ErrorKind::Unauthorized);
+    }
+
+    #[test]
+    fn dependency_path_routes_via_installed_index() {
+        let schema_a = LibrarySchema::new(
+            "/lib/acme/a/1.0.0".parse().expect("schema a"),
+            "1.0.0",
+            vec!["/lib/acme/b/1.0.0".parse().expect("dependency b")],
+        );
+        let schema_b = LibrarySchema::new(
+            "/lib/acme/b/1.0.0".parse().expect("schema b"),
+            "1.0.0",
+            vec![],
+        );
+
+        let registry = crate::library::LibraryRegistry::new(None, BTreeMap::new());
+        futures::executor::block_on(registry.insert_schema(schema_a.clone())).expect("insert a");
+        futures::executor::block_on(registry.insert_schema(schema_b)).expect("insert b");
+        let module = Arc::new(registry);
+        let handlers = crate::library::LibraryHandlers::with_route(
+            ok_handler(),
+            ok_handler(),
+            |req: Request| {
+                let path = req.uri().path().to_string();
+                async move {
+                    if path.starts_with("/lib/acme/b/1.0.0/") {
+                        state_response(State::from(Value::from("dependency-b")))
+                    } else {
+                        http::Response::builder()
+                            .status(crate::StatusCode::NOT_FOUND)
+                            .body(Body::empty())
+                            .expect("not found")
+                    }
+                }
+                .boxed()
+            },
+        );
+
+        let kernel = Kernel::builder()
+            .with_library_module(module, handlers)
+            .finish();
+
+        let claim = Claim::new(schema_a.id().clone(), USER_READ);
+        let txn = kernel.with_resolver(kernel.txn_manager().begin().with_claims(vec![claim]));
+        let op = tc_ir::OpRef::Get((
+            tc_ir::Subject::Link(
+                Link::from_str("/lib/acme/b/1.0.0/echo").expect("dependency link"),
+            ),
+            tc_ir::Scalar::default(),
+        ));
+
+        let state = futures::executor::block_on(op.resolve(&txn)).expect("dependency resolve");
+        assert!(matches!(
+            state,
+            State::Scalar(tc_ir::Scalar::Value(Value::String(ref s))) if s == "dependency-b"
+        ));
+    }
+
+    #[test]
+    fn multi_library_hosted_case_needs_no_constructor_dependency_wiring() {
+        let schema_a = LibrarySchema::new(
+            "/lib/acme/a/1.0.0".parse().expect("schema a"),
+            "1.0.0",
+            vec![
+                "/lib/acme/b/1.0.0".parse().expect("dependency b"),
+                "/lib/acme/c/1.0.0".parse().expect("dependency c"),
+            ],
+        );
+        let schema_b = LibrarySchema::new(
+            "/lib/acme/b/1.0.0".parse().expect("schema b"),
+            "1.0.0",
+            vec![],
+        );
+        let schema_c = LibrarySchema::new(
+            "/lib/acme/c/1.0.0".parse().expect("schema c"),
+            "1.0.0",
+            vec![],
+        );
+
+        let registry = crate::library::LibraryRegistry::new(None, BTreeMap::new());
+        futures::executor::block_on(registry.insert_schema(schema_a.clone())).expect("insert a");
+        futures::executor::block_on(registry.insert_schema(schema_b)).expect("insert b");
+        futures::executor::block_on(registry.insert_schema(schema_c)).expect("insert c");
+        let module = Arc::new(registry);
+        let handlers = crate::library::LibraryHandlers::with_route(
+            ok_handler(),
+            ok_handler(),
+            |req: Request| {
+                let path = req.uri().path().to_string();
+                async move {
+                    if path.starts_with("/lib/acme/b/1.0.0/") {
+                        return state_response(State::from(Value::from("b")));
+                    }
+
+                    if path.starts_with("/lib/acme/c/1.0.0/") {
+                        return state_response(State::from(Value::from("c")));
+                    }
+
+                    http::Response::builder()
+                        .status(crate::StatusCode::NOT_FOUND)
+                        .body(Body::empty())
+                        .expect("not found")
+                }
+                .boxed()
+            },
+        );
+
+        let kernel = Kernel::builder()
+            .with_library_module(module, handlers)
+            .finish();
+
+        let claim = Claim::new(schema_a.id().clone(), USER_READ);
+        let txn = kernel.with_resolver(kernel.txn_manager().begin().with_claims(vec![claim]));
+
+        let op_b = tc_ir::OpRef::Get((
+            tc_ir::Subject::Link(Link::from_str("/lib/acme/b/1.0.0/echo").expect("b link")),
+            tc_ir::Scalar::default(),
+        ));
+        let op_c = tc_ir::OpRef::Get((
+            tc_ir::Subject::Link(Link::from_str("/lib/acme/c/1.0.0/echo").expect("c link")),
+            tc_ir::Scalar::default(),
+        ));
+
+        let state_b = futures::executor::block_on(op_b.resolve(&txn)).expect("resolve b");
+        let state_c = futures::executor::block_on(op_c.resolve(&txn)).expect("resolve c");
+
+        assert!(matches!(
+            state_b,
+            State::Scalar(tc_ir::Scalar::Value(Value::String(ref s))) if s == "b"
+        ));
+        assert!(matches!(
+            state_c,
+            State::Scalar(tc_ir::Scalar::Value(Value::String(ref s))) if s == "c"
+        ));
     }
 
     #[test]
@@ -477,15 +688,10 @@ mod tests {
             Scalar::Ref(Box::new(TCRef::Op(inner_op))),
         ));
 
-        let response = futures::executor::block_on(outer_op.resolve(&txn)).expect("resolve op");
-
-        assert!(matches!(
-            response,
-            State::Scalar(Scalar::Value(Value::String(ref s))) if s == "ok"
-        ));
+        let err = futures::executor::block_on(outer_op.resolve(&txn)).expect_err("expected unauthorized");
+        assert!(err.message().contains("transaction-chained bearer auth"));
 
         let calls = gateway.calls.lock().expect("calls lock");
-        assert_eq!(calls.len(), 2);
-        assert!(matches!(calls[1].2, Some(Value::String(ref s)) if s == "key"));
+        assert!(calls.is_empty());
     }
 }

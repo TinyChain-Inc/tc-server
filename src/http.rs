@@ -15,6 +15,7 @@ pub use config::{
     HttpKernelConfig, build_http_kernel, build_http_kernel_and_registry_with_config_and_builder,
     build_http_kernel_with_config, build_http_kernel_with_native_library,
     build_http_kernel_with_native_library_and_config,
+    build_http_kernel_with_native_library_and_config_and_builder,
 };
 pub use host::host_handler_with_public_keys;
 pub use server::HttpServer;

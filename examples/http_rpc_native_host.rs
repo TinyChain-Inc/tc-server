@@ -1,5 +1,6 @@
 use std::{env, io::Write, net::TcpListener, str::FromStr};
 
+use base64::Engine as _;
 use futures::{FutureExt, TryStreamExt};
 use pathlink::Link;
 use tc_error::{TCError, TCResult};
@@ -8,7 +9,8 @@ use tc_ir::{
     Subject, TCRef, parse_route_path,
 };
 use tc_value::Value;
-use tinychain::http::build_http_kernel_with_native_library_and_config;
+use tinychain::auth::{Actor, KeyringActorResolver};
+use tinychain::http::build_http_kernel_with_native_library_and_config_and_builder;
 use tinychain::http::{Body, HttpMethod, Request, Response, StatusCode};
 use tinychain::library::NativeLibrary;
 use tinychain::txn::TxnHandle;
@@ -17,6 +19,8 @@ use tinychain::{HttpKernelConfig, HttpServer};
 const B_ROOT: &str = "/lib/example-devco/example/0.1.0";
 const B_HELLO: &str = "/example-devco/example/0.1.0/hello";
 const B_OPDEF: &str = "/example-devco/example/0.1.0/opdef";
+const DEFAULT_ACTOR_ID: &str = "example-admin";
+const DEFAULT_SECRET_KEY_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
 #[derive(Clone)]
 enum HandlerKind {
@@ -180,12 +184,35 @@ fn ok_handler(_req: Request) -> futures::future::BoxFuture<'static, Response> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut actor_id = DEFAULT_ACTOR_ID.to_string();
+    let mut secret_key_b64 = DEFAULT_SECRET_KEY_B64.to_string();
     let bind = env::args()
         .skip(1)
-        .find_map(|arg| arg.strip_prefix("--bind=").map(str::to_string))
-        .unwrap_or_else(|| "127.0.0.1:0".to_string());
+        .fold("127.0.0.1:0".to_string(), |current_bind, arg| {
+            if let Some(value) = arg.strip_prefix("--bind=") {
+                value.to_string()
+            } else if let Some(value) = arg.strip_prefix("--actor-id=") {
+                actor_id = value.to_string();
+                current_bind
+            } else if let Some(value) = arg.strip_prefix("--secret-key-b64=") {
+                secret_key_b64 = value.to_string();
+                current_bind
+            } else {
+                current_bind
+            }
+        });
 
     let bind_addr = std::net::SocketAddr::from_str(&bind)?;
+    let listener = TcpListener::bind(bind_addr)?;
+    let addr = listener.local_addr()?;
+    let host_link = Link::from_str(&format!("http://{addr}"))?;
+    let secret_key_bytes = base64::engine::general_purpose::STANDARD.decode(secret_key_b64)?;
+    let secret_key_bytes: [u8; 32] = secret_key_bytes
+        .try_into()
+        .map_err(|_| "invalid --secret-key-b64: expected 32-byte Ed25519 secret key")?;
+    let signing_key = rjwt::SigningKey::from_bytes(&secret_key_bytes);
+    let actor = Actor::with_public_key(Value::from(actor_id), signing_key.verifying_key());
+    let keyring = KeyringActorResolver::default().with_actor(host_link, actor);
 
     let schema = tc_ir::LibrarySchema::new(Link::from_str(B_ROOT)?, "0.1.0", vec![]);
     let hello_route = parse_route_path(B_HELLO)?;
@@ -207,16 +234,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = LibraryModule::new(schema.clone(), routes);
     let library = NativeLibrary::new(module);
 
-    let kernel = build_http_kernel_with_native_library_and_config(
+    let kernel = build_http_kernel_with_native_library_and_config_and_builder(
         library,
         HttpKernelConfig::default().with_host_id("tc-http-rpc-native-host"),
         ok_handler,
         ok_handler,
         ok_handler,
+        |builder| builder.with_rjwt_keyring_token_verifier(keyring),
     );
-
-    let listener = TcpListener::bind(bind_addr)?;
-    let addr = listener.local_addr()?;
     println!("{addr}");
     eprintln!("serving native B at {B_ROOT}");
     std::io::stdout().flush().ok();

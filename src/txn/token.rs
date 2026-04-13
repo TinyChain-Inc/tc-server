@@ -54,3 +54,10 @@ pub(crate) fn owner_id_from_token(
 
     Ok(format!("{host}::{actor_id}"))
 }
+
+pub(crate) fn has_txn_claim(token: &crate::auth::TokenContext) -> bool {
+    token
+        .claims
+        .iter()
+        .any(|(_, _, claim)| claim.link.to_string().starts_with("/txn/"))
+}

@@ -132,6 +132,14 @@ impl LibraryRegistry {
         best.map(|(id, runtime)| (runtime, id == &path))
     }
 
+    pub fn has_route_root(&self, root: &str) -> bool {
+        let root = normalize_path(root);
+        self.entries
+            .read()
+            .expect("library registry read lock")
+            .contains_key(&root)
+    }
+
     pub fn schema_for_txn(&self, txn: &TxnHandle) -> TCResult<LibrarySchema> {
         let mut best: Option<(usize, LibrarySchema)> = None;
 

@@ -172,18 +172,45 @@ where
     K: KernelHandler,
     He: KernelHandler,
 {
+    build_http_kernel_with_native_library_and_config_and_builder(
+        library,
+        config,
+        service_handler,
+        kernel_handler,
+        health_handler,
+        |builder| builder,
+    )
+}
+
+pub fn build_http_kernel_with_native_library_and_config_and_builder<H, S, K, He, F>(
+    library: NativeLibrary<H>,
+    config: HttpKernelConfig,
+    service_handler: S,
+    kernel_handler: K,
+    health_handler: He,
+    configure: F,
+) -> Kernel
+where
+    H: NativeLibraryHandler,
+    S: KernelHandler,
+    K: KernelHandler,
+    He: KernelHandler,
+    F: FnOnce(KernelBuilder) -> KernelBuilder,
+{
     let native = Arc::new(library);
     let schema_handler = native_schema_get_handler(native.schema().clone());
     let install_handler = native_install_not_supported_handler();
     let routes_handler = http_native_routes_handler(native);
 
-    Kernel::builder()
-        .with_host_id(config.host_id.clone())
-        .with_lib_handler(schema_handler)
-        .with_lib_put_handler(install_handler)
-        .with_lib_route_handler(routes_handler)
-        .with_service_handler(service_handler)
-        .with_kernel_handler(kernel_handler)
-        .with_health_handler(health_handler)
-        .finish()
+    configure(
+        Kernel::builder()
+            .with_host_id(config.host_id.clone())
+            .with_lib_handler(schema_handler)
+            .with_lib_put_handler(install_handler)
+            .with_lib_route_handler(routes_handler)
+            .with_service_handler(service_handler)
+            .with_kernel_handler(kernel_handler)
+            .with_health_handler(health_handler),
+    )
+    .finish()
 }

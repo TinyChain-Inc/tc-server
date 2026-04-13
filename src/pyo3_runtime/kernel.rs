@@ -14,7 +14,7 @@ use tc_value::Value;
 use umask;
 
 use crate::{
-    Body, Kernel, KernelDispatch, KernelHandler, Request, StatusCode,
+    Body, Kernel, KernelDispatch, KernelHandler, Method, Request, StatusCode,
     library::http as http_library,
     resolve::Resolve,
     storage::load_library_root,
@@ -270,6 +270,7 @@ impl KernelHandle {
         let schema = decode_schema_from_json(schema_json)?;
         let module =
             block_on_tokio(http_library::build_http_library_module(schema, None)).expect("module");
+        block_on_tokio(module.hydrate_from_storage()).expect("library hydrate");
         let handlers = http_library::http_library_handlers(&module);
         let config = apply_config_overrides(
             PyKernelConfig::default(),
@@ -309,6 +310,7 @@ impl KernelHandle {
             storage_root,
         ))
         .expect("module");
+        block_on_tokio(module.hydrate_from_storage()).expect("library hydrate");
         let handlers = http_library::http_library_handlers(&module);
         let host =
             Link::from_str(token_host).map_err(|_| PyValueError::new_err("invalid token host"))?;
@@ -357,6 +359,7 @@ impl KernelHandle {
             storage_root,
         ))
         .expect("module");
+        block_on_tokio(module.hydrate_from_storage()).expect("library hydrate");
         let handlers = http_library::http_library_handlers(&module);
         let config = PyKernelConfig {
             data_dir,
@@ -400,6 +403,7 @@ impl KernelHandle {
             storage_root,
         ))
         .expect("module");
+        block_on_tokio(module.hydrate_from_storage()).expect("library hydrate");
         let handlers = http_library::http_library_handlers(&module);
         let host =
             Link::from_str(token_host).map_err(|_| PyValueError::new_err("invalid token host"))?;
@@ -540,6 +544,7 @@ impl KernelHandle {
         };
         let inbound_txn_id = txn_id;
         let mut minted_txn_id: Option<TxnId> = None;
+        let mut minted_txn: Option<crate::txn::TxnHandle> = None;
         let mut request = http_request_from_py_with_body(&request, body_bytes.clone())?;
         if !body_bytes.is_empty() {
             request
@@ -556,13 +561,29 @@ impl KernelHandle {
             token.as_ref(),
             |handle, req| {
                 minted_txn_id = Some(handle.id());
+                minted_txn = Some(handle.clone());
                 req.extensions_mut().insert(handle.clone());
             },
         ) {
             Ok(KernelDispatch::Response(resp)) => {
                 let mut response =
                     self.block_on(async move { py_response_from_http(resp.await).await })?;
+                let mut auto_finalized = false;
                 if inbound_txn_id.is_none()
+                    && route_path == crate::uri::LIB_ROOT
+                    && matches!(method, Method::Put)
+                    && let Some(txn) = minted_txn
+                {
+                    auto_finalized = true;
+                    let commit = response.status() < 400;
+                    let result = self.block_on(self.inner.finalize_transaction(txn, commit));
+                    if result.is_err() {
+                        return Ok(PyKernelResponse::new(400, None, None));
+                    }
+                }
+
+                if !auto_finalized
+                    && inbound_txn_id.is_none()
                     && let Some(txn_id) = minted_txn_id
                 {
                     response

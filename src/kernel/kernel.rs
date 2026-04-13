@@ -105,6 +105,7 @@ impl Kernel {
             token_verifier: Arc::clone(&self.token_verifier),
             txn_manager: self.txn_manager.clone(),
             txn_server: self.txn_server.clone(),
+            lib_route_handler: self.lib_route_handler.as_ref().map(Arc::clone),
             host_handler: Arc::clone(&self.kernel_handler),
         })
     }
@@ -194,7 +195,17 @@ impl Kernel {
 
         let (owner_id, bearer_token, claims) = match (txn_id, token) {
             (Some(txn_id), Some(token)) => {
-                let owner_id = crate::txn::owner_id_from_token(txn_id, token)?;
+                let owner_id = match crate::txn::owner_id_from_token(txn_id, token) {
+                    Ok(owner_id) => owner_id,
+                    Err(crate::txn::TxnError::Unauthorized) => {
+                        if crate::txn::has_txn_claim(token) {
+                            return Err(crate::txn::TxnError::Unauthorized);
+                        }
+
+                        token.owner_id.to_string()
+                    }
+                    Err(err) => return Err(err),
+                };
                 let claims = token
                     .claims
                     .iter()

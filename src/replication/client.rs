@@ -543,17 +543,17 @@ fn decode_peer_cluster_listing(body_bytes: &[u8]) -> TCResult<PeerClusterListing
         let peer = normalize_peer(&identity.peer)?;
         peers.insert(peer.clone());
         if let (Some(actor_id), Some(public_key_b64)) = (identity.actor_id, identity.public_key_b64)
+            && !actor_id.trim().is_empty()
+            && !public_key_b64.trim().is_empty()
         {
-            if !actor_id.trim().is_empty() && !public_key_b64.trim().is_empty() {
-                identities.insert(
-                    peer.clone(),
-                    PeerIdentity {
-                        peer,
-                        actor_id,
-                        public_key_b64,
-                    },
-                );
-            }
+            identities.insert(
+                peer.clone(),
+                PeerIdentity {
+                    peer,
+                    actor_id,
+                    public_key_b64,
+                },
+            );
         }
     }
 
