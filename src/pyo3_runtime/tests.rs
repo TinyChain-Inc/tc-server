@@ -224,6 +224,7 @@ mod tests {
             .txn_manager()
             .begin()
             .with_claims(vec![install_claim]);
+        let install_txn_for_commit = install_txn.clone();
         install_request.extensions_mut().insert(install_txn);
 
         let install_response = remote_kernel
@@ -231,6 +232,10 @@ mod tests {
             .expect("install handler")
             .await;
         assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
+        remote_kernel
+            .finalize_transaction(install_txn_for_commit, true)
+            .await
+            .expect("commit install");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");

@@ -33,6 +33,68 @@ impl Default for HttpRpcGateway {
     }
 }
 
+/// Post state params to a TinyChain route URL without appending transaction query params.
+///
+/// This is intended for externally versioned library routes where the caller must use
+/// exact route paths and bearer-token auth, but does not own TinyChain txn lifecycle.
+pub async fn post_state_raw(
+    endpoint: &str,
+    bearer_token: Option<&str>,
+    params: Map<State>,
+) -> TCResult<State> {
+    let uri: http::Uri = endpoint
+        .parse()
+        .map_err(|err| TCError::bad_request(format!("invalid URI: {err}")))?;
+
+    let body = if params.is_empty() {
+        Vec::new()
+    } else {
+        encode_params_body(params)?
+    };
+
+    let mut builder = http::Request::builder()
+        .method(hyper::Method::POST)
+        .uri(uri);
+
+    if let Some(token) = bearer_token {
+        let token = token.trim();
+        if !token.is_empty() {
+            builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+    }
+
+    if !body.is_empty() {
+        builder = builder.header(http::header::CONTENT_TYPE, "application/json");
+    }
+
+    let request = builder
+        .body(hyper::Body::from(body))
+        .map_err(|err| TCError::bad_request(err.to_string()))?;
+
+    let response = hyper::Client::new()
+        .request(request)
+        .map_err(|err| TCError::bad_gateway(err.to_string()))
+        .await?;
+
+    let status = response.status();
+    let body_bytes = hyper::body::to_bytes(response.into_body())
+        .map_err(|err| TCError::bad_gateway(err.to_string()))
+        .await?;
+
+    if !status.is_success() {
+        return Err(tc_error_from_status(status, body_bytes));
+    }
+
+    if body_bytes.is_empty() || body_bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(State::None);
+    }
+
+    let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(body_bytes)]);
+    destream_json::try_decode(tc_state::null_transaction(), stream)
+        .await
+        .map_err(|err| TCError::bad_request(err.to_string()))
+}
+
 impl RpcGateway for HttpRpcGateway {
     fn get(
         &self,

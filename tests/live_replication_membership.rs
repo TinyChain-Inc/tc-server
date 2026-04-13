@@ -172,7 +172,8 @@ async fn install_with_write_token(server: &RunningServer, schema: &LibrarySchema
     let txn_id = begin_transaction(server.addr, token).await;
     let txn_token = token_for_schema_and_txn(&server.actor, schema, USER_WRITE, txn_id);
     let payload = install_payload_for_schema(schema, ir_bytes_for_schema(schema));
-    let response = put_install_payload(server.addr, Some(txn_token.clone()), payload, Some(txn_id)).await;
+    let response =
+        put_install_payload(server.addr, Some(txn_token.clone()), payload, Some(txn_id)).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let finalize = finalize_install(server.addr, &txn_token, txn_id, true).await;
     assert_eq!(finalize.status(), StatusCode::NO_CONTENT);
