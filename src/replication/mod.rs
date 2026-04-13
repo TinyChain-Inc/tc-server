@@ -9,6 +9,7 @@ mod peers;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -356,16 +357,63 @@ where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = TCResult<()>>,
 {
-    for peer in membership.active_peers() {
-        match apply(peer.clone()).await {
-            Ok(()) => membership.mark_success(&peer),
-            Err(err) => {
-                eprintln!("live replication: failed to {operation} on {peer}: {err}");
-                membership.mark_failure(&peer);
-                return Err(err);
+    const FANOUT_MAX_ATTEMPTS: usize = 3;
+
+    let mut delivered = HashSet::new();
+    let mut first_error = None;
+    let mut had_targets = false;
+
+    for attempt in 1..=FANOUT_MAX_ATTEMPTS {
+        let targets = membership
+            .active_peers()
+            .into_iter()
+            .filter(|peer| !delivered.contains(peer))
+            .collect::<Vec<_>>();
+
+        if targets.is_empty() {
+            break;
+        }
+        had_targets = true;
+
+        for peer in targets {
+            match apply(peer.clone()).await {
+                Ok(()) => {
+                    membership.mark_success(&peer);
+                    delivered.insert(peer);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "live replication: failed to {operation} on {peer} (attempt {attempt}/{FANOUT_MAX_ATTEMPTS}): {err}"
+                    );
+                    membership.mark_failure(&peer);
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
             }
         }
     }
 
-    Ok(())
+    let unresolved = membership
+        .active_peers()
+        .into_iter()
+        .filter(|peer| !delivered.contains(peer))
+        .collect::<Vec<_>>();
+
+    if unresolved.is_empty() {
+        if had_targets && delivered.is_empty() {
+            Err(first_error.unwrap_or_else(|| {
+                TCError::bad_gateway(format!("failed to {operation}: no reachable peers"))
+            }))
+        } else {
+            Ok(())
+        }
+    } else {
+        Err(first_error.unwrap_or_else(|| {
+            TCError::bad_gateway(format!(
+                "failed to {operation} on unresolved peers: {}",
+                unresolved.join(", ")
+            ))
+        }))
+    }
 }

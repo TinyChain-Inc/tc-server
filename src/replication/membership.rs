@@ -100,6 +100,14 @@ impl PeerMembership {
             .remove(peer);
     }
 
+    pub fn retain<F>(&self, mut keep: F)
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut peers = self.peers.write().expect("peer membership write");
+        peers.retain(|peer, _| keep(peer));
+    }
+
     pub fn active_peers(&self) -> Vec<String> {
         let peers = self.peers.read().expect("peer membership read");
         let mut peers = peers.keys().cloned().collect::<Vec<_>>();

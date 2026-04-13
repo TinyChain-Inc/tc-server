@@ -12,8 +12,10 @@ use hyper::body::to_bytes;
 use hyper::{Body, Request, StatusCode};
 use pathlink::Link;
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tc_ir::LibrarySchema;
 
 #[tokio::test]
@@ -207,4 +209,67 @@ async fn kernel_routes_cluster_membership_under_lib_prefix() {
         _ => panic!("expected response dispatch"),
     };
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn fanout_prunes_stale_peers_within_single_operation() {
+    let membership = PeerMembership::new(vec![
+        "http://10.0.0.1:8702".to_string(),
+        "http://10.0.0.2:8702".to_string(),
+        "http://10.0.0.3:8702".to_string(),
+    ]);
+
+    let calls: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    let calls_for_apply = calls.clone();
+
+    let result = super::fanout_peers(&membership, "test operation", move |peer| {
+        let calls = calls_for_apply.clone();
+        async move {
+            let mut calls = calls.lock().expect("calls lock");
+            let count = calls.entry(peer.clone()).or_insert(0);
+            *count += 1;
+            drop(calls);
+
+            if peer == "http://10.0.0.1:8702" {
+                Ok(())
+            } else {
+                Err(tc_error::TCError::bad_gateway("simulated stale peer"))
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "fanout should succeed after pruning stale peers"
+    );
+
+    let calls = calls.lock().expect("calls lock");
+    assert_eq!(calls.get("http://10.0.0.1:8702"), Some(&1));
+    assert_eq!(calls.get("http://10.0.0.2:8702"), Some(&3));
+    assert_eq!(calls.get("http://10.0.0.3:8702"), Some(&3));
+
+    assert_eq!(
+        membership.active_peers(),
+        vec!["http://10.0.0.1:8702".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn fanout_rejects_when_all_peers_are_unreachable() {
+    let membership = PeerMembership::new(vec![
+        "http://10.0.1.1:8702".to_string(),
+        "http://10.0.1.2:8702".to_string(),
+    ]);
+
+    let result = super::fanout_peers(&membership, "test operation", |_peer| async move {
+        Err(tc_error::TCError::bad_gateway("simulated unreachable peer"))
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "fanout must fail when no peer is reachable"
+    );
+    assert!(membership.active_peers().is_empty());
 }

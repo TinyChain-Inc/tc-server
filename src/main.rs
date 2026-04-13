@@ -6,9 +6,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "mdns")]
-use std::env;
-
 use base64::Engine as _;
 use clap::Parser;
 use futures::FutureExt;
@@ -37,6 +34,9 @@ const DEFAULT_BIND: &str = "0.0.0.0:8702";
 const DEFAULT_DATA_DIR: &str = "/tmp/tinychain";
 #[cfg(feature = "mdns")]
 const SERVICE_TYPE: &str = "_tinychain._tcp.local.";
+
+#[cfg(feature = "mdns")]
+use std::env;
 
 #[derive(Clone, Debug, Deserialize)]
 struct TrustedInstaller {
@@ -441,6 +441,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    if let Some(k8s_dns) = config.k8s_dns.clone() {
+        let membership_for_discovery = membership.clone();
+        let discovery_port = config.k8s_port.unwrap_or(bind.port());
+        let bind_ip = bind.ip();
+        let advertise_ip = config.advertise_ip;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+
+                let mut discovered = discover_k8s_peers(&k8s_dns, discovery_port).await;
+                discovered = dedupe_peers(discovered);
+                discovered.retain(|peer| !is_self(peer, bind_ip, advertise_ip, discovery_port));
+                let resolved: HashSet<String> = discovered.iter().cloned().collect();
+                membership_for_discovery.retain(|peer| resolved.contains(peer));
+
+                for peer in discovered {
+                    match tinychain::replication::normalize_peer(&peer) {
+                        Ok(peer) => {
+                            membership_for_discovery.upsert_active(peer);
+                        }
+                        Err(err) => {
+                            eprintln!("k8s peer discovery ignored invalid peer {peer}: {err}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     #[cfg(feature = "mdns")]
     if let Some(advertise_ip) = if config.mdns {
         advertise_ip(bind, config.advertise_ip)
@@ -681,11 +712,17 @@ fn advertise_ip(bind: SocketAddr, override_ip: Option<IpAddr>) -> Option<IpAddr>
 
 async fn discover_k8s_peers(dns: &str, port: u16) -> Vec<String> {
     let mut out = Vec::new();
+    let dns = dns.trim().trim_matches('.');
+    if dns.is_empty() {
+        return out;
+    }
+
     if let Ok(addrs) = (dns, port).to_socket_addrs() {
         for addr in addrs {
             out.push(addr.to_string());
         }
     }
+
     out
 }
 
