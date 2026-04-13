@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "mdns")]
+use std::env;
 
 use base64::Engine as _;
 use clap::Parser;
@@ -25,10 +27,10 @@ use tinychain::http::{
 };
 use tinychain::kernel::KernelHandler;
 use tinychain::replication::{
-    PEERS_HEARTBEAT_PATH, PEERS_JOIN_PATH, PEERS_LEAVE_PATH, PEERS_PATH, PeerMembership,
-    ReplicatedTxnTracker, ReplicationIssuer, announce_self_to_cluster, export_handler,
-    live_replicating_finalize_hook, live_replicating_install_put_handler, parse_psk_keys,
-    parse_psk_list, peer_membership_handler, replicate_from_peers, replication_token_handler,
+    PeerMembership, PeerRoutes, ReplicatedTxnTracker, ReplicationIssuer, announce_self_to_cluster,
+    export_handler, is_peer_membership_path, live_replicating_finalize_hook,
+    live_replicating_install_put_handler, parse_psk_keys, parse_psk_list, peer_membership_handler,
+    replicate_from_peers, replication_token_handler,
 };
 
 const DEFAULT_BIND: &str = "0.0.0.0:8702";
@@ -41,18 +43,22 @@ struct TrustedInstaller {
     host: String,
     actor_id: String,
     public_key_b64: String,
-    #[serde(default, alias = "allowed_lib_roots")]
+    #[serde(default)]
     allowed_lib_prefixes: Vec<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct TrustedInstallerPolicy {
     by_actor: HashMap<(String, String), Vec<String>>,
+    replication_root: String,
 }
 
 impl TrustedInstallerPolicy {
-    fn from_installers(installers: &[TrustedInstaller]) -> TCResult<Self> {
-        let mut by_actor = HashMap::new();
+    fn from_installers(installers: &[TrustedInstaller], cluster_root: &str) -> TCResult<Self> {
+        let mut policy = Self {
+            by_actor: HashMap::new(),
+            replication_root: normalize_lib_prefix(cluster_root)?,
+        };
 
         for installer in installers {
             let host = Link::from_str(&installer.host).map_err(|err| {
@@ -76,17 +82,22 @@ impl TrustedInstallerPolicy {
                 )));
             }
 
-            by_actor.insert((host.to_string(), actor_id.to_string()), prefixes);
+            policy
+                .by_actor
+                .insert((host.to_string(), actor_id.to_string()), prefixes);
         }
 
-        Ok(Self { by_actor })
+        Ok(policy)
     }
 
-    fn validate_context(&self, ctx: &TokenContext) -> Result<(), tinychain::txn::TxnError> {
-        if self.by_actor.is_empty() {
-            return Ok(());
-        }
+    fn replication_root(&self) -> &str {
+        &self.replication_root
+    }
 
+    fn validate_external_context(
+        &self,
+        ctx: &TokenContext,
+    ) -> Result<(), tinychain::txn::TxnError> {
         for (host, actor_id, claim) in &ctx.claims {
             let path = claim.link.to_string();
 
@@ -94,7 +105,6 @@ impl TrustedInstallerPolicy {
                 continue;
             }
 
-            // Replication tokens are host-internal and issued by the kernel.
             if host == "/host" {
                 continue;
             }
@@ -123,11 +133,23 @@ impl TrustedInstallerPolicy {
 struct TrustedInstallerTokenVerifier {
     inner: RjwtTokenVerifier,
     policy: TrustedInstallerPolicy,
+    replication_membership: PeerMembership,
+    local_replication_actor_id: String,
 }
 
 impl TrustedInstallerTokenVerifier {
-    fn new(inner: RjwtTokenVerifier, policy: TrustedInstallerPolicy) -> Self {
-        Self { inner, policy }
+    fn new(
+        inner: RjwtTokenVerifier,
+        policy: TrustedInstallerPolicy,
+        replication_membership: PeerMembership,
+        local_replication_actor_id: String,
+    ) -> Self {
+        Self {
+            inner,
+            policy,
+            replication_membership,
+            local_replication_actor_id,
+        }
     }
 }
 
@@ -138,9 +160,37 @@ impl TokenVerifier for TrustedInstallerTokenVerifier {
     ) -> futures::future::BoxFuture<'static, Result<TokenContext, tinychain::txn::TxnError>> {
         let inner = self.inner.clone();
         let policy = self.policy.clone();
+        let replication_membership = self.replication_membership.clone();
+        let local_replication_actor_id = self.local_replication_actor_id.clone();
         async move {
             let ctx = inner.verify(bearer_token).await?;
-            policy.validate_context(&ctx)?;
+            policy.validate_external_context(&ctx)?;
+
+            for (host, actor_id, claim) in &ctx.claims {
+                let path = claim.link.to_string();
+                if path.starts_with("/txn/") {
+                    continue;
+                }
+
+                if host == "/host" {
+                    let from_known_replica = actor_id == &local_replication_actor_id
+                        || replication_membership
+                            .peer_descriptors()
+                            .iter()
+                            .any(|peer| peer.actor_id.as_deref() == Some(actor_id.as_str()));
+
+                    if !from_known_replica {
+                        return Err(tinychain::txn::TxnError::Unauthorized);
+                    }
+
+                    if path != "/host/library/export"
+                        && !path_matches_prefix(&path, policy.replication_root())
+                    {
+                        return Err(tinychain::txn::TxnError::Unauthorized);
+                    }
+                }
+            }
+
             Ok(ctx)
         }
         .boxed()
@@ -166,6 +216,13 @@ struct Config {
 
     #[arg(long, env = "TC_HOST_ID", default_value = "tc-server")]
     host_id: String,
+
+    #[arg(
+        long = "cluster-root",
+        env = "TC_CLUSTER_ROOT",
+        default_value = "/lib/example-devco"
+    )]
+    cluster_root: String,
 
     #[arg(long = "peer", env = "TC_PEERS", value_delimiter = ',', action = clap::ArgAction::Append)]
     peers: Vec<String>,
@@ -218,18 +275,6 @@ impl Config {
         config.peers = flatten_list(config.peers);
         config.psk_keys = flatten_psk_list(config.psk_keys);
 
-        let psk_value = if config.psk_keys.is_empty() {
-            env::var("TC_PSK")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        } else {
-            None
-        };
-        if let Some(value) = psk_value {
-            config.psk_keys.push(value);
-        }
-
         if config.no_replicate {
             config.replicate = false;
         }
@@ -263,8 +308,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_txn_ttl(Duration::from_secs(config.request_ttl_secs))
         .with_max_request_bytes_unauth(config.max_request_bytes);
 
+    let peer_routes = PeerRoutes::new(&config.cluster_root)?;
     let trusted_installers = load_trusted_installers(&config)?;
-    let installer_policy = TrustedInstallerPolicy::from_installers(&trusted_installers)?;
+    let installer_policy =
+        TrustedInstallerPolicy::from_installers(&trusted_installers, peer_routes.cluster_root())?;
 
     let public_keys = PublicKeyStore::default();
     let host = Link::from_str("/host")?;
@@ -279,7 +326,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keyring = keyring.with_actor(host.clone(), local_host_actor);
 
     let keys = parse_psk_keys(&config.psk_keys)?;
-    let replication_actor = Actor::new(Value::from(format!("replication:{}", config.host_id)));
+    let replication_actor_id = format!("replication:{}", config.host_id);
+    let replication_actor = Actor::new(Value::from(replication_actor_id.clone()));
     let issuer = Arc::new(ReplicationIssuer::new(
         host,
         keys.clone(),
@@ -316,6 +364,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_keys_for_kernel = public_keys.clone();
     let installer_policy_for_kernel = installer_policy.clone();
     let membership_for_kernel = membership.clone();
+    let replication_actor_id_for_kernel = replication_actor_id.clone();
+    let peer_routes_for_kernel = peer_routes.clone();
     let keys_for_kernel = keys.clone();
     let tracker_for_kernel = ReplicatedTxnTracker::default();
     let (kernel, registry) = build_http_kernel_and_registry_with_config_and_builder(
@@ -332,11 +382,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let peers_handler: Arc<dyn KernelHandler> = Arc::new(peer_membership_handler(
                 membership_for_kernel.clone(),
                 issuer_for_kernel.clone(),
+                peer_routes_for_kernel.clone(),
             ));
             let host_handler = combined_host_handler(public, token, export, peers_handler);
             let verifier = TrustedInstallerTokenVerifier::new(
                 RjwtTokenVerifier::new(Arc::new(keyring_for_kernel)),
                 installer_policy_for_kernel,
+                membership_for_kernel.clone(),
+                replication_actor_id_for_kernel.clone(),
             );
             let live_put = live_replicating_install_put_handler(
                 registry.clone(),
@@ -362,6 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_membership = membership.clone();
     let bootstrap_peers = peers.clone();
     let bootstrap_keys = keys.clone();
+    let bootstrap_routes = peer_routes.clone();
     let bootstrap_replicate = config.replicate;
     let bootstrap_self_peer = self_peer(bind, config.advertise_ip);
     let bootstrap_issuer = issuer.clone();
@@ -376,6 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     announce_self_to_cluster(
                         &bootstrap_membership,
                         &identity,
+                        &bootstrap_routes,
                         &bootstrap_keys,
                         &bootstrap_issuer,
                     )
@@ -443,9 +498,7 @@ fn combined_host_handler(
             match path.as_str() {
                 "/" => token.call(req).await,
                 "/host/library/export" => export.call(req).await,
-                PEERS_PATH | PEERS_JOIN_PATH | PEERS_LEAVE_PATH | PEERS_HEARTBEAT_PATH => {
-                    peers.call(req).await
-                }
+                path if is_peer_membership_path(path) => peers.call(req).await,
                 _ => public.call(req).await,
             }
         }
@@ -711,6 +764,10 @@ async fn advertise_mdns(ip: IpAddr, port: u16) -> TCResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use tc_ir::Claim;
+    use umask::{USER_READ, USER_WRITE};
 
     #[test]
     fn parses_psk_list() {
@@ -722,5 +779,223 @@ mod tests {
     fn dedupes_peers() {
         let peers = dedupe_peers(vec!["1.2.3.4:5".to_string(), "1.2.3.4:5".to_string()]);
         assert_eq!(peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn trusted_installer_verifier_rejects_opaque_anonymous_tokens() {
+        let policy =
+            TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
+        let verifier = TrustedInstallerTokenVerifier::new(
+            RjwtTokenVerifier::new(Arc::new(KeyringActorResolver::default())),
+            policy,
+            PeerMembership::new(Vec::new()),
+            "replication:local".to_string(),
+        );
+
+        let result = verifier.verify("anonymous-session-token".to_string()).await;
+        assert!(matches!(
+            result,
+            Err(tinychain::txn::TxnError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn trusted_installer_verifier_still_enforces_claim_policy_for_signed_tokens() {
+        let host = Link::from_str("http://127.0.0.1:8702").expect("host");
+        let actor = Actor::new(Value::from("trusted-installer"));
+        let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
+
+        let policy = TrustedInstallerPolicy::from_installers(
+            &[TrustedInstaller {
+                host: host.to_string(),
+                actor_id: "trusted-installer".to_string(),
+                public_key_b64: base64::engine::general_purpose::STANDARD
+                    .encode(actor.public_key().to_bytes()),
+                allowed_lib_prefixes: vec!["/lib/example-devco".to_string()],
+            }],
+            "/lib/example-devco",
+        )
+        .expect("policy");
+
+        let verifier = TrustedInstallerTokenVerifier::new(
+            RjwtTokenVerifier::new(Arc::new(keyring)),
+            policy,
+            PeerMembership::new(Vec::new()),
+            "replication:local".to_string(),
+        );
+
+        let denied_claim = Claim::new(
+            Link::from_str("/lib/otherco/private/1.0.0").expect("claim"),
+            USER_WRITE,
+        );
+        let token = tinychain::auth::Token::new(
+            host,
+            SystemTime::now(),
+            Duration::from_secs(30),
+            actor.id().clone(),
+            denied_claim,
+        );
+        let signed = actor.sign_token(token).expect("signed").into_jwt();
+
+        let result = verifier.verify(signed).await;
+        assert!(matches!(
+            result,
+            Err(tinychain::txn::TxnError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn trusted_installer_verifier_rejects_jwt_shaped_garbage_tokens() {
+        let policy =
+            TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
+        let verifier = TrustedInstallerTokenVerifier::new(
+            RjwtTokenVerifier::new(Arc::new(KeyringActorResolver::default())),
+            policy,
+            PeerMembership::new(Vec::new()),
+            "replication:local".to_string(),
+        );
+
+        let result = verifier.verify("aaa.bbb.ccc".to_string()).await;
+        assert!(matches!(
+            result,
+            Err(tinychain::txn::TxnError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn trusted_installer_policy_rejects_unconfigured_external_actor() {
+        let host = Link::from_str("http://127.0.0.1:8702").expect("host");
+        let actor = Actor::new(Value::from("external-installer"));
+        let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
+        let policy =
+            TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
+        let verifier = TrustedInstallerTokenVerifier::new(
+            RjwtTokenVerifier::new(Arc::new(keyring)),
+            policy,
+            PeerMembership::new(Vec::new()),
+            "replication:local".to_string(),
+        );
+
+        let claim = Claim::new(
+            Link::from_str("/lib/example-devco/example/1.0.0").expect("claim"),
+            USER_WRITE,
+        );
+        let token = tinychain::auth::Token::new(
+            host,
+            SystemTime::now(),
+            Duration::from_secs(30),
+            actor.id().clone(),
+            claim,
+        );
+        let signed = actor.sign_token(token).expect("signed").into_jwt();
+
+        let result = verifier.verify(signed).await;
+        assert!(matches!(
+            result,
+            Err(tinychain::txn::TxnError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn trusted_installer_policy_allows_host_replication_actor() {
+        let host = Link::from_str("/host").expect("host");
+        let actor = Actor::new(Value::from("replication:node-a"));
+        let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
+        let policy =
+            TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
+        let verifier = TrustedInstallerTokenVerifier::new(
+            RjwtTokenVerifier::new(Arc::new(keyring)),
+            policy,
+            PeerMembership::new(Vec::new()),
+            "replication:node-a".to_string(),
+        );
+
+        let claim = Claim::new(
+            Link::from_str("/lib/example-devco/example/1.0.0").expect("claim"),
+            USER_READ,
+        );
+        let token = tinychain::auth::Token::new(
+            host,
+            SystemTime::now(),
+            Duration::from_secs(30),
+            actor.id().clone(),
+            claim,
+        );
+        let signed = actor.sign_token(token).expect("signed").into_jwt();
+
+        let result = verifier.verify(signed).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn trusted_installer_policy_allows_known_peer_replication_actor() {
+        let host = Link::from_str("/host").expect("host");
+        let actor = Actor::new(Value::from("replication:node-b"));
+        let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
+        let policy =
+            TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
+        let membership = PeerMembership::new(Vec::new());
+        membership.upsert_identity(tinychain::replication::PeerIdentity {
+            peer: "http://10.0.0.2:8702".to_string(),
+            actor_id: "replication:node-b".to_string(),
+            public_key_b64: base64::engine::general_purpose::STANDARD
+                .encode(actor.public_key().to_bytes()),
+        });
+        let verifier = TrustedInstallerTokenVerifier::new(
+            RjwtTokenVerifier::new(Arc::new(keyring)),
+            policy,
+            membership,
+            "replication:node-a".to_string(),
+        );
+
+        let claim = Claim::new(
+            Link::from_str("/lib/example-devco/example/1.0.0").expect("claim"),
+            USER_READ,
+        );
+        let token = tinychain::auth::Token::new(
+            host,
+            SystemTime::now(),
+            Duration::from_secs(30),
+            actor.id().clone(),
+            claim,
+        );
+        let signed = actor.sign_token(token).expect("signed").into_jwt();
+
+        let result = verifier.verify(signed).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn trusted_installer_policy_rejects_host_replication_outside_cluster_root() {
+        let host = Link::from_str("/host").expect("host");
+        let actor = Actor::new(Value::from("replication:node-a"));
+        let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
+        let policy =
+            TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
+        let verifier = TrustedInstallerTokenVerifier::new(
+            RjwtTokenVerifier::new(Arc::new(keyring)),
+            policy,
+            PeerMembership::new(Vec::new()),
+            "replication:node-a".to_string(),
+        );
+
+        let claim = Claim::new(
+            Link::from_str("/lib/otherco/private/1.0.0").expect("claim"),
+            USER_READ,
+        );
+        let token = tinychain::auth::Token::new(
+            host,
+            SystemTime::now(),
+            Duration::from_secs(30),
+            actor.id().clone(),
+            claim,
+        );
+        let signed = actor.sign_token(token).expect("signed").into_jwt();
+
+        let result = verifier.verify(signed).await;
+        assert!(matches!(
+            result,
+            Err(tinychain::txn::TxnError::Unauthorized)
+        ));
     }
 }

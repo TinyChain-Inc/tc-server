@@ -128,9 +128,7 @@ impl Service<Request> for KernelService {
 
             let bearer = parse_bearer_token(&req);
             let inbound_txn_id = txn_id;
-            let inbound_bearer = bearer.clone();
             let mut minted_txn_id = None;
-            let mut minted_token = None;
             let token = match bearer {
                 Some(token) => match kernel.token_verifier().verify(token).await {
                     Ok(token) => Some(token),
@@ -156,9 +154,6 @@ impl Service<Request> for KernelService {
                 token.as_ref(),
                 |handle, req| {
                     minted_txn_id = Some(handle.id());
-                    if inbound_bearer.is_none() {
-                        minted_token = handle.raw_token().map(str::to_string);
-                    }
                     req.extensions_mut().insert(handle.clone());
                 },
             ) {
@@ -170,11 +165,6 @@ impl Service<Request> for KernelService {
                             .and_then(Result::ok)
                         {
                             response.headers_mut().insert("x-tc-txn-id", value);
-                        }
-                        if let Some(value) =
-                            minted_token.and_then(|token| HeaderValue::from_str(&token).ok())
-                        {
-                            response.headers_mut().insert("x-tc-bearer-token", value);
                         }
                     }
 

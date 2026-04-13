@@ -81,6 +81,17 @@ mod tests {
 
             futures::future::ready(Ok(ctx)).boxed()
         }
+
+        fn grant(
+            &self,
+            token: crate::auth::TokenContext,
+            _claim: tc_ir::Claim,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::auth::TokenContext, crate::txn::TxnError>,
+        > {
+            futures::future::ready(Ok(token)).boxed()
+        }
     }
 
     #[tokio::test]
@@ -132,7 +143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_bearer_token_for_anonymous_txn() {
+    async fn does_not_return_bearer_token_for_anonymous_txn() {
         let kernel: Kernel = Kernel::builder()
             .with_lib_handler(ok_handler())
             .with_lib_put_handler(ok_handler())
@@ -158,11 +169,7 @@ mod tests {
             .get("x-tc-txn-id")
             .and_then(|value| value.to_str().ok())
             .expect("missing x-tc-txn-id header");
-        let bearer = response
-            .headers()
-            .get("x-tc-bearer-token")
-            .and_then(|value| value.to_str().ok())
-            .expect("missing x-tc-bearer-token header");
+        assert!(response.headers().get("x-tc-bearer-token").is_none());
 
         let commit = http::Request::builder()
             .method("POST")
@@ -172,16 +179,6 @@ mod tests {
 
         let commit_response = service.call(commit).await.expect("commit response");
         assert_eq!(commit_response.status(), StatusCode::UNAUTHORIZED);
-
-        let commit = http::Request::builder()
-            .method("POST")
-            .uri(format!("/lib?txn_id={txn_id}"))
-            .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
-            .body(Body::empty())
-            .expect("commit request with bearer");
-
-        let commit_response = service.call(commit).await.expect("commit response");
-        assert_eq!(commit_response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -382,6 +379,7 @@ mod tests {
         let remote_kernel: Kernel = Kernel::builder()
             .with_host_id("tc-wasm-test")
             .with_library_module(module, handlers)
+            .with_token_verifier(TestTokenVerifier)
             .with_service_handler(ok_handler())
             .with_kernel_handler(ok_handler())
             .with_health_handler(ok_handler())
@@ -454,9 +452,14 @@ mod tests {
             .with_library_module(module, handlers)
             .with_dependency_route("/lib/example-devco/example/0.1.0", addr)
             .with_http_rpc_gateway()
+            .with_token_verifier(TestTokenVerifier)
             .finish();
 
-        let txn = local_kernel.with_resolver(remote_kernel.txn_manager().begin());
+        let seeded = local_kernel
+            .txn_manager()
+            .begin_with_owner(Some("owner-a"), Some("owner-a"));
+        let tokenized = seeded.with_bearer_token(format!("owner-a|{}", seeded.id()));
+        let txn = local_kernel.with_resolver(tokenized);
 
         let link = Link::from_str("/lib/example-devco/example/0.1.0/hello").expect("op link");
         let op = OpRef::Get((

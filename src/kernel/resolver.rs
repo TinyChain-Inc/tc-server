@@ -40,12 +40,8 @@ impl KernelTxnResolver {
                     .await
                     .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
 
-                let owner_id = if ctx.claims.is_empty() {
-                    ctx.owner_id.clone()
-                } else {
-                    crate::txn::owner_id_from_token(txn.id(), &ctx)
-                        .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?
-                };
+                let owner_id = crate::txn::owner_id_from_token(txn.id(), &ctx)
+                    .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
 
                 if self.txn_manager.get(&txn.id()).is_some() {
                     match self.txn_manager.interpret_request(

@@ -20,7 +20,6 @@ pub struct KernelBuilder {
     library_module: Option<Arc<LibraryRegistry>>,
     rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
-    kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
     txn_finalize_hook: Option<TxnFinalizeHook>,
 }
 
@@ -39,7 +38,6 @@ impl Default for KernelBuilder {
             library_module: None,
             rpc_gateway: None,
             token_verifier: crate::auth::default_token_verifier(),
-            kernel_actor: None,
             txn_finalize_hook: None,
         }
     }
@@ -152,11 +150,6 @@ impl KernelBuilder {
         self
     }
 
-    pub fn with_kernel_actor(mut self, host: pathlink::Link, actor: crate::auth::Actor) -> Self {
-        self.kernel_actor = Some((host, actor));
-        self
-    }
-
     pub fn with_txn_finalize_hook<F, Fut>(mut self, hook: F) -> Self
     where
         F: Fn(crate::txn::TxnHandle, bool) -> Fut + Send + Sync + 'static,
@@ -209,7 +202,6 @@ impl KernelBuilder {
             library_module: self.library_module,
             rpc_gateway: self.rpc_gateway,
             token_verifier: self.token_verifier,
-            kernel_actor: self.kernel_actor,
             txn_finalize_hook: self.txn_finalize_hook,
         }
     }

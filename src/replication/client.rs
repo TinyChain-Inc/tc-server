@@ -19,10 +19,7 @@ use super::crypto::{
     decode_encrypted_payload, decrypt_token_with_key, encode_encrypted_payload,
     encrypt_path_with_key,
 };
-use super::{
-    FORWARDED_HEADER, LIBRARY_EXPORT_PATH, PEERS_HEARTBEAT_PATH, PEERS_JOIN_PATH, PEERS_LEAVE_PATH,
-    PEERS_PATH, PeerIdentity, TOKEN_PATH,
-};
+use super::{FORWARDED_HEADER, LIBRARY_EXPORT_PATH, PeerIdentity, PeerRoutes, TOKEN_PATH};
 
 const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -222,11 +219,12 @@ pub fn normalize_peer(peer: &str) -> TCResult<String> {
 pub async fn register_with_peer(
     seed: &str,
     joiner: &PeerIdentity,
+    routes: &PeerRoutes,
     keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
 ) -> TCResult<PeerClusterListing> {
-    post_encrypted_peer_action(
+    post_encrypted_peer_action_with_listing(
         seed,
-        PEERS_JOIN_PATH,
+        routes.join_path(),
         PeerAnnouncement {
             peer: joiner.peer.clone(),
             actor_id: Some(joiner.actor_id.clone()),
@@ -234,18 +232,18 @@ pub async fn register_with_peer(
         },
         keys,
     )
-    .await?;
-    list_peer_cluster(seed).await
+    .await
 }
 
 pub async fn leave_peer_cluster(
     seed: &str,
     peer: &str,
+    routes: &PeerRoutes,
     keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
 ) -> TCResult<()> {
     post_encrypted_peer_action(
         seed,
-        PEERS_LEAVE_PATH,
+        routes.leave_path(),
         PeerAnnouncement {
             peer: peer.to_string(),
             actor_id: None,
@@ -259,11 +257,12 @@ pub async fn leave_peer_cluster(
 pub async fn heartbeat_peer(
     seed: &str,
     peer: &PeerIdentity,
+    routes: &PeerRoutes,
     keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
 ) -> TCResult<()> {
     post_encrypted_peer_action(
         seed,
-        PEERS_HEARTBEAT_PATH,
+        routes.heartbeat_path(),
         PeerAnnouncement {
             peer: peer.peer.clone(),
             actor_id: Some(peer.actor_id.clone()),
@@ -275,75 +274,22 @@ pub async fn heartbeat_peer(
 }
 
 #[allow(clippy::collapsible_if)]
-pub async fn list_peer_cluster(seed: &str) -> TCResult<PeerClusterListing> {
-    #[derive(serde::Deserialize)]
-    struct PeerListResponse {
-        #[serde(default)]
-        replicas: Vec<PeerIdentityRaw>,
-        #[serde(default)]
-        peers: Vec<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct PeerIdentityRaw {
-        peer: String,
-        actor_id: Option<String>,
-        public_key_b64: Option<String>,
-    }
-
-    let mut url = peer_to_url(seed)?;
-    url.set_path(PEERS_PATH);
-
-    let req = Request::builder()
-        .method("GET")
-        .uri(url.as_str())
-        .body(Body::empty())
-        .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
-
-    let response = send_peer_request(req).await?;
-
-    let status = response.status();
-    let body_bytes = to_bytes(response.into_body())
-        .await
-        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
-
-    if !status.is_success() {
-        return Err(TCError::bad_gateway(format!(
-            "peer {seed} list request failed with status {status}"
-        )));
-    }
-
-    let listing: PeerListResponse = serde_json::from_slice(&body_bytes)
-        .map_err(|err| TCError::bad_gateway(format!("invalid peer list response: {err}")))?;
-
-    let mut peers = BTreeSet::new();
-    let mut identities = BTreeMap::new();
-    for identity in listing.replicas {
-        let peer = normalize_peer(&identity.peer)?;
-        peers.insert(peer.clone());
-        if let (Some(actor_id), Some(public_key_b64)) = (identity.actor_id, identity.public_key_b64)
-        {
-            if !actor_id.trim().is_empty() && !public_key_b64.trim().is_empty() {
-                identities.insert(
-                    peer.clone(),
-                    PeerIdentity {
-                        peer,
-                        actor_id,
-                        public_key_b64,
-                    },
-                );
-            }
-        }
-    }
-
-    for peer in listing.peers {
-        peers.insert(normalize_peer(&peer)?);
-    }
-
-    Ok(PeerClusterListing {
-        peers: peers.into_iter().collect(),
-        identities: identities.into_values().collect(),
-    })
+pub async fn list_peer_cluster(
+    seed: &str,
+    routes: &PeerRoutes,
+    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+) -> TCResult<PeerClusterListing> {
+    post_encrypted_peer_action_with_listing(
+        seed,
+        routes.peers_path(),
+        PeerAnnouncement {
+            peer: normalize_peer(seed)?,
+            actor_id: None,
+            public_key_b64: None,
+        },
+        keys,
+    )
+    .await
 }
 
 pub(crate) async fn push_install_payload(
@@ -476,6 +422,64 @@ async fn post_encrypted_peer_action(
     .await
 }
 
+async fn post_encrypted_peer_action_with_listing(
+    seed: &str,
+    path: &str,
+    announcement: PeerAnnouncement,
+    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+) -> TCResult<PeerClusterListing> {
+    let peer = normalize_peer(&announcement.peer)?;
+    let payload = serde_json::to_string(&PeerAnnouncement {
+        peer,
+        actor_id: announcement.actor_id,
+        public_key_b64: announcement.public_key_b64,
+    })
+    .map_err(|err| TCError::bad_request(format!("invalid peer announcement: {err}")))?;
+    let mut url = peer_to_url(seed)?;
+    url.set_path(path);
+
+    let failure_prefix = format!("peer action {path} failed");
+    with_psk_key_retries(
+        keys,
+        "peer list action failed for all PSK keys",
+        &failure_prefix,
+        |idx, key| {
+            let payload = payload.clone();
+            let url = url.clone();
+            async move {
+                let (nonce, encrypted_peer) =
+                    encrypt_path_with_key(&payload, &key).map_err(|err| err.to_string())?;
+                let body = encode_encrypted_payload(&nonce, &encrypted_peer)
+                    .map_err(|err| err.to_string())?;
+                let req = Request::builder()
+                    .method(hyper::Method::POST)
+                    .uri(url.as_str())
+                    .body(Body::from(body))
+                    .map_err(|err| format!("key[{idx}] invalid request: {err}"))?;
+
+                let response = send_peer_request(req)
+                    .await
+                    .map_err(|err| format!("key[{idx}] request failed: {err}"))?;
+                let status = response.status();
+                let body = to_bytes(response.into_body())
+                    .await
+                    .map_err(|err| format!("key[{idx}] response body read failed: {err}"))?;
+
+                if !status.is_success() {
+                    let message = String::from_utf8_lossy(&body);
+                    return Err(format!("key[{idx}] status {status}: {message}"));
+                }
+
+                let listing = decode_peer_cluster_listing(&body)
+                    .map_err(|err| format!("key[{idx}] invalid list response: {err}"))?;
+
+                Ok(Some(listing))
+            }
+        },
+    )
+    .await
+}
+
 async fn with_psk_key_retries<T, F, Fut>(
     keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
     no_keys_message: &str,
@@ -512,6 +516,55 @@ struct PeerAnnouncement {
     actor_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     public_key_b64: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PeerListResponse {
+    #[serde(default)]
+    replicas: Vec<PeerIdentityRaw>,
+    #[serde(default)]
+    peers: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PeerIdentityRaw {
+    peer: String,
+    actor_id: Option<String>,
+    public_key_b64: Option<String>,
+}
+
+fn decode_peer_cluster_listing(body_bytes: &[u8]) -> TCResult<PeerClusterListing> {
+    let listing: PeerListResponse = serde_json::from_slice(body_bytes)
+        .map_err(|err| TCError::bad_gateway(format!("invalid peer list response: {err}")))?;
+
+    let mut peers = BTreeSet::new();
+    let mut identities = BTreeMap::new();
+    for identity in listing.replicas {
+        let peer = normalize_peer(&identity.peer)?;
+        peers.insert(peer.clone());
+        if let (Some(actor_id), Some(public_key_b64)) = (identity.actor_id, identity.public_key_b64)
+        {
+            if !actor_id.trim().is_empty() && !public_key_b64.trim().is_empty() {
+                identities.insert(
+                    peer.clone(),
+                    PeerIdentity {
+                        peer,
+                        actor_id,
+                        public_key_b64,
+                    },
+                );
+            }
+        }
+    }
+
+    for peer in listing.peers {
+        peers.insert(normalize_peer(&peer)?);
+    }
+
+    Ok(PeerClusterListing {
+        peers: peers.into_iter().collect(),
+        identities: identities.into_values().collect(),
+    })
 }
 
 fn build_export_request(url: Url, token: &str) -> TCResult<Request<Body>> {

@@ -1,15 +1,15 @@
 use super::*;
 use crate::auth::Token;
 use std::str::FromStr;
-use tc_ir::Claim;
+use tc_ir::{Claim, NetworkTime, TxnId};
 use umask::Mode;
 
 #[test]
-fn mints_bearer_token_for_anonymous_txn() {
+fn does_not_mint_bearer_token_for_anonymous_txn() {
     let manager = TxnManager::with_host_id("test-host");
     let handle = manager.begin();
 
-    assert!(handle.raw_token().is_some());
+    assert!(handle.raw_token().is_none());
 
     let txn_link = pathlink::Link::from_str(&format!("/txn/{}", handle.id())).expect("txn link");
     assert!(handle.has_claim(&txn_link, umask::USER_EXEC));
@@ -76,4 +76,15 @@ fn enforces_canonical_claim_position() {
         err.message()
             .contains("canonical claim must be first or second")
     );
+}
+
+#[test]
+fn unknown_txn_continuation_requires_authenticated_owner() {
+    let manager = TxnManager::with_host_id("test-host");
+    let unknown = TxnId::from_parts(NetworkTime::from_nanos(7), 7).with_trace([1; 32]);
+    let rejected = manager.interpret_request(Some(unknown), None, None);
+    assert!(matches!(rejected, Err(TxnError::NotFound)));
+
+    let accepted = manager.interpret_request(Some(unknown), Some("owner-a"), Some("token-a"));
+    assert!(matches!(accepted, Ok(TxnFlow::Begin(_))));
 }

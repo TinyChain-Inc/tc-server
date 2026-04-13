@@ -5,9 +5,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use getrandom::getrandom;
 use parking_lot::Mutex;
 use pathlink::Link;
 use sha2::{Digest, Sha256};
@@ -112,17 +109,11 @@ impl TxnManager {
         let claim = default_claim();
         let txn_claim = Link::from_str(&format!("/txn/{id}")).expect("txn claim link");
         let txn_claim = Claim::new(txn_claim, umask::USER_EXEC | umask::USER_WRITE);
-        let mut owner_id = owner_id.map(str::to_string);
-        let mut bearer_token = bearer_token.map(str::to_string);
-        let minted_token = owner_id.is_none() && bearer_token.is_none();
-        if minted_token {
-            let token = mint_bearer_token();
-            owner_id = Some(token.clone());
-            bearer_token = Some(token);
-        }
+        let owner_id = owner_id.map(str::to_string);
+        let bearer_token = bearer_token.map(str::to_string);
         let handle_owner = owner_id.clone();
         let handle_bearer = bearer_token.clone();
-        let claims = if minted_token || bearer_token.is_none() {
+        let claims = if bearer_token.is_none() {
             vec![txn_claim.clone()]
         } else {
             Vec::new()
@@ -211,14 +202,18 @@ impl TxnManager {
             Some(id) => match self.get_with_owner(&id, owner_id) {
                 Ok(handle) => Ok(TxnFlow::Use(handle)),
                 Err(TxnError::NotFound) => {
-                    let Some(owner_id) = owner_id else {
+                    let (Some(owner_id), Some(bearer_token)) = (owner_id, bearer_token) else {
                         return Err(TxnError::NotFound);
                     };
+
+                    if bearer_token.trim().is_empty() {
+                        return Err(TxnError::Unauthorized);
+                    }
 
                     Ok(TxnFlow::Begin(self.begin_with_id(
                         id,
                         Some(owner_id),
-                        bearer_token,
+                        Some(bearer_token),
                     )))
                 }
                 Err(err) => Err(err),
@@ -260,15 +255,9 @@ impl TxnManager {
         let claim = default_claim();
         let txn_claim = Link::from_str(&format!("/txn/{canonical}")).expect("txn claim link");
         let txn_claim = Claim::new(txn_claim, umask::USER_EXEC | umask::USER_WRITE);
-        let mut owner_id = owner_id.map(str::to_string);
-        let mut bearer_token = bearer_token.map(str::to_string);
-        let minted_token = owner_id.is_none() && bearer_token.is_none();
-        if minted_token {
-            let token = mint_bearer_token();
-            owner_id = Some(token.clone());
-            bearer_token = Some(token);
-        }
-        let claims = if minted_token || bearer_token.is_none() {
+        let owner_id = owner_id.map(str::to_string);
+        let bearer_token = bearer_token.map(str::to_string);
+        let claims = if bearer_token.is_none() {
             vec![txn_claim.clone()]
         } else {
             Vec::new()
@@ -309,14 +298,6 @@ fn default_claim() -> Claim {
         Link::from_str("/lib/default").expect("default claim link"),
         Mode::all(),
     )
-}
-
-fn mint_bearer_token() -> String {
-    let mut bytes = [0u8; 32];
-    if let Err(err) = getrandom(&mut bytes) {
-        panic!("failed to generate bearer token: {err}");
-    }
-    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn compute_trace(host_id: &str, timestamp: NetworkTime, nonce: u16) -> [u8; 32] {

@@ -27,7 +27,6 @@ pub struct Kernel {
     pub(crate) library_module: Option<Arc<LibraryRegistry>>,
     pub(crate) rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     pub(crate) token_verifier: Arc<dyn crate::auth::TokenVerifier>,
-    pub(crate) kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
     pub(crate) txn_finalize_hook: Option<super::TxnFinalizeHook>,
 }
 
@@ -42,6 +41,10 @@ impl Kernel {
         path: &str,
         req: Request,
     ) -> Option<BoxFuture<'static, Response>> {
+        if crate::replication::is_peer_membership_path(path) {
+            return Some(self.kernel_handler.call(req));
+        }
+
         if path.starts_with("/state/") {
             return Some(self.kernel_handler.call(req));
         }
@@ -181,21 +184,16 @@ impl Kernel {
             || path == crate::uri::HOST_ROOT
             || (path.starts_with(crate::uri::HOST_ROOT_PREFIX)
                 && path != crate::uri::HOST_LIBRARY_EXPORT)
+            || crate::replication::is_peer_membership_path(path)
         {
             return Ok(dispatch_or_not_found(self.dispatch(method, path, req)));
         }
 
         let is_component_root =
             component_root(path).is_some_and(|component_root| component_root == path);
-        let token_has_txn_claim = |token: &crate::auth::TokenContext| {
-            token
-                .claims
-                .iter()
-                .any(|(_, _, claim)| claim.link.to_string().starts_with("/txn/"))
-        };
 
         let (owner_id, bearer_token, claims) = match (txn_id, token) {
-            (Some(txn_id), Some(token)) if token_has_txn_claim(token) => {
+            (Some(txn_id), Some(token)) => {
                 let owner_id = crate::txn::owner_id_from_token(txn_id, token)?;
                 let claims = token
                     .claims
@@ -208,7 +206,8 @@ impl Kernel {
                     Some(claims),
                 )
             }
-            (_, Some(token)) => {
+            (Some(_), None) => (None, None, None),
+            (None, Some(token)) => {
                 let claims = if token.claims.is_empty() {
                     None
                 } else {
@@ -230,6 +229,10 @@ impl Kernel {
         };
         let owner_id = owner_id.as_deref();
         let bearer_token = bearer_token.as_deref();
+
+        if txn_id.is_some() && bearer_token.is_none() {
+            return Err(crate::txn::TxnError::Unauthorized);
+        }
 
         let flow =
             if body_is_none && is_component_root && matches!(method, Method::Post | Method::Delete)
@@ -286,6 +289,11 @@ impl Kernel {
                 } else {
                     handle
                 };
+                let handle = if let Some(token) = bearer_token {
+                    handle.with_bearer_token(token.to_string())
+                } else {
+                    handle
+                };
                 let handle = self.with_resolver(handle);
                 bind_txn(&handle, &mut req);
                 dispatch_or_not_found(self.dispatch(method, path, req))
@@ -297,6 +305,11 @@ impl Kernel {
                         let _ = self.txn_manager.record_claim(&handle.id(), claim.clone());
                     }
                     handle.with_claims(claims.clone())
+                } else {
+                    handle
+                };
+                let handle = if let Some(token) = bearer_token {
+                    handle.with_bearer_token(token.to_string())
                 } else {
                     handle
                 };
@@ -325,7 +338,6 @@ impl Clone for Kernel {
             library_module: self.library_module.as_ref().map(Arc::clone),
             rpc_gateway: self.rpc_gateway.as_ref().map(Arc::clone),
             token_verifier: Arc::clone(&self.token_verifier),
-            kernel_actor: self.kernel_actor.clone(),
             txn_finalize_hook: self.txn_finalize_hook.as_ref().map(Arc::clone),
         }
     }

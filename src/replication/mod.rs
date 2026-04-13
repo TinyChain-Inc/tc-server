@@ -21,16 +21,16 @@ use futures::FutureExt;
 use hyper::body::to_bytes;
 use hyper::{Body, Request, StatusCode};
 use parking_lot::Mutex;
-use tc_error::TCResult;
+use tc_error::{TCError, TCResult};
 use tc_ir::TxnId;
 
 use self::http_util::{bad_request, empty_response, text_response};
 
 pub const LIBRARY_EXPORT_PATH: &str = crate::uri::HOST_LIBRARY_EXPORT;
-pub const PEERS_PATH: &str = "/host/peers";
-pub const PEERS_JOIN_PATH: &str = "/host/peers/join";
-pub const PEERS_LEAVE_PATH: &str = "/host/peers/leave";
-pub const PEERS_HEARTBEAT_PATH: &str = "/host/peers/heartbeat";
+pub const PEERS_PATH_SUFFIX: &str = "/_cluster/peers";
+pub const PEERS_JOIN_PATH_SUFFIX: &str = "/_cluster/peers/join";
+pub const PEERS_LEAVE_PATH_SUFFIX: &str = "/_cluster/peers/leave";
+pub const PEERS_HEARTBEAT_PATH_SUFFIX: &str = "/_cluster/peers/heartbeat";
 pub const FORWARDED_HEADER: &str = "x-tc-replicated";
 const TOKEN_PATH: &str = "/";
 const REPLICATION_TTL: Duration = Duration::from_secs(30);
@@ -44,6 +44,76 @@ pub use handler::{export_handler, replication_token_handler};
 pub use issuer::{ReplicationIssuer, parse_psk_keys, parse_psk_list};
 pub use membership::{PeerDescriptor, PeerIdentity, PeerMembership};
 pub use peers::peer_membership_handler;
+
+pub fn is_peer_membership_path(path: &str) -> bool {
+    path.ends_with(PEERS_PATH_SUFFIX)
+        || path.ends_with(PEERS_JOIN_PATH_SUFFIX)
+        || path.ends_with(PEERS_LEAVE_PATH_SUFFIX)
+        || path.ends_with(PEERS_HEARTBEAT_PATH_SUFFIX)
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerRoutes {
+    cluster_root: String,
+    peers: String,
+    join: String,
+    leave: String,
+    heartbeat: String,
+}
+
+impl PeerRoutes {
+    pub fn new(cluster_root: &str) -> TCResult<Self> {
+        let cluster_root = normalize_cluster_root(cluster_root)?;
+        Ok(Self {
+            peers: format!("{cluster_root}{PEERS_PATH_SUFFIX}"),
+            join: format!("{cluster_root}{PEERS_JOIN_PATH_SUFFIX}"),
+            leave: format!("{cluster_root}{PEERS_LEAVE_PATH_SUFFIX}"),
+            heartbeat: format!("{cluster_root}{PEERS_HEARTBEAT_PATH_SUFFIX}"),
+            cluster_root,
+        })
+    }
+
+    pub fn cluster_root(&self) -> &str {
+        &self.cluster_root
+    }
+
+    pub fn peers_path(&self) -> &str {
+        &self.peers
+    }
+
+    pub fn join_path(&self) -> &str {
+        &self.join
+    }
+
+    pub fn leave_path(&self) -> &str {
+        &self.leave
+    }
+
+    pub fn heartbeat_path(&self) -> &str {
+        &self.heartbeat
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        path == self.peers || path == self.join || path == self.leave || path == self.heartbeat
+    }
+}
+
+fn normalize_cluster_root(value: &str) -> TCResult<String> {
+    let root = value.trim().trim_end_matches('/');
+    if !root.starts_with("/lib/") {
+        return Err(TCError::bad_request(format!(
+            "invalid cluster root {root}: expected /lib/<publisher>"
+        )));
+    }
+
+    if root == "/lib" || root == "/lib/" {
+        return Err(TCError::bad_request(
+            "invalid cluster root /lib: expected /lib/<publisher>",
+        ));
+    }
+
+    Ok(root.to_string())
+}
 
 #[derive(Clone, Default)]
 pub struct ReplicatedTxnTracker {
@@ -101,6 +171,7 @@ pub async fn replicate_from_peers(
 pub async fn announce_self_to_cluster(
     membership: &PeerMembership,
     self_identity: &PeerIdentity,
+    routes: &PeerRoutes,
     keys: &[Key<Aes256GcmSiv>],
     issuer: &ReplicationIssuer,
 ) {
@@ -111,7 +182,7 @@ pub async fn announce_self_to_cluster(
             continue;
         }
 
-        match register_with_peer(&seed, self_identity, keys).await {
+        match register_with_peer(&seed, self_identity, routes, keys).await {
             Ok(discovered) => {
                 membership.mark_success(&seed);
                 for identity in discovered.identities {

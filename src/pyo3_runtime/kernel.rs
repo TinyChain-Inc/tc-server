@@ -14,8 +14,7 @@ use tc_value::Value;
 use umask;
 
 use crate::{
-    Body, Kernel, KernelDispatch, KernelHandler, Method, Request, StatusCode,
-    auth::TokenContext,
+    Body, Kernel, KernelDispatch, KernelHandler, Request, StatusCode,
     library::http as http_library,
     resolve::Resolve,
     storage::load_library_root,
@@ -27,7 +26,7 @@ use super::types::{
     PyKernelConfig, PyKernelRequest, PyKernelResponse, PyStateHandle, apply_config_overrides,
 };
 use super::wire::{
-    decode_scalar_from_bytes, decode_schema_from_json, encode_state_to_bytes, http_request_from_py,
+    decode_scalar_from_bytes, decode_schema_from_json, encode_state_to_bytes,
     http_request_from_py_with_body, parse_path_and_txn_id, py_bearer_token, py_body_is_none,
     py_error_response, py_request_from_http, py_response_from_http, py_response_to_http,
     request_body_bytes,
@@ -508,63 +507,6 @@ impl KernelHandle {
 
                 Ok(PyKernelResponse::new(200, None, body))
             }),
-            Err(err)
-                if err.message().starts_with("no egress route for ")
-                    || err.message().starts_with("no RPC gateway configured") =>
-            {
-                let local_token = match token.as_ref() {
-                    Some(token) => Some(token.clone()),
-                    None => match txn_handle.raw_token() {
-                        Some(raw) => match self
-                            .block_on(self.inner.token_verifier().verify(raw.to_string()))
-                        {
-                            Ok(ctx) => Some(ctx),
-                            Err(_) => Some(TokenContext::new(raw.to_string(), raw.to_string())),
-                        },
-                        None => None,
-                    },
-                };
-
-                // If this target is not routed for egress, fall back to local dispatch within the
-                // same transaction and still rollback afterwards. This keeps per-call ergonomics
-                // stable: a GET either hits a local installed handler or routes through the RPC
-                // gateway based on kernel config, not caller metadata.
-                let request = PyKernelRequest::new(
-                    "GET",
-                    path,
-                    bearer_token.as_deref().map(|token| {
-                        vec![("authorization".to_string(), format!("Bearer {token}"))]
-                    }),
-                    body,
-                )?;
-                let request = http_request_from_py(&request)?;
-
-                match self.inner.route_request(
-                    Method::Get,
-                    path,
-                    request,
-                    Some(txn_id),
-                    true,
-                    local_token.as_ref(),
-                    |handle, req| {
-                        req.extensions_mut().insert(handle.clone());
-                    },
-                ) {
-                    Ok(KernelDispatch::Response(resp)) => {
-                        self.block_on(async move { py_response_from_http(resp.await).await })
-                    }
-                    Ok(KernelDispatch::Finalize { commit, txn }) => {
-                        let result = self.block_on(self.inner.finalize_transaction(txn, commit));
-                        let status = if result.is_ok() { 204 } else { 400 };
-                        Ok(PyKernelResponse::new(status, None, None))
-                    }
-                    Ok(KernelDispatch::NotFound) => Ok(PyKernelResponse::new(404, None, None)),
-                    Err(TxnError::NotFound) => Err(PyValueError::new_err("unknown transaction id")),
-                    Err(TxnError::Unauthorized) => {
-                        Err(PyValueError::new_err("unauthorized transaction owner"))
-                    }
-                }
-            }
             Err(err) => Err(PyValueError::new_err(err.message().to_string())),
         };
 
@@ -580,7 +522,6 @@ impl KernelHandle {
         let (route_path, txn_id) = parse_path_and_txn_id(&raw_path)?;
         let body_is_none = py_body_is_none(request.body());
         let bearer = py_bearer_token(&request);
-        let inbound_bearer = bearer.clone();
         let body_bytes = if body_is_none {
             Vec::new()
         } else {
@@ -599,7 +540,6 @@ impl KernelHandle {
         };
         let inbound_txn_id = txn_id;
         let mut minted_txn_id: Option<TxnId> = None;
-        let mut minted_token: Option<String> = None;
         let mut request = http_request_from_py_with_body(&request, body_bytes.clone())?;
         if !body_bytes.is_empty() {
             request
@@ -616,9 +556,6 @@ impl KernelHandle {
             token.as_ref(),
             |handle, req| {
                 minted_txn_id = Some(handle.id());
-                if inbound_bearer.is_none() {
-                    minted_token = handle.raw_token().map(str::to_string);
-                }
                 req.extensions_mut().insert(handle.clone());
             },
         ) {
@@ -631,11 +568,6 @@ impl KernelHandle {
                     response
                         .headers
                         .push(("x-tc-txn-id".to_string(), txn_id.to_string()));
-                    if let Some(token) = minted_token {
-                        response
-                            .headers
-                            .push(("x-tc-bearer-token".to_string(), token));
-                    }
                 }
                 Ok(response)
             }

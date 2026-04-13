@@ -4,9 +4,10 @@ use futures::FutureExt;
 use hyper::{Body, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use super::http_util::{bad_request, decode_encrypted_request, empty_response, json_ok};
-use super::{PEERS_HEARTBEAT_PATH, PEERS_JOIN_PATH, PEERS_LEAVE_PATH, PEERS_PATH};
-use super::{PeerIdentity, PeerMembership, ReplicationIssuer, normalize_peer};
+use super::http_util::{
+    bad_request, decode_encrypted_request, empty_response, json_ok, method_not_allowed,
+};
+use super::{PeerIdentity, PeerMembership, PeerRoutes, ReplicationIssuer, normalize_peer};
 use crate::KernelHandler;
 use crate::Response;
 
@@ -25,17 +26,24 @@ struct PeerAnnouncement {
 pub fn peer_membership_handler(
     membership: PeerMembership,
     issuer: Arc<ReplicationIssuer>,
+    routes: PeerRoutes,
 ) -> impl KernelHandler {
     move |req: Request<Body>| {
         let membership = membership.clone();
         let issuer = issuer.clone();
+        let routes = routes.clone();
         async move {
-            match (req.method().as_str(), req.uri().path()) {
-                ("GET", PEERS_PATH) => {
+            match route(req.method().as_str(), req.uri().path(), &routes) {
+                Some(Route::List) => {
+                    match decode_and_touch_peer(req, &membership, &issuer).await {
+                        Ok(()) => {}
+                        Err(response) => return response,
+                    }
+
                     let body = peer_list_body(&membership);
                     json_ok(body)
                 }
-                ("POST", PEERS_JOIN_PATH) => {
+                Some(Route::Join) => {
                     match decode_and_upsert_identity(req, &membership, &issuer).await {
                         Ok(()) => {}
                         Err(response) => return response,
@@ -44,7 +52,7 @@ pub fn peer_membership_handler(
                     let body = peer_list_body(&membership);
                     json_ok(body)
                 }
-                ("POST", PEERS_HEARTBEAT_PATH) => {
+                Some(Route::Heartbeat) => {
                     match decode_and_upsert_identity(req, &membership, &issuer).await {
                         Ok(()) => {}
                         Err(response) => return response,
@@ -52,7 +60,7 @@ pub fn peer_membership_handler(
 
                     empty_response(StatusCode::NO_CONTENT)
                 }
-                ("POST", PEERS_LEAVE_PATH) => {
+                Some(Route::Leave) => {
                     let announcement = match decode_peer_announcement(req, &issuer).await {
                         Ok(announcement) => announcement,
                         Err(response) => return response,
@@ -66,11 +74,72 @@ pub fn peer_membership_handler(
 
                     empty_response(StatusCode::NO_CONTENT)
                 }
+                Some(Route::WrongMethod) => method_not_allowed("POST"),
                 _ => empty_response(StatusCode::NOT_FOUND),
             }
         }
         .boxed()
     }
+}
+
+enum Route {
+    List,
+    Join,
+    Heartbeat,
+    Leave,
+    WrongMethod,
+}
+
+fn route(method: &str, path: &str, routes: &PeerRoutes) -> Option<Route> {
+    if is_list_path(path, routes) {
+        return if method == "POST" {
+            Some(Route::List)
+        } else {
+            Some(Route::WrongMethod)
+        };
+    }
+
+    if is_join_path(path, routes) {
+        return if method == "POST" {
+            Some(Route::Join)
+        } else {
+            Some(Route::WrongMethod)
+        };
+    }
+
+    if is_heartbeat_path(path, routes) {
+        return if method == "POST" {
+            Some(Route::Heartbeat)
+        } else {
+            Some(Route::WrongMethod)
+        };
+    }
+
+    if is_leave_path(path, routes) {
+        return if method == "POST" {
+            Some(Route::Leave)
+        } else {
+            Some(Route::WrongMethod)
+        };
+    }
+
+    None
+}
+
+fn is_list_path(path: &str, routes: &PeerRoutes) -> bool {
+    path == routes.peers_path()
+}
+
+fn is_join_path(path: &str, routes: &PeerRoutes) -> bool {
+    path == routes.join_path()
+}
+
+fn is_heartbeat_path(path: &str, routes: &PeerRoutes) -> bool {
+    path == routes.heartbeat_path()
+}
+
+fn is_leave_path(path: &str, routes: &PeerRoutes) -> bool {
+    path == routes.leave_path()
 }
 
 fn peer_list_body(membership: &PeerMembership) -> Vec<u8> {
@@ -113,6 +182,39 @@ async fn decode_and_upsert_identity(
 ) -> Result<(), Response> {
     let identity = decode_identity_announcement(req, issuer).await?;
     membership.upsert_identity(identity);
+    Ok(())
+}
+
+async fn decode_and_touch_peer(
+    req: Request<Body>,
+    membership: &PeerMembership,
+    issuer: &ReplicationIssuer,
+) -> Result<(), Response> {
+    let announcement = decode_peer_announcement(req, issuer).await?;
+    let peer = match normalize_peer(&announcement.peer) {
+        Ok(peer) => peer,
+        Err(err) => return Err(bad_request(err.to_string())),
+    };
+
+    if announcement
+        .actor_id
+        .as_ref()
+        .is_some_and(|actor| !actor.trim().is_empty())
+        || announcement
+            .public_key_b64
+            .as_ref()
+            .is_some_and(|key| !key.trim().is_empty())
+    {
+        let identity =
+            normalize_identity(announcement).map_err(|err| bad_request(err.to_string()))?;
+        issuer
+            .register_peer_identity(&identity)
+            .map_err(|err| bad_request(err.to_string()))?;
+        membership.upsert_identity(identity);
+    } else {
+        membership.upsert_active(peer);
+    }
+
     Ok(())
 }
 

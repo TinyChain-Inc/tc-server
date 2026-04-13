@@ -2,7 +2,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use futures::{future::BoxFuture, FutureExt};
-    use tc_ir::{LibrarySchema, NetworkTime, TxnId};
+    use tc_ir::LibrarySchema;
 
     use super::*;
     use crate::resolve::Resolve;
@@ -20,7 +20,21 @@ mod tests {
         use umask::USER_EXEC;
 
         let kernel = Kernel::builder().with_lib_handler(ok_handler()).finish();
-        let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0; 32]);
+        let begin_token = crate::auth::TokenContext::new("host-a::actor-a", "seed");
+        let begin = kernel.route_request(
+            Method::Get,
+            "/lib",
+            Request::new(Body::empty()),
+            None,
+            true,
+            Some(&begin_token),
+            |_txn, _req| {},
+        );
+        assert!(begin.is_ok());
+
+        let pending = kernel.txn_manager().pending_ids();
+        assert_eq!(pending.len(), 1);
+        let txn_id = pending[0];
         let txn_claim = Claim::new(
             pathlink::Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim link"),
             USER_EXEC,
@@ -77,13 +91,27 @@ mod tests {
         use umask::USER_EXEC;
 
         let kernel = Kernel::builder().with_lib_handler(ok_handler()).finish();
-        let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0; 32]);
 
         let host = pathlink::Link::from_str(crate::uri::HOST_ROOT).expect("host link");
         let actor_a = rjwt::Actor::new(Value::from("actor-a"));
         let resolver =
             crate::auth::KeyringActorResolver::default().with_actor(host.clone(), actor_a.clone());
         let verifier = crate::auth::RjwtTokenVerifier::new(Arc::new(resolver));
+
+        let begin_token = crate::auth::TokenContext::new(format!("{host}::actor-a"), "seed");
+        let begin = kernel.route_request(
+            Method::Get,
+            "/lib",
+            Request::new(Body::empty()),
+            None,
+            true,
+            Some(&begin_token),
+            |_txn, _req| {},
+        );
+        assert!(begin.is_ok());
+        let pending = kernel.txn_manager().pending_ids();
+        assert_eq!(pending.len(), 1);
+        let txn_id = pending[0];
 
         let claim = Claim::new(
             pathlink::Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim"),
@@ -213,6 +241,42 @@ mod tests {
         );
 
         assert!(matches!(finalize, Err(crate::txn::TxnError::Unauthorized)));
+    }
+
+    #[test]
+    fn continuation_requires_txn_claim_even_with_matching_owner() {
+        let kernel = Kernel::builder().with_lib_handler(ok_handler()).finish();
+
+        let owner_token = crate::auth::TokenContext::new("owner-a", "bearer-a");
+        let begin = kernel.route_request(
+            Method::Get,
+            "/lib",
+            Request::new(Body::empty()),
+            None,
+            true,
+            Some(&owner_token),
+            |_txn, _req| {},
+        );
+        assert!(begin.is_ok());
+
+        let pending = kernel.txn_manager().pending_ids();
+        assert_eq!(pending.len(), 1);
+        let txn_id = pending[0];
+
+        let continue_without_claim = kernel.route_request(
+            Method::Get,
+            "/lib",
+            Request::new(Body::empty()),
+            Some(txn_id),
+            true,
+            Some(&owner_token),
+            |_txn, _req| {},
+        );
+
+        assert!(matches!(
+            continue_without_claim,
+            Err(crate::txn::TxnError::Unauthorized)
+        ));
     }
 
     #[derive(Clone, Default)]

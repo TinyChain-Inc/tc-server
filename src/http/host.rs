@@ -1,7 +1,8 @@
 use std::str::FromStr;
 
 use bytes::Bytes;
-use futures::{FutureExt, stream};
+use futures::FutureExt;
+use futures::stream;
 use pathlink::PathBuf as LinkPathBuf;
 use tc_value::Value;
 use url::form_urlencoded;
@@ -57,18 +58,16 @@ pub fn host_handler_with_public_keys(
                         return bad_request_response("missing key query parameter");
                     };
 
-                    let actor_id = match serde_json::from_str::<String>(&actor_id) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(
-                                Bytes::copy_from_slice(actor_id.as_bytes()),
-                            )]);
-
-                            match destream_json::try_decode((), stream).await {
-                                Ok(Value::String(value)) => value,
-                                _ => return bad_request_response("invalid key query parameter"),
-                            }
-                        }
+                    let actor_id = match destream_json::try_decode(
+                        (),
+                        stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+                            actor_id.into_bytes(),
+                        ))]),
+                    )
+                    .await
+                    {
+                        Ok(Value::String(value)) => value,
+                        _ => return bad_request_response("invalid key query parameter"),
                     };
 
                     let Some(public_key) = keys.public_key(&actor_id) else {

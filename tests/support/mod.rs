@@ -8,7 +8,7 @@ use hyper::{Body, Client, Request, StatusCode};
 use pathlink::Link;
 use tc_ir::{Claim, LibrarySchema, TxnId};
 use tinychain::auth::{Actor, Token};
-use tinychain::replication::{PEERS_HEARTBEAT_PATH, PEERS_JOIN_PATH, PEERS_LEAVE_PATH, PEERS_PATH};
+use tinychain::replication::is_peer_membership_path;
 
 pub fn token_for_schema(actor: &Actor, schema: &LibrarySchema, mask: umask::Mode) -> String {
     let host = Link::from_str("/host").expect("host link");
@@ -171,9 +171,7 @@ pub fn combine_host_handlers_with_peers(
             match path.as_str() {
                 "/" => token.call(req).await,
                 "/host/library/export" => export.call(req).await,
-                PEERS_PATH | PEERS_JOIN_PATH | PEERS_LEAVE_PATH | PEERS_HEARTBEAT_PATH => {
-                    peers.call(req).await
-                }
+                path if is_peer_membership_path(path) => peers.call(req).await,
                 _ => public.call(req).await,
             }
         }
