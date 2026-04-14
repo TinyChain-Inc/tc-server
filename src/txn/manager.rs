@@ -137,6 +137,7 @@ impl TxnManager {
             resolver: None,
             ttl: self.ttl,
             token: None,
+            auth_context: None,
         }
     }
 
@@ -168,6 +169,7 @@ impl TxnManager {
             resolver: None,
             ttl: self.ttl,
             token: record.token,
+            auth_context: None,
         })
     }
 
@@ -281,6 +283,7 @@ impl TxnManager {
             resolver: None,
             ttl: self.ttl,
             token: None,
+            auth_context: None,
         }
     }
 }

@@ -63,12 +63,14 @@ mod tests {
                 "actor-a".to_string(),
                 txn_claim.clone(),
             )],
+            verified_at_nanos: 0,
         };
 
         let token_b = crate::auth::TokenContext {
             owner_id: "ignored".to_string(),
             bearer_token: "b".to_string(),
             claims: vec![("host-b".to_string(), "actor-b".to_string(), txn_claim)],
+            verified_at_nanos: 0,
         };
 
         let _ = kernel

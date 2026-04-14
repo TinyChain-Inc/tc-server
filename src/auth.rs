@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tc_ir::Claim;
 
 use crate::txn::TxnError;
@@ -25,14 +26,20 @@ pub struct TokenContext {
     pub owner_id: String,
     pub bearer_token: String,
     pub claims: Vec<(String, String, Claim)>,
+    pub verified_at_nanos: u64,
 }
 
 impl TokenContext {
     pub fn new(owner_id: impl Into<String>, bearer_token: impl Into<String>) -> Self {
+        let verified_at_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         Self {
             owner_id: owner_id.into(),
             bearer_token: bearer_token.into(),
             claims: Vec::new(),
+            verified_at_nanos,
         }
     }
 
