@@ -51,6 +51,20 @@ mod tests {
             .finish()
     }
 
+    fn kernel_with_host_auth_context() -> Kernel {
+        Kernel::builder()
+            .with_lib_handler(ok_handler())
+            .with_lib_put_handler(ok_handler())
+            .with_lib_route_handler(ok_handler())
+            .with_service_handler(ok_handler())
+            .with_kernel_handler(super::host_handler_with_public_keys(
+                crate::auth::PublicKeyStore::default(),
+            ))
+            .with_health_handler(ok_handler())
+            .with_token_verifier(TestTokenVerifier)
+            .finish()
+    }
+
     #[derive(Clone)]
     struct TestTokenVerifier;
 
@@ -210,6 +224,32 @@ mod tests {
 
         let continue_resp = service.call(continue_req).await.expect("continue response");
         assert_eq!(continue_resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn returns_authenticated_route_context_from_host_endpoint() {
+        let kernel = kernel_with_host_auth_context();
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/host/auth/context")
+            .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
+            .body(Body::empty())
+            .expect("context request");
+
+        let response = service.call(request).await.expect("context response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body())
+            .await
+            .expect("context body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("context json");
+        assert_eq!(payload["principal"], serde_json::Value::String("/host::owner-a".to_string()));
+        assert!(payload["txn_id"].is_string());
+        assert!(payload["txn_timestamp_nanos"].is_u64());
+        assert!(payload["token_verified_at_nanos"].is_u64());
+        assert!(payload["claims"].is_array());
     }
 
     #[tokio::test]

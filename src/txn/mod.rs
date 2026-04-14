@@ -6,6 +6,6 @@ mod token;
 #[cfg(test)]
 mod tests;
 
-pub use handle::TxnHandle;
+pub use handle::{AuthContext, TxnHandle};
 pub use manager::{TxnError, TxnFlow, TxnManager};
 pub(crate) use token::{has_txn_claim, owner_id_from_token};

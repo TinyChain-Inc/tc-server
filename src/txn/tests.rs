@@ -88,3 +88,30 @@ fn unknown_txn_continuation_requires_authenticated_owner() {
     let accepted = manager.interpret_request(Some(unknown), Some("owner-a"), Some("token-a"));
     assert!(matches!(accepted, Ok(TxnFlow::Begin(_))));
 }
+
+#[test]
+fn attaches_structured_auth_context_to_txn_handle() {
+    let manager = TxnManager::with_host_id("test-host");
+    let handle =
+        manager.begin_with_owner(Some("http://127.0.0.1:8702::example-admin"), Some("token"));
+
+    let claim = Claim::new(
+        pathlink::Link::from_str("/lib/example-devco/a/0.1.0").expect("claim link"),
+        Mode::all(),
+    );
+    let mut token = crate::auth::TokenContext::new("http://127.0.0.1:8702::example-admin", "token");
+    token = token.with_claim(
+        "http://127.0.0.1:8702".to_string(),
+        "example-admin".to_string(),
+        claim,
+    );
+
+    let handle = handle.with_auth_context(AuthContext::from_token_context(&token));
+    let auth = handle.auth_context().expect("auth context");
+    assert_eq!(auth.principal, "http://127.0.0.1:8702::example-admin");
+    assert_eq!(auth.claims.len(), 1);
+    assert_eq!(
+        auth.token_hosts(),
+        vec!["http://127.0.0.1:8702".to_string()]
+    );
+}

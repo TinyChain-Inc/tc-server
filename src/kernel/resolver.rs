@@ -243,6 +243,16 @@ impl KernelTxnResolver {
             )
         })?;
 
+        if target_root == crate::uri::HOST_ROOT {
+            if target_uri.authority().is_some() {
+                return Err(tc_error::TCError::unauthorized(
+                    "cross-host /host access is not allowed from library routes",
+                ));
+            }
+
+            return Ok((OutboundTarget::Local(target.clone()), txn.clone()));
+        }
+
         let target_root_link = pathlink::Link::from_str(target_root)
             .map_err(|err| tc_error::TCError::bad_request(err.to_string()))?;
         let dependency_allowed = schema.id() == &target_root_link

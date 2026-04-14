@@ -366,11 +366,14 @@ impl KernelHandle {
             ..PyKernelConfig::default()
         };
         let config = apply_config_overrides(config, request_ttl_secs, max_request_bytes_unauth);
+        let kernel_handler =
+            crate::http::host_handler_with_public_keys(crate::auth::PublicKeyStore::default());
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
             .with_library_module(module, handlers)
             .with_dependency_route(dependency_root, authority)
             .with_http_rpc_gateway()
+            .with_kernel_handler(kernel_handler)
             .with_txn_ttl(config.limits.txn_ttl)
             .finish();
         Ok(Self::from_kernel(kernel, config))
@@ -419,12 +422,15 @@ impl KernelHandle {
             ..PyKernelConfig::default()
         };
         let config = apply_config_overrides(config, request_ttl_secs, max_request_bytes_unauth);
+        let kernel_handler =
+            crate::http::host_handler_with_public_keys(crate::auth::PublicKeyStore::default());
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
             .with_library_module(module, handlers)
             .with_dependency_route(dependency_root, authority)
             .with_http_rpc_gateway()
             .with_rjwt_keyring_token_verifier(keyring)
+            .with_kernel_handler(kernel_handler)
             .with_txn_ttl(config.limits.txn_ttl)
             .finish();
         Ok(Self::from_kernel(kernel, config))

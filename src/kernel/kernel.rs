@@ -184,7 +184,8 @@ impl Kernel {
         if path == crate::uri::HEALTHZ
             || path == crate::uri::HOST_ROOT
             || (path.starts_with(crate::uri::HOST_ROOT_PREFIX)
-                && path != crate::uri::HOST_LIBRARY_EXPORT)
+                && path != crate::uri::HOST_LIBRARY_EXPORT
+                && path != crate::uri::HOST_AUTH_CONTEXT)
             || crate::replication::is_peer_membership_path(path)
         {
             return Ok(dispatch_or_not_found(self.dispatch(method, path, req)));
@@ -240,6 +241,7 @@ impl Kernel {
         };
         let owner_id = owner_id.as_deref();
         let bearer_token = bearer_token.as_deref();
+        let auth_context = token.map(crate::txn::AuthContext::from_token_context);
 
         if txn_id.is_some() && bearer_token.is_none() {
             return Err(crate::txn::TxnError::Unauthorized);
@@ -305,6 +307,11 @@ impl Kernel {
                 } else {
                     handle
                 };
+                let handle = if let Some(auth_context) = auth_context.clone() {
+                    handle.with_auth_context(auth_context)
+                } else {
+                    handle
+                };
                 let handle = self.with_resolver(handle);
                 bind_txn(&handle, &mut req);
                 dispatch_or_not_found(self.dispatch(method, path, req))
@@ -321,6 +328,11 @@ impl Kernel {
                 };
                 let handle = if let Some(token) = bearer_token {
                     handle.with_bearer_token(token.to_string())
+                } else {
+                    handle
+                };
+                let handle = if let Some(auth_context) = auth_context.clone() {
+                    handle.with_auth_context(auth_context)
                 } else {
                     handle
                 };
