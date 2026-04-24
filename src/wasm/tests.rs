@@ -38,6 +38,7 @@ mod http_tests {
     use crate::http::{Body, StatusCode};
     use crate::{
         HttpServer,
+        KernelHandler,
         kernel::{Kernel, Method},
         library::http::{build_http_library_module, http_library_handlers},
     };
@@ -178,6 +179,21 @@ mod http_tests {
         let response = fut.await;
         let body = body::to_bytes(response.into_body()).await.expect("body");
         assert_eq!(body.as_ref(), b"\"hello\"");
+    }
+
+    #[tokio::test]
+    async fn wasm_route_rejects_non_get_methods() {
+        let bytes = super::tests::wasm_module();
+        let (handler, _schema, _routes) =
+            crate::wasm::http::http_wasm_route_handler_from_bytes(bytes).expect("route handler");
+
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/lib/example-devco/example/0.1.0/hello")
+            .body(Body::empty())
+            .expect("request");
+        let response = handler.call(request).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     fn wasm_static_response_module(

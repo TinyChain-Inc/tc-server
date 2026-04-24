@@ -434,12 +434,15 @@ impl KernelHandle {
             request_ttl_secs,
             max_request_bytes_unauth,
         );
+        let stub = stub_py_handler();
         let kernel_handler =
             crate::http::host_handler_with_public_keys(crate::auth::PublicKeyStore::default());
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
             .with_library_module(module, handlers)
+            .with_service_handler(python_handler(stub))
             .with_kernel_handler(kernel_handler)
+            .with_health_handler(python_health_handler())
             .with_txn_ttl(config.limits.txn_ttl)
             .finish();
         Ok(Self::from_kernel(kernel, config))
@@ -481,101 +484,16 @@ impl KernelHandle {
             ..PyKernelConfig::default()
         };
         let config = apply_config_overrides(config, request_ttl_secs, max_request_bytes_unauth);
+        let stub = stub_py_handler();
         let kernel_handler =
             crate::http::host_handler_with_public_keys(crate::auth::PublicKeyStore::default());
         let kernel = Kernel::builder()
             .with_host_id("tc-py-kernel")
             .with_library_module(module, handlers)
             .with_rjwt_keyring_token_verifier(keyring)
+            .with_service_handler(python_handler(stub))
             .with_kernel_handler(kernel_handler)
-            .with_txn_ttl(config.limits.txn_ttl)
-            .finish();
-        Ok(Self::from_kernel(kernel, config))
-    }
-
-    #[classmethod]
-    #[pyo3(signature = (schema_json, dependency_root, authority, data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
-    pub fn with_library_schema_and_dependency_route(
-        _cls: &Bound<'_, PyType>,
-        schema_json: &str,
-        dependency_root: &str,
-        authority: &str,
-        data_dir: Option<PathBuf>,
-        request_ttl_secs: Option<u64>,
-        max_request_bytes_unauth: Option<usize>,
-    ) -> PyResult<Self> {
-        let authority = authority
-            .parse()
-            .map_err(|_| PyValueError::new_err("invalid dependency route authority"))?;
-        let schema = decode_schema_from_json(schema_json)?;
-        let storage_root = data_dir.clone();
-        let module =
-            block_on_tokio(http_library::build_http_library_module(schema, storage_root))
-                .expect("module");
-        block_on_tokio(module.hydrate_from_storage()).expect("library hydrate");
-        let handlers = http_library::http_library_handlers(&module);
-        let config = PyKernelConfig {
-            data_dir,
-            ..PyKernelConfig::default()
-        };
-        let config = apply_config_overrides(config, request_ttl_secs, max_request_bytes_unauth);
-        let kernel = Kernel::builder()
-            .with_host_id("tc-py-kernel")
-            .with_library_module(module, handlers)
-            .with_dependency_route(dependency_root, authority)
-            .with_http_rpc_gateway()
-            .with_txn_ttl(config.limits.txn_ttl)
-            .finish();
-        Ok(Self::from_kernel(kernel, config))
-    }
-
-    #[classmethod]
-    #[pyo3(signature = (schema_json, dependency_root, authority, token_host, actor_id, public_key_b64, data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_library_schema_and_dependency_route_rjwt(
-        _cls: &Bound<'_, PyType>,
-        schema_json: &str,
-        dependency_root: &str,
-        authority: &str,
-        token_host: &str,
-        actor_id: &str,
-        public_key_b64: &str,
-        data_dir: Option<PathBuf>,
-        request_ttl_secs: Option<u64>,
-        max_request_bytes_unauth: Option<usize>,
-    ) -> PyResult<Self> {
-        use std::str::FromStr;
-
-        let authority = authority
-            .parse()
-            .map_err(|_| PyValueError::new_err("invalid dependency route authority"))?;
-        let schema = decode_schema_from_json(schema_json)?;
-        let storage_root = data_dir.clone();
-        let module =
-            block_on_tokio(http_library::build_http_library_module(schema, storage_root))
-                .expect("module");
-        block_on_tokio(module.hydrate_from_storage()).expect("library hydrate");
-        let handlers = http_library::http_library_handlers(&module);
-        let host =
-            Link::from_str(token_host).map_err(|_| PyValueError::new_err("invalid token host"))?;
-        let key_bytes = STANDARD
-            .decode(public_key_b64)
-            .map_err(|_| PyValueError::new_err("invalid public key base64"))?;
-        let verifying_key = rjwt::VerifyingKey::try_from(key_bytes.as_slice())
-            .map_err(|_| PyValueError::new_err("invalid public key"))?;
-        let actor = crate::auth::Actor::with_public_key(Value::from(actor_id), verifying_key);
-        let keyring = crate::auth::KeyringActorResolver::default().with_actor(host, actor);
-        let config = PyKernelConfig {
-            data_dir,
-            ..PyKernelConfig::default()
-        };
-        let config = apply_config_overrides(config, request_ttl_secs, max_request_bytes_unauth);
-        let kernel = Kernel::builder()
-            .with_host_id("tc-py-kernel")
-            .with_library_module(module, handlers)
-            .with_dependency_route(dependency_root, authority)
-            .with_http_rpc_gateway()
-            .with_rjwt_keyring_token_verifier(keyring)
+            .with_health_handler(python_health_handler())
             .with_txn_ttl(config.limits.txn_ttl)
             .finish();
         Ok(Self::from_kernel(kernel, config))
