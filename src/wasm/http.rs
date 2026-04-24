@@ -50,16 +50,9 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request) -> Respo
         return not_found(&path);
     }
 
-    // TODO(framework-gap): WASM route manifests currently bind paths to exports but do not carry
-    // per-route verb metadata. Accept the standard TinyChain verbs here and let the exported WASM
-    // handler enforce its own semantics until the manifest can describe allowed methods directly.
-    if !matches!(
-        method,
-        crate::http::HttpMethod::GET
-            | crate::http::HttpMethod::PUT
-            | crate::http::HttpMethod::POST
-            | crate::http::HttpMethod::DELETE
-    ) {
+    // TODO(framework-gap): re-enable non-GET verbs once WASM route manifests carry per-route
+    // method metadata and the runtime can enforce method/route compatibility consistently.
+    if method != crate::http::HttpMethod::GET {
         return method_not_allowed(&method, &path);
     }
 
@@ -162,10 +155,12 @@ fn txn_header(req: &Request) -> TCResult<TxnHeader> {
 }
 
 fn method_not_allowed(method: &crate::http::HttpMethod, path: &str) -> Response {
-    error_response(TCError::method_not_allowed(
-        method.clone(),
-        path.to_string(),
-    ))
+    let message = format!("endpoint {} does not support {:?}", path, method);
+    hyper::Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(crate::http::header::CONTENT_TYPE, "text/plain")
+        .body(Body::from(message))
+        .unwrap()
 }
 
 fn not_found(path: &str) -> Response {

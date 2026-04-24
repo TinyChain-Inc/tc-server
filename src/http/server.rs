@@ -159,13 +159,12 @@ impl Service<Request> for KernelService {
             ) {
                 Ok(KernelDispatch::Response(resp)) => {
                     let mut response = resp.await;
-                    if inbound_txn_id.is_none() {
-                        if let Some(value) = minted_txn_id
+                    if inbound_txn_id.is_none()
+                        && let Some(value) = minted_txn_id
                             .map(|txn_id| HeaderValue::from_str(&txn_id.to_string()))
                             .and_then(Result::ok)
-                        {
-                            response.headers_mut().insert("x-tc-txn-id", value);
-                        }
+                    {
+                        response.headers_mut().insert("x-tc-txn-id", value);
                     }
 
                     Ok(response)
