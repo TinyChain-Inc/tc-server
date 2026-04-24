@@ -6,7 +6,8 @@ use std::time::Duration;
 use pathlink::Link;
 use serde_json::json;
 use tc_ir::LibrarySchema;
-use tinychain::auth::{KeyringActorResolver, PublicKeyStore};
+use tc_value::Value;
+use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
 use tinychain::library::http::{build_http_library_module, http_library_handlers};
@@ -15,6 +16,10 @@ use tinychain::replication::{
     replication_token_handler, request_replication_token,
 };
 use tinychain::storage::{Artifact, LibraryStore};
+
+mod support;
+
+use support::combine_host_handlers;
 
 #[tokio::test]
 async fn rotates_psk_keys_for_export_integration() {
@@ -47,7 +52,7 @@ async fn rotates_psk_keys_for_export_integration() {
     }))
     .expect("ir manifest");
 
-    let keys = parse_psk_keys(&vec![
+    let keys = parse_psk_keys(&[
         "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
         "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
     ])
@@ -80,11 +85,11 @@ async fn rotates_psk_keys_for_export_integration() {
         .expect("payload");
     assert_eq!(payload.schema.id(), schema.id());
 
-    let keys_new_only = parse_psk_keys(&vec![
+    let keys_new_only = parse_psk_keys(&[
         "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
     ])
     .expect("keys");
-    let keys_old_only = parse_psk_keys(&vec![
+    let keys_old_only = parse_psk_keys(&[
         "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
     ])
     .expect("keys");
@@ -120,6 +125,7 @@ async fn start_server(
     let issuer = Arc::new(ReplicationIssuer::new(
         Link::from_str("/host").expect("host"),
         keys,
+        Actor::new(Value::from("replication:psk:test")),
         keyring.clone(),
         public_keys.clone(),
     ));
@@ -150,28 +156,4 @@ async fn start_server(
 
     tokio::time::sleep(Duration::from_millis(20)).await;
     addr
-}
-
-fn combine_host_handlers(
-    public: impl tinychain::KernelHandler,
-    token: impl tinychain::KernelHandler,
-    export: impl tinychain::KernelHandler,
-) -> impl tinychain::KernelHandler {
-    let public: Arc<dyn tinychain::KernelHandler> = Arc::new(public);
-    let token: Arc<dyn tinychain::KernelHandler> = Arc::new(token);
-    let export: Arc<dyn tinychain::KernelHandler> = Arc::new(export);
-
-    move |req: tinychain::Request| {
-        let path = req.uri().path().to_string();
-        let public = Arc::clone(&public);
-        let token = Arc::clone(&token);
-        let export = Arc::clone(&export);
-        async move {
-            match path.as_str() {
-                "/" => token.call(req).await,
-                "/host/library/export" => export.call(req).await,
-                _ => public.call(req).await,
-            }
-        }
-    }
 }

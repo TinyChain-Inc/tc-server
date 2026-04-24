@@ -5,16 +5,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
     use pathlink::Link;
+    use rjwt::SigningKey;
     use tc_ir::Claim;
     use tc_value::Value;
-    use umask::USER_WRITE;
+    use umask::{USER_EXEC, USER_WRITE};
 
     use tinychain::auth::{Actor, Token};
 
     let mut host: Option<String> = None;
     let mut actor_id: Option<String> = None;
     let mut libs: Vec<String> = Vec::new();
+    let mut txn_id: Option<String> = None;
+    let mut secret_key_b64: Option<String> = None;
     let mut ttl_secs: u64 = 3600;
 
     let mut args = env::args().skip(1);
@@ -29,6 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("missing --lib value".into());
                 }
             }
+            "--txn-id" => txn_id = args.next(),
+            "--secret-key-b64" => secret_key_b64 = args.next(),
             "--ttl-secs" => {
                 ttl_secs = args.next().ok_or("missing --ttl-secs value")?.parse()?;
             }
@@ -51,7 +57,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for lib in &libs {
         claims.push(Claim::new(Link::from_str(lib)?, USER_WRITE));
     }
-    let actor = Actor::new(Value::from(actor_id.clone()));
+
+    let signing_key = if let Some(secret_key_b64) = secret_key_b64 {
+        let key_bytes = STANDARD
+            .decode(secret_key_b64.trim())
+            .or_else(|_| STANDARD_NO_PAD.decode(secret_key_b64.trim()))?;
+        let key_bytes: [u8; 32] = key_bytes
+            .try_into()
+            .map_err(|_| "invalid --secret-key-b64: expected 32-byte Ed25519 secret key")?;
+        SigningKey::from_bytes(&key_bytes)
+    } else {
+        use aes_gcm_siv::aead::OsRng;
+        SigningKey::generate(&mut OsRng)
+    };
+
+    let secret_key_b64 = STANDARD.encode(signing_key.to_bytes());
+    let actor = Actor::with_keypair(Value::from(actor_id.clone()), signing_key);
+
     let token = Token::new(
         host.clone(),
         SystemTime::now(),
@@ -63,6 +85,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for claim in claims.iter().skip(1).cloned() {
         signed = actor.consume_and_sign(signed, host.clone(), claim, SystemTime::now())?;
     }
+    if let Some(txn_id) = txn_id {
+        let txn_claim = Claim::new(
+            Link::from_str(&format!("/txn/{txn_id}"))?,
+            USER_EXEC | USER_WRITE,
+        );
+        signed = actor.consume_and_sign(signed, host.clone(), txn_claim, SystemTime::now())?;
+    }
 
     let public_key_b64 = STANDARD.encode(actor.public_key().to_bytes());
 
@@ -72,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("actor_id: {actor_id}");
     println!("public_key_b64: {public_key_b64}");
+    println!("secret_key_b64: {secret_key_b64}");
     println!("bearer_token: {}", signed.into_jwt());
 
     Ok(())
@@ -79,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: rjwt_install_token --host <http://host:port> --actor <id> --lib <path> [--lib <path> ...] [--ttl-secs <n>]\n\
+        "Usage: rjwt_install_token --host <http://host:port> --actor <id> --lib <path> [--lib <path> ...] [--txn-id <id>] [--secret-key-b64 <b64>] [--ttl-secs <n>]\n\
          Example:\n\
           cargo run --example rjwt_install_token -- \\\n\
              --host http://127.0.0.1:8702 --actor example-admin \\\n\

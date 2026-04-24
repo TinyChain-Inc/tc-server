@@ -51,6 +51,7 @@ pub(crate) fn parse_bearer_token(req: &Request) -> Option<String> {
     Some(token.to_string())
 }
 
+#[allow(clippy::collapsible_if)]
 pub(crate) async fn parse_body(
     req: Request,
     max_request_bytes_unauth: usize,

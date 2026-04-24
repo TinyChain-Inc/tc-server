@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fmt,
     str::FromStr,
     sync::Arc,
@@ -14,6 +15,47 @@ use umask::Mode;
 use crate::auth::{Actor, SignedToken, Token};
 use crate::gateway::RpcGateway;
 
+#[derive(Clone, Debug)]
+pub struct AuthClaimContext {
+    pub host: String,
+    pub actor_id: String,
+    pub claim: Claim,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthContext {
+    pub principal: String,
+    pub verified_at_nanos: u64,
+    pub claims: Vec<AuthClaimContext>,
+}
+
+impl AuthContext {
+    pub fn from_token_context(token: &crate::auth::TokenContext) -> Self {
+        Self {
+            principal: token.owner_id.clone(),
+            verified_at_nanos: token.verified_at_nanos,
+            claims: token
+                .claims
+                .iter()
+                .map(|(host, actor_id, claim)| AuthClaimContext {
+                    host: host.clone(),
+                    actor_id: actor_id.clone(),
+                    claim: claim.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn token_hosts(&self) -> Vec<String> {
+        let mut hosts = BTreeSet::new();
+        for claim in &self.claims {
+            hosts.insert(claim.host.clone());
+        }
+
+        hosts.into_iter().collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct TxnHandle {
     pub(super) id: TxnId,
@@ -24,6 +66,7 @@ pub struct TxnHandle {
     pub(super) resolver: Option<Arc<dyn RpcGateway>>,
     pub(super) ttl: Duration,
     pub(super) token: Option<Arc<SignedToken>>,
+    pub(super) auth_context: Option<AuthContext>,
 }
 
 impl TxnHandle {
@@ -37,6 +80,7 @@ impl TxnHandle {
             resolver: Some(resolver),
             ttl: self.ttl,
             token: self.token.clone(),
+            auth_context: self.auth_context.clone(),
         }
     }
 
@@ -60,6 +104,10 @@ impl TxnHandle {
         self.owner_id.as_deref()
     }
 
+    pub fn auth_context(&self) -> Option<&AuthContext> {
+        self.auth_context.as_ref()
+    }
+
     pub(crate) fn raw_token(&self) -> Option<&str> {
         self.bearer_token.as_deref()
     }
@@ -80,6 +128,21 @@ impl TxnHandle {
             resolver: self.resolver.clone(),
             ttl: self.ttl,
             token: self.token.clone(),
+            auth_context: self.auth_context.clone(),
+        }
+    }
+
+    pub(crate) fn without_bearer_token(&self) -> Self {
+        Self {
+            id: self.id,
+            claim: self.claim.clone(),
+            claims: self.claims.clone(),
+            owner_id: self.owner_id.clone(),
+            bearer_token: None,
+            resolver: self.resolver.clone(),
+            ttl: self.ttl,
+            token: self.token.clone(),
+            auth_context: self.auth_context.clone(),
         }
     }
 
@@ -97,6 +160,7 @@ impl TxnHandle {
             resolver: self.resolver.clone(),
             ttl: self.ttl,
             token: self.token.clone(),
+            auth_context: self.auth_context.clone(),
         }
     }
 
@@ -117,7 +181,22 @@ impl TxnHandle {
             resolver: self.resolver.clone(),
             ttl: self.ttl,
             token: Some(Arc::new(token)),
+            auth_context: self.auth_context.clone(),
         })
+    }
+
+    pub(crate) fn with_auth_context(&self, auth_context: AuthContext) -> Self {
+        Self {
+            id: self.id,
+            claim: self.claim.clone(),
+            claims: self.claims.clone(),
+            owner_id: self.owner_id.clone(),
+            bearer_token: self.bearer_token.clone(),
+            resolver: self.resolver.clone(),
+            ttl: self.ttl,
+            token: self.token.clone(),
+            auth_context: Some(auth_context),
+        }
     }
 
     pub fn grant(

@@ -34,14 +34,15 @@ fn loads_manifest_and_invokes_route() {
 #[cfg(all(test, feature = "http-server"))]
 mod http_tests {
     use super::*;
+    use crate::auth::{TokenContext, TokenVerifier};
     use crate::http::{Body, StatusCode};
     use crate::{
         HttpServer,
         kernel::{Kernel, Method},
         library::http::{build_http_library_module, http_library_handlers},
-        txn::TxnManager,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use futures::FutureExt;
     use hyper::{Client, body};
     use pathlink::Link;
     use std::net::TcpListener;
@@ -53,6 +54,54 @@ mod http_tests {
         GlobalSection, GlobalType, Instruction, MemorySection, MemoryType, Module, TypeSection,
         ValType,
     };
+
+    #[derive(Clone, Default)]
+    struct TestTokenVerifier;
+
+    impl TokenVerifier for TestTokenVerifier {
+        fn verify(
+            &self,
+            bearer_token: String,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::auth::TokenContext, crate::txn::TxnError>,
+        > {
+            use std::str::FromStr;
+
+            futures::future::ready({
+                let mut parts = bearer_token.splitn(2, '|');
+                let actor_id = parts.next().unwrap_or_default().trim().to_string();
+                if actor_id.is_empty() {
+                    Err(crate::txn::TxnError::Unauthorized)
+                } else {
+                    let owner_id = format!("/host::{actor_id}");
+                    let txn_id = parts.next().and_then(|part| TxnId::from_str(part).ok());
+                    let mut ctx = TokenContext::new(owner_id, bearer_token);
+                    if let Some(txn_id) = txn_id {
+                        let claim = Claim::new(
+                            Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim link"),
+                            umask::USER_EXEC | umask::USER_WRITE,
+                        );
+                        ctx.claims
+                            .push((crate::uri::HOST_ROOT.to_string(), actor_id, claim));
+                    }
+                    Ok(ctx)
+                }
+            })
+            .boxed()
+        }
+
+        fn grant(
+            &self,
+            token: crate::auth::TokenContext,
+            _claim: Claim,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::auth::TokenContext, crate::txn::TxnError>,
+        > {
+            futures::future::ready(Ok(token)).boxed()
+        }
+    }
 
     #[tokio::test]
     async fn kernel_dispatches_wasm_route() {
@@ -85,12 +134,14 @@ mod http_tests {
             }]
         });
 
-        let txn_manager = TxnManager::with_host_id("tc-wasm-test");
         let install_claim = Claim::new(
             Link::from_str("/lib/example-devco/example/0.1.0").expect("install link"),
             umask::USER_WRITE,
         );
-        let txn = txn_manager.begin().with_claims(vec![install_claim]);
+        let txn = kernel
+            .txn_manager()
+            .begin()
+            .with_claims(vec![install_claim]);
 
         let mut install_request = ::http::Request::builder()
             .method("PUT")
@@ -105,6 +156,10 @@ mod http_tests {
             .expect("install handler")
             .await;
         assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
+        kernel
+            .finalize_transaction(txn.clone(), true)
+            .await
+            .expect("commit install");
 
         let mut request = ::http::Request::builder()
             .method("GET")
@@ -333,6 +388,7 @@ mod http_tests {
         let b_kernel = Kernel::builder()
             .with_host_id("tc-http-b")
             .with_library_module(b_module, b_handlers)
+            .with_token_verifier(TestTokenVerifier)
             .with_service_handler(|_req| async { Response::new(Body::empty()) })
             .with_kernel_handler(|_req| async { Response::new(Body::empty()) })
             .with_health_handler(|_req| async { Response::new(Body::empty()) })
@@ -365,7 +421,9 @@ mod http_tests {
             .txn_manager()
             .begin()
             .with_claims(vec![install_claim_b]);
-        install_request_b.extensions_mut().insert(install_txn_b);
+        install_request_b
+            .extensions_mut()
+            .insert(install_txn_b.clone());
 
         let install_response_b = b_kernel
             .dispatch(Method::Put, "/lib", install_request_b)
@@ -373,6 +431,7 @@ mod http_tests {
             .await;
 
         assert_eq!(install_response_b.status(), StatusCode::NO_CONTENT);
+        b_kernel.finalize_transaction(install_txn_b, true).await?;
 
         let b_listener = TcpListener::bind("127.0.0.1:0")?;
         let b_addr = b_listener.local_addr()?;
@@ -402,6 +461,7 @@ mod http_tests {
             .with_library_module(a_module, a_handlers)
             .with_dependency_route(b_root, b_addr)
             .with_http_rpc_gateway()
+            .with_token_verifier(TestTokenVerifier)
             .with_service_handler(|_req| async { Response::new(Body::empty()) })
             .with_kernel_handler(|_req| async { Response::new(Body::empty()) })
             .with_health_handler(|_req| async { Response::new(Body::empty()) })
@@ -445,7 +505,9 @@ mod http_tests {
             .txn_manager()
             .begin()
             .with_claims(vec![install_claim_a]);
-        install_request_a.extensions_mut().insert(install_txn_a);
+        install_request_a
+            .extensions_mut()
+            .insert(install_txn_a.clone());
 
         let install_response_a = a_kernel
             .dispatch(Method::Put, "/lib", install_request_a)
@@ -453,6 +515,7 @@ mod http_tests {
             .await;
 
         assert_eq!(install_response_a.status(), StatusCode::NO_CONTENT);
+        a_kernel.finalize_transaction(install_txn_a, true).await?;
 
         let a_listener = TcpListener::bind("127.0.0.1:0")?;
         let a_addr = a_listener.local_addr()?;
@@ -463,10 +526,28 @@ mod http_tests {
             })
         };
 
+        let begin_request = ::http::Request::builder()
+            .method("GET")
+            .uri(format!("http://{a_addr}{a_root}"))
+            .header(hyper::header::AUTHORIZATION, "Bearer demo-user")
+            .body(Body::empty())?;
+
+        let begin_response = Client::new().request(begin_request).await?;
+        assert_eq!(begin_response.status(), StatusCode::OK);
+        let txn_id = begin_response
+            .headers()
+            .get("x-tc-txn-id")
+            .and_then(|value| value.to_str().ok())
+            .ok_or("missing x-tc-txn-id on begin response")?
+            .to_string();
+
         let request = ::http::Request::builder()
             .method("GET")
-            .uri(format!("http://{a_addr}{a_from_b}"))
-            .header(hyper::header::AUTHORIZATION, "Bearer demo-user")
+            .uri(format!("http://{a_addr}{a_from_b}?txn_id={txn_id}"))
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer demo-user|{txn_id}"),
+            )
             .body(Body::empty())?;
 
         let response = Client::new().request(request).await?;

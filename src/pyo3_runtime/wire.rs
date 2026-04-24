@@ -28,23 +28,6 @@ pub(super) fn parse_method(method: &str) -> PyResult<Method> {
     }
 }
 
-pub(super) fn http_request_from_py(request: &PyKernelRequest) -> PyResult<Request> {
-    let method = match request.method_enum() {
-        Method::Get => crate::HttpMethod::GET,
-        Method::Put => crate::HttpMethod::PUT,
-        Method::Post => crate::HttpMethod::POST,
-        Method::Delete => crate::HttpMethod::DELETE,
-    };
-
-    let mut builder = http::Request::builder().method(method).uri(request.path());
-    for (name, value) in request.headers() {
-        builder = builder.header(name.as_str(), value.as_str());
-    }
-
-    let body_bytes = request_body_bytes(request.body())?;
-    http_request_from_py_with_body(request, body_bytes)
-}
-
 pub(super) fn http_request_from_py_with_body(
     request: &PyKernelRequest,
     body_bytes: Vec<u8>,

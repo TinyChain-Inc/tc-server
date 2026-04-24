@@ -1,15 +1,15 @@
 use super::*;
 use crate::auth::Token;
 use std::str::FromStr;
-use tc_ir::Claim;
+use tc_ir::{Claim, NetworkTime, TxnId};
 use umask::Mode;
 
 #[test]
-fn mints_bearer_token_for_anonymous_txn() {
+fn does_not_mint_bearer_token_for_anonymous_txn() {
     let manager = TxnManager::with_host_id("test-host");
     let handle = manager.begin();
 
-    assert!(handle.raw_token().is_some());
+    assert!(handle.raw_token().is_none());
 
     let txn_link = pathlink::Link::from_str(&format!("/txn/{}", handle.id())).expect("txn link");
     assert!(handle.has_claim(&txn_link, umask::USER_EXEC));
@@ -75,5 +75,43 @@ fn enforces_canonical_claim_position() {
     assert!(
         err.message()
             .contains("canonical claim must be first or second")
+    );
+}
+
+#[test]
+fn unknown_txn_continuation_requires_authenticated_owner() {
+    let manager = TxnManager::with_host_id("test-host");
+    let unknown = TxnId::from_parts(NetworkTime::from_nanos(7), 7).with_trace([1; 32]);
+    let rejected = manager.interpret_request(Some(unknown), None, None);
+    assert!(matches!(rejected, Err(TxnError::NotFound)));
+
+    let accepted = manager.interpret_request(Some(unknown), Some("owner-a"), Some("token-a"));
+    assert!(matches!(accepted, Ok(TxnFlow::Begin(_))));
+}
+
+#[test]
+fn attaches_structured_auth_context_to_txn_handle() {
+    let manager = TxnManager::with_host_id("test-host");
+    let handle =
+        manager.begin_with_owner(Some("http://127.0.0.1:8702::example-admin"), Some("token"));
+
+    let claim = Claim::new(
+        pathlink::Link::from_str("/lib/example-devco/a/0.1.0").expect("claim link"),
+        Mode::all(),
+    );
+    let mut token = crate::auth::TokenContext::new("http://127.0.0.1:8702::example-admin", "token");
+    token = token.with_claim(
+        "http://127.0.0.1:8702".to_string(),
+        "example-admin".to_string(),
+        claim,
+    );
+
+    let handle = handle.with_auth_context(AuthContext::from_token_context(&token));
+    let auth = handle.auth_context().expect("auth context");
+    assert_eq!(auth.principal, "http://127.0.0.1:8702::example-admin");
+    assert_eq!(auth.claims.len(), 1);
+    assert_eq!(
+        auth.token_hosts(),
+        vec!["http://127.0.0.1:8702".to_string()]
     );
 }

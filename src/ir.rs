@@ -307,6 +307,7 @@ pub fn http_ir_route_handler_from_bytes(
             .expect("error response")
     }
 
+    #[allow(clippy::collapsible_if)]
     async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> {
         if let Some(body) = req.extensions().get::<RequestBody>() {
             if !body.is_empty() {

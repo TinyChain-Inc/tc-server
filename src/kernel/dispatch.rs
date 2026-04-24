@@ -2,11 +2,12 @@ use futures::future::BoxFuture;
 
 use crate::Response;
 
+#[allow(clippy::large_enum_variant)]
 pub enum KernelDispatch {
     Response(BoxFuture<'static, Response>),
     Finalize {
         commit: bool,
-        result: Result<(), crate::txn::TxnError>,
+        txn: crate::txn::TxnHandle,
     },
     NotFound,
 }

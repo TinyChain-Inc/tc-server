@@ -1,6 +1,7 @@
 use std::{str::FromStr, sync::Arc};
 
 use futures::future::BoxFuture;
+use tc_error::TCResult;
 use tc_ir::TxnId;
 
 use crate::egress::EgressPolicy;
@@ -26,7 +27,7 @@ pub struct Kernel {
     pub(crate) library_module: Option<Arc<LibraryRegistry>>,
     pub(crate) rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     pub(crate) token_verifier: Arc<dyn crate::auth::TokenVerifier>,
-    pub(crate) kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
+    pub(crate) txn_finalize_hook: Option<super::TxnFinalizeHook>,
 }
 
 impl Kernel {
@@ -40,6 +41,10 @@ impl Kernel {
         path: &str,
         req: Request,
     ) -> Option<BoxFuture<'static, Response>> {
+        if crate::replication::is_peer_membership_path(path) {
+            return Some(self.kernel_handler.call(req));
+        }
+
         if path.starts_with("/state/") {
             return Some(self.kernel_handler.call(req));
         }
@@ -55,13 +60,15 @@ impl Kernel {
             return Some(self.service_handler.call(req));
         }
 
+        if path == crate::uri::HOST_ROOT || path.starts_with(crate::uri::HOST_ROOT_PREFIX) {
+            return Some(self.kernel_handler.call(req));
+        }
+
         match (method, path) {
             (Method::Get, crate::uri::LIB_ROOT) => Some(self.lib_get_handler.call(req)),
             (Method::Put, crate::uri::LIB_ROOT) => Some(self.lib_put_handler.call(req)),
             (Method::Get, "/") => Some(self.kernel_handler.call(req)),
-            (Method::Get, crate::uri::HOST_METRICS) => Some(self.kernel_handler.call(req)),
-            (Method::Get, crate::uri::HOST_PUBLIC_KEY) => Some(self.kernel_handler.call(req)),
-            (Method::Get, crate::uri::HOST_LIBRARY_EXPORT) => Some(self.kernel_handler.call(req)),
+            (Method::Post, "/") => Some(self.kernel_handler.call(req)),
             (Method::Post, path) if is_scalar_reflect_path_str(path) => {
                 Some(self.kernel_handler.call(req))
             }
@@ -98,6 +105,7 @@ impl Kernel {
             token_verifier: Arc::clone(&self.token_verifier),
             txn_manager: self.txn_manager.clone(),
             txn_server: self.txn_server.clone(),
+            lib_route_handler: self.lib_route_handler.as_ref().map(Arc::clone),
             host_handler: Arc::clone(&self.kernel_handler),
         })
     }
@@ -109,9 +117,48 @@ impl Kernel {
     pub(crate) fn expire_transactions_at(&self, now: std::time::Instant) -> Vec<TxnId> {
         let expired = self.txn_server.expire_at(now);
         for txn_id in &expired {
+            if let Some(module) = &self.library_module {
+                module.discard_txn(*txn_id);
+            }
             let _ = self.txn_manager.rollback(*txn_id);
         }
         expired
+    }
+
+    pub async fn finalize_transaction(
+        &self,
+        txn: crate::txn::TxnHandle,
+        commit: bool,
+    ) -> TCResult<()> {
+        if let Some(finalize_hook) = &self.txn_finalize_hook {
+            if commit {
+                finalize_hook(txn.clone(), true).await?;
+            } else if let Err(err) = finalize_hook(txn.clone(), false).await {
+                eprintln!("rollback finalize hook failed: {err}");
+            }
+        }
+
+        if let Some(module) = &self.library_module {
+            module.finalize_txn(txn.id(), commit).await?;
+        }
+
+        self.txn_server.forget(&txn.id());
+
+        let result = if commit {
+            self.txn_manager.commit(txn.id())
+        } else {
+            self.txn_manager.rollback(txn.id())
+        };
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(crate::txn::TxnError::NotFound) => {
+                Err(tc_error::TCError::bad_request("unknown transaction id"))
+            }
+            Err(crate::txn::TxnError::Unauthorized) => Err(tc_error::TCError::unauthorized(
+                "unauthorized transaction owner",
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -137,23 +184,29 @@ impl Kernel {
         if path == crate::uri::HEALTHZ
             || path == crate::uri::HOST_ROOT
             || (path.starts_with(crate::uri::HOST_ROOT_PREFIX)
-                && path != crate::uri::HOST_LIBRARY_EXPORT)
+                && path != crate::uri::HOST_LIBRARY_EXPORT
+                && path != crate::uri::HOST_AUTH_CONTEXT)
+            || crate::replication::is_peer_membership_path(path)
         {
             return Ok(dispatch_or_not_found(self.dispatch(method, path, req)));
         }
 
         let is_component_root =
             component_root(path).is_some_and(|component_root| component_root == path);
-        let token_has_txn_claim = |token: &crate::auth::TokenContext| {
-            token
-                .claims
-                .iter()
-                .any(|(_, _, claim)| claim.link.to_string().starts_with("/txn/"))
-        };
 
         let (owner_id, bearer_token, claims) = match (txn_id, token) {
-            (Some(txn_id), Some(token)) if token_has_txn_claim(token) => {
-                let owner_id = crate::txn::owner_id_from_token(txn_id, token)?;
+            (Some(txn_id), Some(token)) => {
+                let owner_id = match crate::txn::owner_id_from_token(txn_id, token) {
+                    Ok(owner_id) => owner_id,
+                    Err(crate::txn::TxnError::Unauthorized) => {
+                        if crate::txn::has_txn_claim(token) {
+                            return Err(crate::txn::TxnError::Unauthorized);
+                        }
+
+                        token.owner_id.to_string()
+                    }
+                    Err(err) => return Err(err),
+                };
                 let claims = token
                     .claims
                     .iter()
@@ -165,7 +218,8 @@ impl Kernel {
                     Some(claims),
                 )
             }
-            (_, Some(token)) => {
+            (Some(_), None) => (None, None, None),
+            (None, Some(token)) => {
                 let claims = if token.claims.is_empty() {
                     None
                 } else {
@@ -187,49 +241,55 @@ impl Kernel {
         };
         let owner_id = owner_id.as_deref();
         let bearer_token = bearer_token.as_deref();
+        let auth_context = token.map(crate::txn::AuthContext::from_token_context);
 
-        let flow = if txn_id.is_some()
-            && body_is_none
-            && is_component_root
-            && matches!(method, Method::Post | Method::Delete)
-        {
-            let handle = self
-                .txn_manager
-                .get_with_owner(&txn_id.expect("txn_id checked above"), owner_id)?;
+        if txn_id.is_some() && bearer_token.is_none() {
+            return Err(crate::txn::TxnError::Unauthorized);
+        }
 
-            let required = match method {
-                Method::Post => umask::USER_EXEC,
-                Method::Delete => umask::USER_WRITE,
-                _ => umask::Mode::new(),
+        let flow =
+            if body_is_none && is_component_root && matches!(method, Method::Post | Method::Delete)
+            {
+                if let Some(txn_id) = txn_id {
+                    let handle = self.txn_manager.get_with_owner(&txn_id, owner_id)?;
+
+                    let required = match method {
+                        Method::Post => umask::USER_EXEC,
+                        Method::Delete => umask::USER_WRITE,
+                        _ => umask::Mode::new(),
+                    };
+                    let handle = match claims {
+                        Some(claims) => handle.with_claims(claims),
+                        None => handle,
+                    };
+                    let bearer_token = match bearer_token {
+                        Some(token) => token,
+                        None => {
+                            return Err(crate::txn::TxnError::Unauthorized);
+                        }
+                    };
+                    let handle = handle.with_bearer_token(bearer_token.to_string());
+                    if bearer_token.is_empty() {
+                        return Err(crate::txn::TxnError::Unauthorized);
+                    }
+
+                    let txn_link = pathlink::Link::from_str(&format!("/txn/{}", handle.id()))
+                        .map_err(|_| crate::txn::TxnError::Unauthorized)?;
+                    if !handle.has_claim(&txn_link, required) {
+                        return Err(crate::txn::TxnError::Unauthorized);
+                    }
+                    return Ok(KernelDispatch::Finalize {
+                        commit: method == Method::Post,
+                        txn: handle,
+                    });
+                }
+
+                self.txn_manager
+                    .interpret_request(txn_id, owner_id, bearer_token)?
+            } else {
+                self.txn_manager
+                    .interpret_request(txn_id, owner_id, bearer_token)?
             };
-            let handle = match claims {
-                Some(claims) => handle.with_claims(claims),
-                None => handle,
-            };
-            if bearer_token.is_none() {
-                return Err(crate::txn::TxnError::Unauthorized);
-            }
-
-            let txn_link = pathlink::Link::from_str(&format!("/txn/{}", handle.id()))
-                .map_err(|_| crate::txn::TxnError::Unauthorized)?;
-            if !handle.has_claim(&txn_link, required) {
-                return Err(crate::txn::TxnError::Unauthorized);
-            }
-
-            self.txn_server.forget(&handle.id());
-
-            return Ok(KernelDispatch::Finalize {
-                commit: method == Method::Post,
-                result: match method {
-                    Method::Post => self.txn_manager.commit(handle.id()),
-                    Method::Delete => self.txn_manager.rollback(handle.id()),
-                    _ => unreachable!("checked above"),
-                },
-            });
-        } else {
-            self.txn_manager
-                .interpret_request(txn_id, owner_id, bearer_token)?
-        };
 
         let dispatch = match flow {
             TxnFlow::Begin(handle) => {
@@ -239,6 +299,16 @@ impl Kernel {
                         let _ = self.txn_manager.record_claim(&handle.id(), claim.clone());
                     }
                     handle.with_claims(claims.clone())
+                } else {
+                    handle
+                };
+                let handle = if let Some(token) = bearer_token {
+                    handle.with_bearer_token(token.to_string())
+                } else {
+                    handle
+                };
+                let handle = if let Some(auth_context) = auth_context.clone() {
+                    handle.with_auth_context(auth_context)
                 } else {
                     handle
                 };
@@ -253,6 +323,16 @@ impl Kernel {
                         let _ = self.txn_manager.record_claim(&handle.id(), claim.clone());
                     }
                     handle.with_claims(claims.clone())
+                } else {
+                    handle
+                };
+                let handle = if let Some(token) = bearer_token {
+                    handle.with_bearer_token(token.to_string())
+                } else {
+                    handle
+                };
+                let handle = if let Some(auth_context) = auth_context.clone() {
+                    handle.with_auth_context(auth_context)
                 } else {
                     handle
                 };
@@ -281,7 +361,7 @@ impl Clone for Kernel {
             library_module: self.library_module.as_ref().map(Arc::clone),
             rpc_gateway: self.rpc_gateway.as_ref().map(Arc::clone),
             token_verifier: Arc::clone(&self.token_verifier),
-            kernel_actor: self.kernel_actor.clone(),
+            txn_finalize_hook: self.txn_finalize_hook.as_ref().map(Arc::clone),
         }
     }
 }

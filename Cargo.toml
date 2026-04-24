@@ -1,6 +1,6 @@
 [package]
 name = "tinychain"
-version = "0.1.0"
+version = "0.17.0"
 edition = "2024"
 
 [lib]
@@ -27,12 +27,14 @@ getrandom = "0.2"
 sha2 = "0.10"
 rjwt = { version = "0.6" }
 freqfs = "0.12.0"
+txfs = "0.5.2"
 mdns-sd = { version = "0.11", optional = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 aes-gcm-siv = "0.11"
 hex = "0.4"
 safecast = "0.2"
 number-general = "0.14"
+get-size = "0.1"
 
 [dependencies.destream_json]
 version = "0.15"

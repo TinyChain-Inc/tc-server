@@ -21,14 +21,10 @@ pub(crate) fn not_found() -> Response {
         .expect("not found response")
 }
 
-pub(crate) fn handle_finalize_result(result: Result<(), crate::txn::TxnError>) -> Response {
+pub(crate) fn handle_finalize_result(result: tc_error::TCResult<()>) -> Response {
     match result {
         Ok(()) => no_content(),
-        Err(crate::txn::TxnError::NotFound) => bad_request_response("unknown transaction id"),
-        Err(crate::txn::TxnError::Unauthorized) => hyper::Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .body(Body::empty())
-            .expect("unauthorized response"),
+        Err(err) => tc_error_response(err),
     }
 }
 

@@ -74,6 +74,7 @@ Environment configuration:
 - `TC_BIND` (default `0.0.0.0:8702`)
 - `TC_DATA_DIR` (default `/tmp/tinychain`)
 - `TC_PSK_HEX` (comma-separated hex keys)
+- `TC_CLUSTER_ROOT` (default `/lib/example-devco`, used for cluster-scoped peer routes like `<cluster-root>/_cluster/peers`)
 - `TC_PEERS` (comma-separated `host:port` entries)
 - `TC_K8S_DNS` / `TC_K8S_PORT` (headless service discovery)
 - `TC_MDNS` (set to `1` to enable mDNS discovery)

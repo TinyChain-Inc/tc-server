@@ -1,17 +1,25 @@
 use std::{
-    io,
+    cmp::Ordering,
+    collections::HashMap,
+    fmt, io,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
 };
 
 use crate::ir::{IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE};
-use freqfs::{Cache, DirEntry, DirLock, FileLoad, FileLock, FileSave};
+use freqfs::{Cache, FileLoad, FileSave, Name};
+use get_size::GetSize;
 use pathlink::Link;
 use safecast::AsType;
 use serde::{Deserialize, Serialize};
 use tc_error::{TCError, TCResult};
-use tc_ir::LibrarySchema;
+use tc_ir::{LibrarySchema, TxnId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use txfs::{Dir as TxDir, DirEntry as TxDirEntry, Id as TxName};
 
 const LIB_ROOT: &str = "lib";
 const SCHEMA_FILE: &str = "schema.json";
@@ -19,6 +27,8 @@ const WASM_FILE: &str = "library.wasm";
 const IR_FILE: &str = "library.ir.json";
 const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_CACHE_HANDLES: usize = 1024;
+const BOOTSTRAP_TXN_VERSION: TxnVersionId = TxnVersionId(1);
+const FIRST_DYNAMIC_TXN_VERSION: u64 = 2;
 
 #[derive(Clone, Debug)]
 pub struct Artifact {
@@ -29,11 +39,12 @@ pub struct Artifact {
 
 #[derive(Clone)]
 pub struct LibraryStore {
-    root: DirLock<LibraryFile>,
-    dir: DirLock<LibraryFile>,
+    root: LibraryRoot,
+    segments: Arc<Vec<TxName>>,
+    versions: Arc<TxnVersionTracker>,
 }
 
-pub(crate) type LibraryRoot = DirLock<LibraryFile>;
+pub(crate) type LibraryRoot = TxDir<TxnVersionId, LibraryFile>;
 
 #[derive(Clone)]
 pub(crate) enum LibraryFile {
@@ -62,6 +73,14 @@ impl AsType<LibraryFile> for LibraryFile {
     }
 }
 
+impl GetSize for LibraryFile {
+    fn get_size(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+        }
+    }
+}
+
 impl FileLoad for LibraryFile {
     async fn load(
         _path: &Path,
@@ -82,6 +101,90 @@ impl FileSave for LibraryFile {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub(crate) struct TxnVersionId(u64);
+
+impl fmt::Display for TxnVersionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for TxnVersionId {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse::<u64>()
+            .map(Self)
+            .map_err(|_| "invalid transaction version id")
+    }
+}
+
+impl Name for TxnVersionId {
+    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
+        let key: TxnVersionId = key.parse().ok()?;
+        PartialOrd::partial_cmp(self, &key)
+    }
+}
+
+impl PartialEq<str> for TxnVersionId {
+    fn eq(&self, other: &str) -> bool {
+        TxnVersionId::from_str(other).is_ok_and(|other| self == &other)
+    }
+}
+
+impl PartialOrd<str> for TxnVersionId {
+    fn partial_cmp(&self, other: &str) -> Option<Ordering> {
+        let other: TxnVersionId = other.parse().ok()?;
+        PartialOrd::partial_cmp(self, &other)
+    }
+}
+
+#[derive(Default)]
+struct TxnVersionTracker {
+    next: AtomicU64,
+    finalized: AtomicU64,
+    mapped: Mutex<HashMap<TxnId, TxnVersionId>>,
+}
+
+impl TxnVersionTracker {
+    fn new() -> Self {
+        Self {
+            next: AtomicU64::new(FIRST_DYNAMIC_TXN_VERSION),
+            finalized: AtomicU64::new(BOOTSTRAP_TXN_VERSION.0),
+            mapped: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn allocate_transient(&self) -> TxnVersionId {
+        let value = self.next.fetch_add(1, AtomicOrdering::Relaxed);
+        TxnVersionId(value)
+    }
+
+    fn for_txn(&self, txn_id: TxnId) -> TxnVersionId {
+        let mut mapped = self.mapped.lock().expect("txn version map");
+        if let Some(existing) = mapped.get(&txn_id) {
+            return *existing;
+        }
+
+        let version = self.allocate_transient();
+        mapped.insert(txn_id, version);
+        version
+    }
+
+    fn take(&self, txn_id: &TxnId) -> Option<TxnVersionId> {
+        self.mapped.lock().expect("txn version map").remove(txn_id)
+    }
+
+    fn mark_finalized(&self, version: TxnVersionId) {
+        self.finalized.fetch_max(version.0, AtomicOrdering::Relaxed);
+    }
+
+    fn read_version(&self) -> TxnVersionId {
+        TxnVersionId(self.finalized.load(AtomicOrdering::Relaxed))
+    }
+}
+
 impl LibraryStore {
     pub async fn open(root: PathBuf) -> TCResult<Self> {
         let root_dir = load_library_root(root).await?;
@@ -90,31 +193,48 @@ impl LibraryStore {
 
     pub(crate) fn from_root(root: LibraryRoot) -> Self {
         Self {
-            root: root.clone(),
-            dir: root,
+            root,
+            segments: Arc::new(Vec::new()),
+            versions: Arc::new(TxnVersionTracker::new()),
         }
     }
 
     pub async fn for_schema(&self, schema: &LibrarySchema) -> TCResult<Self> {
-        let segments = library_segments(schema.id())?;
-        let dir = ensure_dir(self.root.clone(), &segments).await?;
+        let segments = library_segments(schema.id())?
+            .into_iter()
+            .map(|segment| parse_name(&segment))
+            .collect::<TCResult<Vec<_>>>()?;
+
         Ok(Self {
             root: self.root.clone(),
-            dir,
+            segments: Arc::new(segments),
+            versions: self.versions.clone(),
         })
     }
 
     pub async fn discover_schemas(&self) -> TCResult<Vec<LibrarySchema>> {
         let mut schemas = Vec::new();
-        discover_schemas(&self.root, &mut schemas).await?;
+        discover_schemas(&self.root, self.versions.read_version(), &mut schemas).await?;
         Ok(schemas)
     }
 }
 
 impl LibraryStore {
     pub async fn persist_schema(&self, schema: &LibrarySchema) -> TCResult<()> {
-        let bytes = encode_schema(schema).map_err(map_io_str)?;
-        write_file(&self.dir, SCHEMA_FILE, bytes).await
+        let version = self.versions.allocate_transient();
+        let staged = self.persist_schema_at(version, schema).await;
+        match staged {
+            Ok(()) => self.finalize_version(version, true).await,
+            Err(err) => {
+                let _ = self.finalize_version(version, false).await;
+                Err(err)
+            }
+        }
+    }
+
+    pub async fn stage_schema(&self, txn_id: TxnId, schema: &LibrarySchema) -> TCResult<()> {
+        let version = self.versions.for_txn(txn_id);
+        self.persist_schema_at(version, schema).await
     }
 
     pub async fn persist_artifact(
@@ -122,30 +242,42 @@ impl LibraryStore {
         schema: &LibrarySchema,
         artifact: &Artifact,
     ) -> TCResult<()> {
-        if artifact.content_type == WASM_ARTIFACT_CONTENT_TYPE {
-            return self.persist_wasm_library(schema, &artifact.bytes).await;
+        let version = self.versions.allocate_transient();
+        let staged = self.persist_artifact_at(version, schema, artifact).await;
+        match staged {
+            Ok(()) => self.finalize_version(version, true).await,
+            Err(err) => {
+                let _ = self.finalize_version(version, false).await;
+                Err(err)
+            }
         }
-        if artifact.content_type == IR_ARTIFACT_CONTENT_TYPE {
-            return self.persist_ir_library(schema, &artifact.bytes).await;
-        }
-        Err(TCError::bad_request(format!(
-            "unsupported library artifact content type {}",
-            artifact.content_type
-        )))
     }
 
-    async fn persist_wasm_library(&self, schema: &LibrarySchema, wasm: &[u8]) -> TCResult<()> {
-        self.persist_schema(schema).await?;
-        write_file(&self.dir, WASM_FILE, wasm.to_vec()).await
+    pub async fn stage_artifact(
+        &self,
+        txn_id: TxnId,
+        schema: &LibrarySchema,
+        artifact: &Artifact,
+    ) -> TCResult<()> {
+        let version = self.versions.for_txn(txn_id);
+        self.persist_artifact_at(version, schema, artifact).await
     }
 
-    async fn persist_ir_library(&self, schema: &LibrarySchema, bytes: &[u8]) -> TCResult<()> {
-        self.persist_schema(schema).await?;
-        write_file(&self.dir, IR_FILE, bytes.to_vec()).await
+    pub async fn finalize_txn(&self, txn_id: TxnId, commit: bool) -> TCResult<()> {
+        let Some(version) = self.versions.take(&txn_id) else {
+            return Ok(());
+        };
+
+        self.finalize_version(version, commit).await
     }
 
     pub async fn load_artifact(&self, schema: &LibrarySchema) -> TCResult<Option<Artifact>> {
-        if let Some(schema_bytes) = read_file(&self.dir, SCHEMA_FILE).await? {
+        let read_version = self.versions.read_version();
+        let Some(dir) = self.resolve_dir(read_version, false).await? else {
+            return Ok(None);
+        };
+
+        if let Some(schema_bytes) = read_file(&dir, read_version, SCHEMA_FILE).await? {
             let stored = decode_schema_bytes(&schema_bytes).map_err(TCError::internal)?;
             if stored.id() != schema.id() || stored.version() != schema.version() {
                 return Ok(None);
@@ -154,7 +286,7 @@ impl LibraryStore {
             return Ok(None);
         }
 
-        match read_file(&self.dir, WASM_FILE).await? {
+        match read_file(&dir, read_version, WASM_FILE).await? {
             Some(wasm_bytes) if !wasm_bytes.is_empty() => {
                 return Ok(Some(Artifact {
                     path: schema.id().to_string(),
@@ -165,7 +297,7 @@ impl LibraryStore {
             _ => {}
         }
 
-        match read_file(&self.dir, IR_FILE).await? {
+        match read_file(&dir, read_version, IR_FILE).await? {
             Some(ir_bytes) if !ir_bytes.is_empty() => {
                 return Ok(Some(Artifact {
                     path: schema.id().to_string(),
@@ -178,6 +310,102 @@ impl LibraryStore {
 
         Ok(None)
     }
+
+    async fn persist_schema_at(
+        &self,
+        version: TxnVersionId,
+        schema: &LibrarySchema,
+    ) -> TCResult<()> {
+        let bytes = encode_schema(schema).map_err(map_io_str)?;
+        let dir = self.resolve_dir(version, true).await?.expect("create dir");
+        write_file(&dir, version, SCHEMA_FILE, bytes).await
+    }
+
+    async fn persist_artifact_at(
+        &self,
+        version: TxnVersionId,
+        schema: &LibrarySchema,
+        artifact: &Artifact,
+    ) -> TCResult<()> {
+        if artifact.content_type == WASM_ARTIFACT_CONTENT_TYPE {
+            return self
+                .persist_wasm_library(version, schema, &artifact.bytes)
+                .await;
+        }
+        if artifact.content_type == IR_ARTIFACT_CONTENT_TYPE {
+            return self
+                .persist_ir_library(version, schema, &artifact.bytes)
+                .await;
+        }
+
+        Err(TCError::bad_request(format!(
+            "unsupported library artifact content type {}",
+            artifact.content_type
+        )))
+    }
+
+    async fn persist_wasm_library(
+        &self,
+        version: TxnVersionId,
+        schema: &LibrarySchema,
+        wasm: &[u8],
+    ) -> TCResult<()> {
+        self.persist_schema_at(version, schema).await?;
+        let dir = self.resolve_dir(version, true).await?.expect("create dir");
+        write_file(&dir, version, WASM_FILE, wasm.to_vec()).await
+    }
+
+    async fn persist_ir_library(
+        &self,
+        version: TxnVersionId,
+        schema: &LibrarySchema,
+        bytes: &[u8],
+    ) -> TCResult<()> {
+        self.persist_schema_at(version, schema).await?;
+        let dir = self.resolve_dir(version, true).await?.expect("create dir");
+        write_file(&dir, version, IR_FILE, bytes.to_vec()).await
+    }
+
+    async fn resolve_dir(
+        &self,
+        version: TxnVersionId,
+        create: bool,
+    ) -> TCResult<Option<LibraryRoot>> {
+        let mut current = self.root.clone();
+
+        for segment in self.segments.iter() {
+            if create {
+                match current.create_dir(version, segment.clone()).await {
+                    Ok(created) => {
+                        current = created;
+                        continue;
+                    }
+                    Err(txfs::Error::IO(err)) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(err) => return Err(map_txfs(err)),
+                }
+            }
+
+            let Some(next) = current.get_dir(version, segment).await.map_err(map_txfs)? else {
+                return Ok(None);
+            };
+
+            current = (*next).clone();
+        }
+
+        Ok(Some(current))
+    }
+
+    async fn finalize_version(&self, version: TxnVersionId, commit: bool) -> TCResult<()> {
+        if commit {
+            self.root.commit(version, true).await;
+        } else {
+            self.root.rollback(version, true).await;
+        }
+
+        self.root.finalize(version).await;
+        self.versions.mark_finalized(version);
+        Ok(())
+    }
 }
 
 pub(crate) async fn load_library_root(root: PathBuf) -> TCResult<LibraryRoot> {
@@ -185,91 +413,86 @@ pub(crate) async fn load_library_root(root: PathBuf) -> TCResult<LibraryRoot> {
     tokio::fs::create_dir_all(&lib_root).await.map_err(map_io)?;
 
     let cache = Cache::new(DEFAULT_CACHE_BYTES, Some(DEFAULT_CACHE_HANDLES));
-    cache.load(lib_root).map_err(map_io)
+    let canonical = cache.load(lib_root).map_err(map_io)?;
+    let root = TxDir::load(BOOTSTRAP_TXN_VERSION, canonical)
+        .await
+        .map_err(map_txfs)?;
+
+    // Seal the loaded snapshot so subsequent transactions can stage writes without
+    // conflicting against the bootstrap transaction.
+    root.commit(BOOTSTRAP_TXN_VERSION, true).await;
+    root.finalize(BOOTSTRAP_TXN_VERSION).await;
+
+    Ok(root)
 }
 
 async fn discover_schemas(
-    dir: &DirLock<LibraryFile>,
+    dir: &LibraryRoot,
+    read_version: TxnVersionId,
     schemas: &mut Vec<LibrarySchema>,
 ) -> TCResult<()> {
     let mut pending = vec![dir.clone()];
+    let schema_name = parse_name(SCHEMA_FILE)?;
+
     while let Some(current) = pending.pop() {
-        let entries = read_dir_entries(&current).await?;
-        for (name, entry) in entries {
-            match entry {
-                DirEntry::Dir(subdir) => pending.push(subdir),
-                DirEntry::File(file) if name == SCHEMA_FILE => {
-                    if let Some(bytes) = read_file_from_lock(&file).await? {
-                        let schema = decode_schema_bytes(&bytes).map_err(TCError::internal)?;
-                        schemas.push(schema);
-                    }
+        let iter = current.iter(read_version).await.map_err(map_txfs)?;
+
+        for (name, entry) in iter {
+            match &*entry {
+                TxDirEntry::Dir(subdir) => pending.push(subdir.clone()),
+                TxDirEntry::File(file) if name == schema_name => {
+                    let guard = file
+                        .read::<LibraryFile>(read_version)
+                        .await
+                        .map_err(map_txfs)?;
+                    let schema = decode_schema_bytes(guard.bytes()).map_err(TCError::internal)?;
+                    schemas.push(schema);
                 }
                 _ => {}
             }
         }
     }
+
     Ok(())
 }
 
-async fn read_dir_entries(
-    dir: &DirLock<LibraryFile>,
-) -> TCResult<Vec<(String, DirEntry<LibraryFile>)>> {
-    let guard = dir.read().await;
-    Ok(guard
-        .iter()
-        .map(|(name, entry)| (name.clone(), entry.clone()))
-        .collect())
-}
+async fn read_file(
+    dir: &LibraryRoot,
+    version: TxnVersionId,
+    name: &str,
+) -> TCResult<Option<Vec<u8>>> {
+    let name = parse_name(name)?;
+    let Some(file) = dir.get_file(version, &name).await.map_err(map_txfs)? else {
+        return Ok(None);
+    };
 
-async fn read_file(dir: &DirLock<LibraryFile>, name: &str) -> TCResult<Option<Vec<u8>>> {
-    let guard = dir.read().await;
-    let file = guard.get_file(name).cloned();
-
-    match file {
-        Some(file) => read_file_from_lock(&file).await,
-        None => Ok(None),
-    }
-}
-
-async fn read_file_from_lock(file: &FileLock<LibraryFile>) -> TCResult<Option<Vec<u8>>> {
-    let guard = file.read::<LibraryFile>().await.map_err(map_io)?;
+    let guard = file.read::<LibraryFile>(version).await.map_err(map_txfs)?;
     Ok(Some(guard.bytes().to_vec()))
 }
 
-async fn write_file(dir: &DirLock<LibraryFile>, name: &str, bytes: Vec<u8>) -> TCResult<()> {
-    let size = bytes.len();
-    let mut guard = dir.write().await;
-    if let Some(file) = guard.get_file(name) {
-        let mut contents = file.write::<LibraryFile>().await.map_err(map_io)?;
+async fn write_file(
+    dir: &LibraryRoot,
+    version: TxnVersionId,
+    name: &str,
+    bytes: Vec<u8>,
+) -> TCResult<()> {
+    let name = parse_name(name)?;
+    if let Some(file) = dir.get_file(version, &name).await.map_err(map_txfs)? {
+        let mut contents = file.write::<LibraryFile>(version).await.map_err(map_txfs)?;
         *contents = LibraryFile::Bytes(bytes);
-        drop(contents);
-        file.sync().await.map_err(map_io)?;
-        Ok(())
-    } else {
-        let file = guard
-            .create_file(name.to_string(), LibraryFile::Bytes(bytes), size)
-            .map_err(map_io)?;
-        file.sync().await.map_err(map_io)
+        return Ok(());
     }
+
+    dir.create_file(version, name, LibraryFile::Bytes(bytes))
+        .await
+        .map_err(map_txfs)?;
+
+    Ok(())
 }
 
-async fn ensure_dir(
-    root: DirLock<LibraryFile>,
-    segments: &[String],
-) -> TCResult<DirLock<LibraryFile>> {
-    let mut current = root;
-    for segment in segments {
-        let next = {
-            let mut guard = current.write().await;
-            if let Some(dir) = guard.get_dir(segment) {
-                dir.clone()
-            } else {
-                guard.create_dir(segment.to_string()).map_err(map_io)?
-            }
-        };
-        current = next;
-    }
-    Ok(current)
+fn parse_name(name: &str) -> TCResult<TxName> {
+    name.parse::<TxName>()
+        .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
 fn library_segments(link: &Link) -> TCResult<Vec<String>> {
@@ -304,6 +527,10 @@ fn map_io(err: io::Error) -> TCError {
 
 fn map_io_str(err: String) -> io::Error {
     io::Error::other(err)
+}
+
+fn map_txfs(err: txfs::Error) -> TCError {
+    TCError::internal(err.to_string())
 }
 
 // Schema payloads are tiny (tens of bytes) and must already be buffered so we can

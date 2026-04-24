@@ -1,5 +1,6 @@
 #[cfg(all(test, feature = "pyo3", feature = "http-server", feature = "wasm"))]
 mod tests {
+    use crate::auth::{TokenContext, TokenVerifier};
     use crate::{Body, Kernel, KernelHandler, Request, Response, StatusCode};
     use crate::resolve::Resolve;
     use base64::Engine as _;
@@ -107,7 +108,8 @@ mod tests {
                     },
                 ) {
                     Ok(crate::KernelDispatch::Response(resp)) => Ok(resp.await),
-                    Ok(crate::KernelDispatch::Finalize { commit: _, result }) => {
+                    Ok(crate::KernelDispatch::Finalize { commit, txn }) => {
+                        let result = kernel.finalize_transaction(txn, commit).await;
                         let status = if result.is_ok() {
                             StatusCode::NO_CONTENT
                         } else {
@@ -167,6 +169,54 @@ mod tests {
         |_req: Request| async move { Response::new(Body::empty()) }.boxed()
     }
 
+    #[derive(Clone, Default)]
+    struct TestBearerVerifier;
+
+    impl TokenVerifier for TestBearerVerifier {
+        fn verify(
+            &self,
+            bearer_token: String,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::auth::TokenContext, crate::txn::TxnError>,
+        > {
+            use std::str::FromStr;
+
+            futures::future::ready({
+                let mut parts = bearer_token.splitn(2, '|');
+                let actor_id = parts.next().unwrap_or_default().trim().to_string();
+                if actor_id.is_empty() {
+                    Err(crate::txn::TxnError::Unauthorized)
+                } else {
+                    let owner_id = format!("/host::{actor_id}");
+                    let txn_id = parts.next().and_then(|part| tc_ir::TxnId::from_str(part).ok());
+                    let mut ctx = TokenContext::new(owner_id, bearer_token);
+                    if let Some(txn_id) = txn_id {
+                        let claim = tc_ir::Claim::new(
+                            Link::from_str(&format!("/txn/{txn_id}")).expect("txn claim link"),
+                            umask::USER_EXEC | umask::USER_WRITE,
+                        );
+                        ctx.claims
+                            .push((crate::uri::HOST_ROOT.to_string(), actor_id, claim));
+                    }
+                    Ok(ctx)
+                }
+            })
+            .boxed()
+        }
+
+        fn grant(
+            &self,
+            token: crate::auth::TokenContext,
+            _claim: tc_ir::Claim,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::auth::TokenContext, crate::txn::TxnError>,
+        > {
+            futures::future::ready(Ok(token)).boxed()
+        }
+    }
+
     fn wasm_module() -> Vec<u8> {
         crate::test_utils::wasm_hello_world_module()
     }
@@ -186,6 +236,7 @@ mod tests {
         let remote_kernel: crate::Kernel = crate::Kernel::builder()
             .with_host_id("tc-remote-test")
             .with_library_module(module, handlers)
+            .with_token_verifier(TestBearerVerifier)
             .with_service_handler(|_req| async move {
                 http::Response::builder()
                     .status(StatusCode::OK)
@@ -223,6 +274,7 @@ mod tests {
             .txn_manager()
             .begin()
             .with_claims(vec![install_claim]);
+        let install_txn_for_commit = install_txn.clone();
         install_request.extensions_mut().insert(install_txn);
 
         let install_response = remote_kernel
@@ -230,6 +282,10 @@ mod tests {
             .expect("install handler")
             .await;
         assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
+        remote_kernel
+            .finalize_transaction(install_txn_for_commit, true)
+            .await
+            .expect("commit install");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
@@ -257,19 +313,18 @@ mod tests {
             .with_library_module(local_module, local_handlers)
             .with_dependency_route(dependency_root, addr)
             .with_http_rpc_gateway()
+            .with_token_verifier(TestBearerVerifier)
             .with_service_handler(ok_py_handler())
             .with_kernel_handler(ok_py_handler())
             .with_health_handler(ok_py_handler())
             .finish();
 
-        let remote_txn = remote_kernel.txn_manager().begin();
-        let owner_id = remote_txn.owner_id().expect("remote txn owner");
-        let bearer = remote_txn.raw_token().expect("remote txn bearer token");
-        let _ = local_kernel.txn_manager().interpret_request(
-            Some(remote_txn.id()),
-            Some(owner_id),
-            Some(bearer),
-        );
+        let owner = "/host::pyo3-test-bearer";
+        let seeded_remote_txn = remote_kernel
+            .txn_manager()
+            .begin_with_owner(Some(owner), Some("pyo3-test-bearer"));
+        let bearer = format!("pyo3-test-bearer|{}", seeded_remote_txn.id());
+        let remote_txn = seeded_remote_txn.with_bearer_token(bearer);
         let txn = local_kernel.with_resolver(remote_txn);
         let op = OpRef::Get((
             tc_ir::Subject::Link(Link::from_str("/lib/example-devco/example/0.1.0/hello").unwrap()),

@@ -3,14 +3,16 @@ use std::sync::Arc;
 use aes_gcm_siv::aead::OsRng;
 use aes_gcm_siv::aead::rand_core::RngCore;
 use futures::FutureExt;
-use hyper::body::to_bytes;
-use hyper::{Body, Request, Response, StatusCode};
+use hyper::{Body, Request, StatusCode};
 
 use crate::KernelHandler;
 use crate::library::{LibraryRegistry, encode_install_payload_bytes};
 use crate::txn::TxnHandle;
 
-use super::crypto::{decode_encrypted_payload, encode_encrypted_payload, encrypt_token_with_key};
+use super::crypto::{encode_encrypted_payload, encrypt_token_with_key};
+use super::http_util::{
+    decode_encrypted_request, empty_response, json_ok, method_not_allowed, text_response,
+};
 use super::{LIBRARY_EXPORT_PATH, ReplicationIssuer, TOKEN_PATH};
 
 pub fn replication_token_handler(issuer: Arc<ReplicationIssuer>) -> impl KernelHandler {
@@ -18,49 +20,21 @@ pub fn replication_token_handler(issuer: Arc<ReplicationIssuer>) -> impl KernelH
         let issuer = issuer.clone();
         async move {
             if req.uri().path() != TOKEN_PATH {
-                return Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::empty())
-                    .expect("not found");
+                return empty_response(StatusCode::NOT_FOUND);
+            }
+            if req.method() != hyper::Method::POST {
+                return method_not_allowed("POST");
             }
 
-            let body_bytes = match to_bytes(req.into_body()).await {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Body::from(err.to_string()))
-                        .expect("bad request");
-                }
-            };
-
-            let (nonce, path_encrypted) = match decode_encrypted_payload(body_bytes) {
-                Ok(tuple) => tuple,
-                Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Body::from(err.to_string()))
-                        .expect("bad request");
-                }
-            };
-
-            let (path, key) = match issuer.decrypt_path_with_key(&nonce, &path_encrypted) {
+            let (path, key) = match decode_encrypted_request(req, &issuer).await {
                 Ok(result) => result,
-                Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(Body::from(err.to_string()))
-                        .expect("bad request");
-                }
+                Err(response) => return response,
             };
 
             let signed = match issuer.issue_token(&path) {
                 Ok(token) => token,
                 Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from(err.to_string()))
-                        .expect("internal error");
+                    return text_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
                 }
             };
 
@@ -71,28 +45,18 @@ pub fn replication_token_handler(issuer: Arc<ReplicationIssuer>) -> impl KernelH
             let encrypted = match encrypt_token_with_key(token, &key, &nonce) {
                 Ok(encrypted) => encrypted,
                 Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from(err.to_string()))
-                        .expect("internal error");
+                    return text_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
                 }
             };
 
             let bytes = match encode_encrypted_payload(&nonce, &encrypted) {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from(err.to_string()))
-                        .expect("internal error");
+                    return text_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
                 }
             };
 
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(hyper::header::CONTENT_TYPE, "application/json")
-                .body(Body::from(bytes))
-                .expect("token response")
+            json_ok(bytes)
         }
         .boxed()
     }
@@ -103,56 +67,28 @@ pub fn export_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
         let registry = Arc::clone(&registry);
         async move {
             if req.uri().path() != LIBRARY_EXPORT_PATH {
-                return Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::empty())
-                    .expect("not found");
+                return empty_response(StatusCode::NOT_FOUND);
             }
 
             let Some(txn) = req.extensions().get::<TxnHandle>() else {
-                return Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .body(Body::from("missing transaction context"))
-                    .expect("unauthorized");
+                return text_response(StatusCode::UNAUTHORIZED, "missing transaction context");
             };
 
             let payload = match registry.export_payload_for_claims(txn).await {
                 Ok(Some(payload)) => payload,
-                Ok(None) => {
-                    return Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(Body::empty())
-                        .expect("not found");
-                }
+                Ok(None) => return empty_response(StatusCode::NOT_FOUND),
                 Err(err) if err.code() == tc_error::ErrorKind::Unauthorized => {
-                    return Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .body(Body::from("unauthorized"))
-                        .expect("unauthorized");
+                    return text_response(StatusCode::UNAUTHORIZED, "unauthorized");
                 }
-                Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from(err.to_string()))
-                        .expect("internal error");
-                }
+                Err(err) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, err),
             };
 
             let bytes = match encode_install_payload_bytes(&payload) {
                 Ok(bytes) => bytes,
-                Err(err) => {
-                    return Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from(err))
-                        .expect("internal error");
-                }
+                Err(err) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, err),
             };
 
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(hyper::header::CONTENT_TYPE, "application/json")
-                .body(Body::from(bytes))
-                .expect("export response")
+            json_ok(bytes)
         }
         .boxed()
     }

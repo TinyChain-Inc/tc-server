@@ -51,6 +51,20 @@ mod tests {
             .finish()
     }
 
+    fn kernel_with_host_auth_context() -> Kernel {
+        Kernel::builder()
+            .with_lib_handler(ok_handler())
+            .with_lib_put_handler(ok_handler())
+            .with_lib_route_handler(ok_handler())
+            .with_service_handler(ok_handler())
+            .with_kernel_handler(super::host_handler_with_public_keys(
+                crate::auth::PublicKeyStore::default(),
+            ))
+            .with_health_handler(ok_handler())
+            .with_token_verifier(TestTokenVerifier)
+            .finish()
+    }
+
     #[derive(Clone)]
     struct TestTokenVerifier;
 
@@ -80,6 +94,17 @@ mod tests {
             }
 
             futures::future::ready(Ok(ctx)).boxed()
+        }
+
+        fn grant(
+            &self,
+            token: crate::auth::TokenContext,
+            _claim: tc_ir::Claim,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::auth::TokenContext, crate::txn::TxnError>,
+        > {
+            futures::future::ready(Ok(token)).boxed()
         }
     }
 
@@ -132,7 +157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_bearer_token_for_anonymous_txn() {
+    async fn does_not_return_bearer_token_for_anonymous_txn() {
         let kernel: Kernel = Kernel::builder()
             .with_lib_handler(ok_handler())
             .with_lib_put_handler(ok_handler())
@@ -158,11 +183,7 @@ mod tests {
             .get("x-tc-txn-id")
             .and_then(|value| value.to_str().ok())
             .expect("missing x-tc-txn-id header");
-        let bearer = response
-            .headers()
-            .get("x-tc-bearer-token")
-            .and_then(|value| value.to_str().ok())
-            .expect("missing x-tc-bearer-token header");
+        assert!(response.headers().get("x-tc-bearer-token").is_none());
 
         let commit = http::Request::builder()
             .method("POST")
@@ -172,16 +193,6 @@ mod tests {
 
         let commit_response = service.call(commit).await.expect("commit response");
         assert_eq!(commit_response.status(), StatusCode::UNAUTHORIZED);
-
-        let commit = http::Request::builder()
-            .method("POST")
-            .uri(format!("/lib?txn_id={txn_id}"))
-            .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
-            .body(Body::empty())
-            .expect("commit request with bearer");
-
-        let commit_response = service.call(commit).await.expect("commit response");
-        assert_eq!(commit_response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -213,6 +224,32 @@ mod tests {
 
         let continue_resp = service.call(continue_req).await.expect("continue response");
         assert_eq!(continue_resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn returns_authenticated_route_context_from_host_endpoint() {
+        let kernel = kernel_with_host_auth_context();
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/host/auth/context")
+            .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
+            .body(Body::empty())
+            .expect("context request");
+
+        let response = service.call(request).await.expect("context response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body())
+            .await
+            .expect("context body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("context json");
+        assert_eq!(payload["principal"], serde_json::Value::String("/host::owner-a".to_string()));
+        assert!(payload["txn_id"].is_string());
+        assert!(payload["txn_timestamp_nanos"].is_u64());
+        assert!(payload["token_verified_at_nanos"].is_u64());
+        assert!(payload["claims"].is_array());
     }
 
     #[tokio::test]
@@ -382,6 +419,7 @@ mod tests {
         let remote_kernel: Kernel = Kernel::builder()
             .with_host_id("tc-wasm-test")
             .with_library_module(module, handlers)
+            .with_token_verifier(TestTokenVerifier)
             .with_service_handler(ok_handler())
             .with_kernel_handler(ok_handler())
             .with_health_handler(ok_handler())
@@ -414,13 +452,17 @@ mod tests {
             .txn_manager()
             .begin()
             .with_claims(vec![install_claim]);
-        install_request.extensions_mut().insert(install_txn);
+        install_request.extensions_mut().insert(install_txn.clone());
 
         let install_response = remote_kernel
             .dispatch(Method::Put, "/lib", install_request)
             .expect("install handler")
             .await;
         assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
+        remote_kernel
+            .finalize_transaction(install_txn, true)
+            .await
+            .expect("commit install");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
@@ -450,9 +492,14 @@ mod tests {
             .with_library_module(module, handlers)
             .with_dependency_route("/lib/example-devco/example/0.1.0", addr)
             .with_http_rpc_gateway()
+            .with_token_verifier(TestTokenVerifier)
             .finish();
 
-        let txn = local_kernel.with_resolver(remote_kernel.txn_manager().begin());
+        let seeded = local_kernel
+            .txn_manager()
+            .begin_with_owner(Some("owner-a"), Some("owner-a"));
+        let tokenized = seeded.with_bearer_token(format!("owner-a|{}", seeded.id()));
+        let txn = local_kernel.with_resolver(tokenized);
 
         let link = Link::from_str("/lib/example-devco/example/0.1.0/hello").expect("op link");
         let op = OpRef::Get((

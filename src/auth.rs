@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tc_ir::Claim;
 
 use crate::txn::TxnError;
@@ -7,18 +8,16 @@ use futures::future::{BoxFuture, FutureExt};
 /// A kernel-owned verifier which maps an `Authorization: Bearer ...` token to a stable owner
 /// identity used to pin transaction ownership.
 ///
-/// Today this verifier treats bearer tokens as opaque, so the owner identity is the token itself.
-/// The trait exists so the kernel can evolve to verify and decode signed tokens without pushing
-/// transaction semantics into protocol adapters.
+/// The trait keeps transaction semantics in the kernel so protocol adapters can remain thin.
 pub trait TokenVerifier: Send + Sync + 'static {
     fn verify(&self, bearer_token: String) -> BoxFuture<'static, Result<TokenContext, TxnError>>;
 
     fn grant(
         &self,
-        token: TokenContext,
+        _token: TokenContext,
         _claim: Claim,
     ) -> BoxFuture<'static, Result<TokenContext, TxnError>> {
-        futures::future::ready(Ok(token)).boxed()
+        futures::future::ready(Err(TxnError::Unauthorized)).boxed()
     }
 }
 
@@ -27,14 +26,20 @@ pub struct TokenContext {
     pub owner_id: String,
     pub bearer_token: String,
     pub claims: Vec<(String, String, Claim)>,
+    pub verified_at_nanos: u64,
 }
 
 impl TokenContext {
     pub fn new(owner_id: impl Into<String>, bearer_token: impl Into<String>) -> Self {
+        let verified_at_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         Self {
             owner_id: owner_id.into(),
             bearer_token: bearer_token.into(),
             claims: Vec::new(),
+            verified_at_nanos,
         }
     }
 
@@ -62,24 +67,16 @@ where
 }
 
 #[derive(Clone, Default)]
-pub struct OpaqueBearerTokenVerifier;
+pub struct RejectBearerTokenVerifier;
 
-impl TokenVerifier for OpaqueBearerTokenVerifier {
-    fn verify(&self, bearer_token: String) -> BoxFuture<'static, Result<TokenContext, TxnError>> {
-        futures::future::ready({
-            let token = bearer_token.trim();
-            if token.is_empty() {
-                Err(TxnError::Unauthorized)
-            } else {
-                Ok(TokenContext::new(token, token))
-            }
-        })
-        .boxed()
+impl TokenVerifier for RejectBearerTokenVerifier {
+    fn verify(&self, _bearer_token: String) -> BoxFuture<'static, Result<TokenContext, TxnError>> {
+        futures::future::ready(Err(TxnError::Unauthorized)).boxed()
     }
 }
 
 pub(crate) fn default_token_verifier() -> Arc<dyn TokenVerifier> {
-    Arc::new(OpaqueBearerTokenVerifier)
+    Arc::new(RejectBearerTokenVerifier)
 }
 
 mod rjwt_token {
@@ -265,6 +262,26 @@ mod rjwt_token {
 
                 Ok(ctx)
             }
+            .boxed()
+        }
+
+        fn grant(
+            &self,
+            token: TokenContext,
+            claim: Claim,
+        ) -> futures::future::BoxFuture<'static, Result<TokenContext, TxnError>> {
+            let required_link = claim.link.clone();
+            let required_mode = claim.mask;
+            let allowed = token
+                .claims
+                .iter()
+                .any(|(_, _, existing)| existing.allows(&required_link, required_mode));
+
+            futures::future::ready(if allowed {
+                Ok(token)
+            } else {
+                Err(TxnError::Unauthorized)
+            })
             .boxed()
         }
     }

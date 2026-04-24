@@ -5,7 +5,7 @@ use crate::egress::EgressPolicy;
 use crate::library::{LibraryHandlers, LibraryRegistry};
 use crate::txn_server::TxnServer;
 
-use super::{Kernel, KernelHandler};
+use super::{Kernel, KernelHandler, TxnFinalizeHook};
 
 pub struct KernelBuilder {
     lib_get_handler: Option<Arc<dyn KernelHandler>>,
@@ -20,7 +20,7 @@ pub struct KernelBuilder {
     library_module: Option<Arc<LibraryRegistry>>,
     rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
-    kernel_actor: Option<(pathlink::Link, crate::auth::Actor)>,
+    txn_finalize_hook: Option<TxnFinalizeHook>,
 }
 
 impl Default for KernelBuilder {
@@ -38,7 +38,7 @@ impl Default for KernelBuilder {
             library_module: None,
             rpc_gateway: None,
             token_verifier: crate::auth::default_token_verifier(),
-            kernel_actor: None,
+            txn_finalize_hook: None,
         }
     }
 }
@@ -150,8 +150,12 @@ impl KernelBuilder {
         self
     }
 
-    pub fn with_kernel_actor(mut self, host: pathlink::Link, actor: crate::auth::Actor) -> Self {
-        self.kernel_actor = Some((host, actor));
+    pub fn with_txn_finalize_hook<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(crate::txn::TxnHandle, bool) -> Fut + Send + Sync + 'static,
+        Fut: futures::Future<Output = tc_error::TCResult<()>> + Send + 'static,
+    {
+        self.txn_finalize_hook = Some(Arc::new(move |txn, commit| Box::pin(hook(txn, commit))));
         self
     }
 
@@ -198,7 +202,7 @@ impl KernelBuilder {
             library_module: self.library_module,
             rpc_gateway: self.rpc_gateway,
             token_verifier: self.token_verifier,
-            kernel_actor: self.kernel_actor,
+            txn_finalize_hook: self.txn_finalize_hook,
         }
     }
 }
