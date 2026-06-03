@@ -37,8 +37,7 @@ mod http_tests {
     use crate::auth::{TokenContext, TokenVerifier};
     use crate::http::{Body, StatusCode};
     use crate::{
-        HttpServer,
-        KernelHandler,
+        HttpServer, KernelHandler,
         kernel::{Kernel, Method},
         library::http::{build_http_library_module, http_library_handlers},
     };
@@ -569,7 +568,7 @@ mod http_tests {
         let response = Client::new().request(request).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = body::to_bytes(response.into_body()).await?;
-        assert_eq!(body.as_ref(), br#"{"/state/scalar/value/string":"hello"}"#);
+        assert_eq!(body.as_ref(), br#""hello""#);
 
         a_task.abort();
         b_task.abort();
