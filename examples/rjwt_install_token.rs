@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: rjwt_install_token --host <http://host:port> --actor <id> --lib <path> [--lib <path> ...] [--txn-id <id>] [--secret-key-b64 <b64>] [--ttl-secs <n>]\n\
+        "Usage: rjwt_install_token --host <http(s)://host[:port]> --actor <id> --lib <path> [--lib <path> ...] [--txn-id <id>] [--secret-key-b64 <b64>] [--ttl-secs <n>]\n\
          Example:\n\
           cargo run --example rjwt_install_token -- \\\n\
              --host http://127.0.0.1:8702 --actor example-admin \\\n\

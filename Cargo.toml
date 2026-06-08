@@ -9,9 +9,9 @@ name = "tinychain"
 [dependencies]
 bytes = "1"
 futures = "0.3"
-pathlink = { version = "0.4", features = ["serialize"] }
+pathlink = { path = "../deps/pathlink", features = ["serialize"] }
 tc-ir = { path = "../tc-ir" }
-tc-error = "0.13"
+tc-error = { path = "../tc-error" }
 tc-value = { path = "../tc-value", features = ["serialize"] }
 tc-state = { path = "../tc-state" }
 umask = "2.1"
