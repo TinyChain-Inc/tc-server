@@ -543,7 +543,8 @@ fn decode_peer_cluster_listing(body_bytes: &[u8]) -> TCResult<PeerClusterListing
         let peer = normalize_peer(&identity.peer)?;
         peers.insert(peer.clone());
         if let (Some(actor_id), Some(public_key_b64)) = (identity.actor_id, identity.public_key_b64)
-            && !actor_id.trim().is_empty() && !public_key_b64.trim().is_empty()
+            && !actor_id.trim().is_empty()
+            && !public_key_b64.trim().is_empty()
         {
             identities.insert(
                 peer.clone(),
@@ -595,20 +596,9 @@ async fn decode_state_body(body: hyper::body::Bytes) -> TCResult<State> {
     }
 
     let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(body.clone())]);
-    match destream_json::try_decode(null_transaction(), stream).await {
-        Ok(state) => Ok(state),
-        Err(_) => {
-            let text = String::from_utf8(body.to_vec())
-                .map_err(|err| TCError::bad_request(err.to_string()))?;
-            let wrapped = format!(r#"{{"/state/scalar/map":{text}}}"#);
-            let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(
-                wrapped.into_bytes().into(),
-            )]);
-            destream_json::try_decode(null_transaction(), stream)
-                .await
-                .map_err(|err| TCError::bad_request(err.to_string()))
-        }
-    }
+    destream_json::try_decode(null_transaction(), stream)
+        .await
+        .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
 fn schema_from_state(state: State) -> TCResult<tc_ir::LibrarySchema> {
@@ -656,22 +646,9 @@ fn schema_from_state(state: State) -> TCResult<tc_ir::LibrarySchema> {
 
 fn listing_from_state(state: State) -> TCResult<tc_ir::Map<bool>> {
     let map = unwrap_map_state(state)?;
-    let listing_map = if map.len() == 1 {
-        if let Some((name, value)) = map.iter().next() {
-            if name.as_str() == "/state/scalar/map" {
-                unwrap_map_state(value.clone())?
-            } else {
-                map
-            }
-        } else {
-            map
-        }
-    } else {
-        map
-    };
 
     let mut listing = tc_ir::Map::new();
-    for (name, value) in listing_map {
+    for (name, value) in map {
         if name.as_str() == "default" {
             continue;
         }
@@ -711,7 +688,7 @@ fn parse_listing_bool(value: State) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{listing_from_state, parse_listing_bool};
+    use super::parse_listing_bool;
     use futures::stream;
     use number_general::Number;
     use tc_state::State;
@@ -728,31 +705,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_wrapped_listing_bool() {
+    fn parse_listing_bool_accepts_state_bool_values() {
         let value = decode_state(r#"{"/state/scalar/value/number":true}"#);
         assert_eq!(parse_listing_bool(value), Some(true));
         assert_eq!(
             parse_listing_bool(State::from(Number::from(true))),
             Some(true)
-        );
-    }
-
-    #[test]
-    fn listing_ignores_typed_empty_map_default() {
-        let listing_state = decode_state(
-            r#"{
-                "/state/scalar/map": {
-                    "default": {
-                        "/state/scalar/value/number": false
-                    }
-                }
-            }"#,
-        );
-
-        let listing = listing_from_state(listing_state).expect("decode listing");
-        assert!(
-            listing.is_empty(),
-            "empty typed listing should decode empty"
         );
     }
 }

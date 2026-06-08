@@ -344,40 +344,6 @@ impl KernelHandle {
     }
 
     #[classmethod]
-    #[pyo3(signature = (dependency_root, authority, token_host=None, actor_id=None, public_key_b64=None, data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn local_with_dependency_route(
-        _cls: &Bound<'_, PyType>,
-        dependency_root: &str,
-        authority: &str,
-        token_host: Option<&str>,
-        actor_id: Option<&str>,
-        public_key_b64: Option<&str>,
-        data_dir: Option<PathBuf>,
-        request_ttl_secs: Option<u64>,
-        max_request_bytes_unauth: Option<usize>,
-    ) -> PyResult<Self> {
-        let config = apply_config_overrides(
-            PyKernelConfig {
-                data_dir,
-                ..PyKernelConfig::default()
-            },
-            request_ttl_secs,
-            max_request_bytes_unauth,
-        );
-
-        let kernel = local_kernel_with_dependency_routes(
-            vec![(dependency_root.to_string(), authority.to_string())],
-            config.clone(),
-            token_host,
-            actor_id,
-            public_key_b64,
-        )?;
-
-        Ok(Self::from_kernel(kernel, config))
-    }
-
-    #[classmethod]
     #[pyo3(signature = (dependency_routes, token_host=None, actor_id=None, public_key_b64=None, data_dir=None, request_ttl_secs=None, max_request_bytes_unauth=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn local_with_dependency_routes(
@@ -465,9 +431,11 @@ impl KernelHandle {
 
         let schema = decode_schema_from_json(schema_json)?;
         let storage_root = data_dir.clone();
-        let module =
-            block_on_tokio(http_library::build_http_library_module(schema, storage_root))
-                .expect("module");
+        let module = block_on_tokio(http_library::build_http_library_module(
+            schema,
+            storage_root,
+        ))
+        .expect("module");
         block_on_tokio(module.hydrate_from_storage()).expect("library hydrate");
         let handlers = http_library::http_library_handlers(&module);
         let host =

@@ -119,13 +119,13 @@ async fn cluster_membership_list_requires_post_and_cluster_root_path() {
     let wrong_method_resp = peers_handler.call(wrong_method).await;
     assert_eq!(wrong_method_resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 
-    let legacy = Request::builder()
+    let wrong_path = Request::builder()
         .method(hyper::Method::POST)
         .uri("/host/peers")
         .body(Body::empty())
         .expect("request");
-    let legacy_resp = peers_handler.call(legacy).await;
-    assert_eq!(legacy_resp.status(), StatusCode::NOT_FOUND);
+    let wrong_path_resp = peers_handler.call(wrong_path).await;
+    assert_eq!(wrong_path_resp.status(), StatusCode::NOT_FOUND);
 
     let payload = serde_json::json!({
         "peer": "http://10.0.0.2:8702"

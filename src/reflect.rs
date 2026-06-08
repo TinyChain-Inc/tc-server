@@ -1,9 +1,8 @@
-use std::io;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::{FutureExt, TryStreamExt, stream};
+use futures::{FutureExt, stream};
 
 use crate::{Body, KernelHandler, Request, Response, StatusCode, header};
 use pathlink::Link;
@@ -304,16 +303,7 @@ async fn opdef_scalars(req: Request) -> Response {
 }
 
 fn state_response(state: State) -> Response {
-    match destream_json::encode(state) {
-        Ok(stream) => http::Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::wrap_stream(
-                stream.map_err(|err| io::Error::other(err.to_string())),
-            ))
-            .expect("state response"),
-        Err(err) => internal_error_response(&err.to_string()),
-    }
+    crate::http::state_response(state)
 }
 
 fn not_found() -> Response {
