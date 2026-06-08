@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, io, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
-use crate::http::{Body, Request, Response, StatusCode, header};
-use futures::{FutureExt, TryStreamExt};
+use crate::http::{Body, Request, Response, StatusCode};
+use futures::FutureExt;
 use hyper::body;
 use number_general::Number;
 use tc_error::TCResult;
@@ -106,17 +106,7 @@ pub fn schema_put_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler 
 
 fn respond_with_schema(schema: LibrarySchema) -> Response {
     let state = schema_to_state(&schema);
-    match destream_json::encode(state) {
-        Ok(stream) => {
-            let body = Body::wrap_stream(stream.map_err(|err| io::Error::other(err.to_string())));
-            http::Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .expect("library schema response")
-        }
-        Err(err) => internal_error(err.to_string()),
-    }
+    crate::http::state_response(state)
 }
 
 fn respond_with_listing(listing: Option<tc_ir::Map<bool>>) -> Response {
@@ -128,17 +118,7 @@ fn respond_with_listing(listing: Option<tc_ir::Map<bool>>) -> Response {
     };
 
     let state = listing_to_state(&listing);
-    match destream_json::encode(state) {
-        Ok(stream) => {
-            let body = Body::wrap_stream(stream.map_err(|err| io::Error::other(err.to_string())));
-            http::Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .expect("dir listing response")
-        }
-        Err(err) => internal_error(err.to_string()),
-    }
+    crate::http::state_response(state)
 }
 
 fn schema_to_state(schema: &LibrarySchema) -> State {
@@ -181,13 +161,6 @@ fn listing_to_state(listing: &tc_ir::Map<bool>) -> State {
         })
         .collect::<Map<State>>();
     State::Map(map)
-}
-
-fn internal_error(message: String) -> Response {
-    http::Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(Body::from(message))
-        .expect("internal error response")
 }
 
 fn unauthorized_response(message: impl Into<String>) -> Response {
@@ -248,22 +221,10 @@ mod tests {
     use tc_state::{State, null_transaction};
 
     async fn decode_state(bytes: Vec<u8>) -> State {
-        let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(
-            bytes.clone().into(),
-        )]);
-        match destream_json::try_decode(null_transaction(), stream).await {
-            Ok(state) => state,
-            Err(_) => {
-                let text = String::from_utf8(bytes).expect("utf8");
-                let wrapped = format!(r#"{{"/state/scalar/map":{text}}}"#);
-                let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(
-                    wrapped.into_bytes().into(),
-                )]);
-                destream_json::try_decode(null_transaction(), stream)
-                    .await
-                    .expect("state decode")
-            }
-        }
+        let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(bytes.into())]);
+        destream_json::try_decode(null_transaction(), stream)
+            .await
+            .expect("state decode")
     }
 
     #[test]

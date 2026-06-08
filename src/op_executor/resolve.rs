@@ -342,10 +342,6 @@ fn resolve_opref(
                         let left_state = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                             TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
                         })?;
-                        let mut left = tuple_state_to_items(left_state, "concat")?
-                            .into_iter()
-                            .map(state_to_scalar)
-                            .collect::<TCResult<Vec<_>>>()?;
 
                         let r_id: Id = "r".parse().expect("Id");
                         let Some(r_value) = params.get(&r_id) else {
@@ -356,12 +352,50 @@ fn resolve_opref(
                         let right_state =
                             resolve_scalar(r_value.clone(), &values, &txn, self_link.as_ref())
                                 .await?;
+
+                        if let Some(left) = string_state_value(&left_state) {
+                            let Some(right) = string_state_value(&right_state) else {
+                                return Err(TCError::bad_request(format!(
+                                    "expected string concat parameter r but found {right_state:?}"
+                                )));
+                            };
+                            let mut out = left.to_string();
+                            out.push_str(right);
+                            return Ok(State::Scalar(Scalar::Value(Value::String(out))));
+                        }
+
+                        let mut left = tuple_state_to_items(left_state, "concat")?
+                            .into_iter()
+                            .map(state_to_scalar)
+                            .collect::<TCResult<Vec<_>>>()?;
                         let mut right = tuple_state_to_items(right_state, "concat")?
                             .into_iter()
                             .map(state_to_scalar)
                             .collect::<TCResult<Vec<_>>>()?;
                         left.append(&mut right);
                         Ok(State::Scalar(Scalar::Tuple(left)))
+                    } else if segments.len() == 1 && segments[0].as_str() == "render" {
+                        let template = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
+                            TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
+                        })?;
+                        let Some(template) = string_state_value(&template) else {
+                            return Err(TCError::bad_request(
+                                "expected render subject to be a string".to_string(),
+                            ));
+                        };
+
+                        let mut rendered = template.to_string();
+                        for (key, value) in params {
+                            let value =
+                                scalar_to_value(value, &values, &txn, self_link.as_ref()).await?;
+                            let replacement = value_to_render_string(value)?;
+                            rendered = rendered.replace(
+                                &format!("{{{{{}}}}}", key.as_str()),
+                                replacement.as_str(),
+                            );
+                        }
+
+                        Ok(State::Scalar(Scalar::Value(Value::String(rendered))))
                     } else if segments.len() == 1 && segments[0].as_str() == "get" {
                         let state = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                             TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
@@ -761,6 +795,24 @@ fn tuple_state_to_items(state: State, context: &str) -> TCResult<Vec<State>> {
         other => Err(TCError::bad_request(format!(
             "expected tuple or map for {context} but found {other:?}"
         ))),
+    }
+}
+
+fn string_state_value(state: &State) -> Option<&str> {
+    match state {
+        State::Scalar(Scalar::Value(Value::String(value))) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn value_to_render_string(value: Value) -> TCResult<String> {
+    match value {
+        Value::String(value) => Ok(value),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::Link(value) => Ok(value.to_string()),
+        Value::None => Err(TCError::bad_request(
+            "cannot render None as a string parameter".to_string(),
+        )),
     }
 }
 

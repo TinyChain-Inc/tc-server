@@ -27,8 +27,8 @@ pub fn http_ir_route_handler_from_bytes(
     };
     use crate::resolve::Resolve;
     use bytes::Bytes;
-    use futures::{FutureExt, TryStreamExt};
-    use std::{collections::HashMap, io};
+    use futures::FutureExt;
+    use std::collections::HashMap;
     use tc_ir::{Map, OpDef, OpRef, Scalar, Subject, parse_route_path};
     use tc_state::State;
     use tc_value::Value;
@@ -110,19 +110,7 @@ pub fn http_ir_route_handler_from_bytes(
     let schema_link = schema.id().clone();
 
     fn state_response(state: tc_state::State) -> Response {
-        match destream_json::encode(state) {
-            Ok(stream) => http::Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::wrap_stream(
-                    stream.map_err(|err| io::Error::other(err.to_string())),
-                ))
-                .unwrap(),
-            Err(err) => http::Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(err.to_string()))
-                .expect("error response"),
-        }
+        crate::http::state_response(state)
     }
 
     let handler = move |req: Request| {

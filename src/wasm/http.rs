@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tc_error::{ErrorKind, TCError, TCResult};
 use tc_ir::{LibrarySchema, TxnHeader, parse_route_path};
 use tokio::sync::Mutex;
@@ -136,11 +137,11 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request) -> Respo
                 }
             }
 
-            hyper::Response::builder()
-                .status(StatusCode::OK)
-                .header(crate::http::header::CONTENT_TYPE, "application/json")
-                .body(Body::from(bytes))
-                .unwrap()
+            let txn_context: Arc<dyn tc_ir::Transaction> = Arc::new(txn);
+            match crate::http::decode_state_bytes(Bytes::from(bytes), txn_context).await {
+                Ok(state) => crate::http::state_response(state),
+                Err(err) => error_response(err),
+            }
         }
         Err(err) => error_response(err),
     }
@@ -185,16 +186,5 @@ fn error_response(err: TCError) -> Response {
 }
 
 fn state_response(state: tc_state::State) -> Response {
-    use futures::TryStreamExt;
-
-    match destream_json::encode(state) {
-        Ok(stream) => hyper::Response::builder()
-            .status(StatusCode::OK)
-            .header(crate::http::header::CONTENT_TYPE, "application/json")
-            .body(Body::wrap_stream(
-                stream.map_err(|err| std::io::Error::other(err.to_string())),
-            ))
-            .unwrap(),
-        Err(err) => error_response(TCError::internal(err.to_string())),
-    }
+    crate::http::state_response(state)
 }
