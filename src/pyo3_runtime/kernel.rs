@@ -480,23 +480,23 @@ impl KernelHandle {
                 if inbound_txn_id.is_none()
                     && route_path == crate::uri::LIB_ROOT
                     && matches!(method, Method::Put)
-                    && let Some(txn) = minted_txn
                 {
-                    auto_finalized = true;
-                    let commit = response.status() < 400;
-                    let result = self.block_on(self.inner.finalize_transaction(txn, commit));
-                    if result.is_err() {
-                        return Ok(PyKernelResponse::new(400, None, None));
+                    if let Some(txn) = minted_txn {
+                        auto_finalized = true;
+                        let commit = response.status() < 400;
+                        let result = self.block_on(self.inner.finalize_transaction(txn, commit));
+                        if result.is_err() {
+                            return Ok(PyKernelResponse::new(400, None, None));
+                        }
                     }
                 }
 
-                if !auto_finalized
-                    && inbound_txn_id.is_none()
-                    && let Some(txn_id) = minted_txn_id
-                {
-                    response
-                        .headers
-                        .push(("x-tc-txn-id".to_string(), txn_id.to_string()));
+                if !auto_finalized && inbound_txn_id.is_none() {
+                    if let Some(txn_id) = minted_txn_id {
+                        response
+                            .headers
+                            .push(("x-tc-txn-id".to_string(), txn_id.to_string()));
+                    }
                 }
                 Ok(response)
             }
