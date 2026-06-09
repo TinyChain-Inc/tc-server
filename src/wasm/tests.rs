@@ -38,10 +38,12 @@ mod http_tests {
     use crate::http::{Body, StatusCode};
     use crate::{
         HttpServer, KernelHandler,
+        ir::WASM_ARTIFACT_CONTENT_TYPE,
         kernel::{Kernel, Method},
+        library::CompiledLibraryPackage,
         library::http::{build_http_library_module, http_library_handlers},
+        storage::Artifact,
     };
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use futures::FutureExt;
     use hyper::{Client, body};
     use pathlink::Link;
@@ -103,6 +105,24 @@ mod http_tests {
         }
     }
 
+    async fn install_compiled_wasm(kernel: &Kernel, schema: LibrarySchema, bytes: Vec<u8>) {
+        let package = CompiledLibraryPackage {
+            schema,
+            artifacts: vec![Artifact {
+                path: "/lib/wasm".to_string(),
+                content_type: WASM_ARTIFACT_CONTENT_TYPE.to_string(),
+                bytes,
+            }],
+        };
+
+        kernel
+            .library_registry()
+            .expect("library registry")
+            .install_compiled_package(package)
+            .await
+            .expect("install compiled package");
+    }
+
     #[tokio::test]
     async fn kernel_dispatches_wasm_route() {
         let bytes = super::tests::wasm_module();
@@ -121,45 +141,16 @@ mod http_tests {
             .with_health_handler(|_req| async { Response::new(Body::empty()) })
             .finish();
 
-        let install_payload = serde_json::json!({
-            "schema": {
-                "id": "/lib/example-devco/example/0.1.0",
-                "version": "0.1.0",
-                "dependencies": []
-            },
-            "artifacts": [{
-                "path": "/lib/wasm",
-                "content_type": "application/wasm",
-                "bytes": BASE64.encode(&bytes),
-            }]
-        });
-
-        let install_claim = Claim::new(
+        let schema = LibrarySchema::new(
             Link::from_str("/lib/example-devco/example/0.1.0").expect("install link"),
-            umask::USER_WRITE,
+            "0.1.0",
+            vec![],
         );
+        install_compiled_wasm(&kernel, schema.clone(), bytes).await;
         let txn = kernel
             .txn_manager()
             .begin()
-            .with_claims(vec![install_claim]);
-
-        let mut install_request = ::http::Request::builder()
-            .method("PUT")
-            .uri("/lib")
-            .header(crate::http::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(install_payload.to_string()))
-            .expect("install request");
-        install_request.extensions_mut().insert(txn.clone());
-
-        let install_response = kernel
-            .dispatch(Method::Put, "/lib", install_request)
-            .expect("install handler")
-            .await;
-        assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
-        kernel
-            .finalize_transaction(txn.clone(), true)
-            .await
-            .expect("commit install");
+            .with_claims(vec![Claim::new(schema.id().clone(), umask::USER_WRITE)]);
 
         let mut request = ::http::Request::builder()
             .method("GET")
@@ -411,42 +402,8 @@ mod http_tests {
 
         let b_schema = tc_ir::LibrarySchema::new(Link::from_str(b_root)?, "0.1.0", vec![]);
         let wasm_b =
-            wasm_static_response_module(b_schema, b_route, "hello", br#""hello""#.to_vec());
-
-        let install_payload_b = serde_json::json!({
-            "schema": {
-                "id": b_root,
-                "version": "0.1.0",
-                "dependencies": [],
-            },
-            "artifacts": [{
-                "path": "/lib/wasm",
-                "content_type": "application/wasm",
-                "bytes": BASE64.encode(&wasm_b),
-            }]
-        });
-
-        let mut install_request_b = ::http::Request::builder()
-            .method("PUT")
-            .uri("/lib")
-            .header(crate::http::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(install_payload_b.to_string()))?;
-        let install_claim_b = Claim::new(Link::from_str(b_root)?, umask::USER_WRITE);
-        let install_txn_b = b_kernel
-            .txn_manager()
-            .begin()
-            .with_claims(vec![install_claim_b]);
-        install_request_b
-            .extensions_mut()
-            .insert(install_txn_b.clone());
-
-        let install_response_b = b_kernel
-            .dispatch(Method::Put, "/lib", install_request_b)
-            .ok_or("missing install handler for /lib")?
-            .await;
-
-        assert_eq!(install_response_b.status(), StatusCode::NO_CONTENT);
-        b_kernel.finalize_transaction(install_txn_b, true).await?;
+            wasm_static_response_module(b_schema.clone(), b_route, "hello", br#""hello""#.to_vec());
+        install_compiled_wasm(&b_kernel, b_schema, wasm_b).await;
 
         let b_listener = TcpListener::bind("127.0.0.1:0")?;
         let b_addr = b_listener.local_addr()?;
@@ -491,46 +448,12 @@ mod http_tests {
             serde_json::Value::Object(map)
         };
         let wasm_a = wasm_static_response_module(
-            a_schema,
+            a_schema.clone(),
             a_route,
             "from_b",
             wasm_response.to_string().into_bytes(),
         );
-
-        let install_payload_a = serde_json::json!({
-            "schema": {
-                "id": a_root,
-                "version": "0.1.0",
-                "dependencies": [b_root],
-            },
-            "artifacts": [{
-                "path": "/lib/wasm",
-                "content_type": "application/wasm",
-                "bytes": BASE64.encode(&wasm_a),
-            }]
-        });
-
-        let mut install_request_a = ::http::Request::builder()
-            .method("PUT")
-            .uri("/lib")
-            .header(crate::http::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(install_payload_a.to_string()))?;
-        let install_claim_a = Claim::new(Link::from_str(a_root)?, umask::USER_WRITE);
-        let install_txn_a = a_kernel
-            .txn_manager()
-            .begin()
-            .with_claims(vec![install_claim_a]);
-        install_request_a
-            .extensions_mut()
-            .insert(install_txn_a.clone());
-
-        let install_response_a = a_kernel
-            .dispatch(Method::Put, "/lib", install_request_a)
-            .ok_or("missing install handler for /lib")?
-            .await;
-
-        assert_eq!(install_response_a.status(), StatusCode::NO_CONTENT);
-        a_kernel.finalize_transaction(install_txn_a, true).await?;
+        install_compiled_wasm(&a_kernel, a_schema, wasm_a).await;
 
         let a_listener = TcpListener::bind("127.0.0.1:0")?;
         let a_addr = a_listener.local_addr()?;

@@ -37,9 +37,9 @@ const TOKEN_PATH: &str = "/";
 const REPLICATION_TTL: Duration = Duration::from_secs(30);
 
 pub use client::{
-    PeerClusterListing, discover_library_paths, fetch_library_export, fetch_library_listing,
-    fetch_library_schema, heartbeat_peer, leave_peer_cluster, list_peer_cluster, normalize_peer,
-    register_with_peer, request_replication_token,
+    PeerClusterListing, discover_library_paths, fetch_compiled_library_package,
+    fetch_library_listing, fetch_library_schema, heartbeat_peer, leave_peer_cluster,
+    list_peer_cluster, normalize_peer, register_with_peer, request_replication_token,
 };
 pub use handler::{export_handler, replication_token_handler};
 pub use issuer::{ReplicationIssuer, parse_psk_keys, parse_psk_list};
@@ -154,9 +154,9 @@ pub async fn replicate_from_peers(
                 }
             };
 
-            match fetch_library_export(peer, &token).await {
+            match fetch_compiled_library_package(peer, &token).await {
                 Ok(Some(payload)) => {
-                    if let Err(err) = registry.install_payload(payload).await {
+                    if let Err(err) = registry.install_compiled_package(payload).await {
                         eprintln!("replication from {peer} failed: {}", err.message());
                     } else {
                         eprintln!("replicated library {path} from {peer}");
@@ -282,7 +282,7 @@ pub async fn forward_install_to_peers(
     membership: &PeerMembership,
     txn: &crate::txn::TxnHandle,
     schema_path: &str,
-    install_payload: Vec<u8>,
+    install_compiled_package: Vec<u8>,
     keys: &[Key<Aes256GcmSiv>],
 ) -> TCResult<()> {
     let token = txn
@@ -293,7 +293,7 @@ pub async fn forward_install_to_peers(
 
     fanout_peers(membership, "install payload", |peer| {
         let token = token.clone();
-        let payload = install_payload.clone();
+        let payload = install_compiled_package.clone();
         async move {
             request_replication_token(&peer, schema_path, keys)
                 .await
@@ -303,7 +303,7 @@ pub async fn forward_install_to_peers(
                     ))
                 })?;
 
-            client::push_install_payload(&peer, &token, txn_id, payload).await
+            client::push_install_compiled_package(&peer, &token, txn_id, payload).await
         }
     })
     .await

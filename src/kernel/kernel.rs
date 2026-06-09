@@ -93,6 +93,10 @@ impl Kernel {
         &self.token_verifier
     }
 
+    pub fn library_registry(&self) -> Option<&Arc<LibraryRegistry>> {
+        self.library_module.as_ref()
+    }
+
     pub fn with_resolver(&self, handle: crate::txn::TxnHandle) -> crate::txn::TxnHandle {
         handle.with_resolver(self.build_txn_resolver())
     }

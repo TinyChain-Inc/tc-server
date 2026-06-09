@@ -17,8 +17,8 @@ mod state;
 mod util;
 
 pub use install::{
-    InstallArtifacts, InstallError, InstallRequest, decode_install_request_bytes,
-    encode_install_payload_bytes,
+    CompiledLibraryPackage, InstallError, decode_compiled_library_package,
+    decode_install_request_bytes, encode_compiled_library_package,
 };
 pub use registry::LibraryRegistry;
 pub use route_meta::{RouteMetadata, SchemaRoutes};
@@ -84,13 +84,9 @@ pub(crate) async fn decode_authorize_and_stage_install(
     txn: &crate::txn::TxnHandle,
     body_bytes: &[u8],
 ) -> Result<String, StageInstallError> {
-    let install_request =
+    let install_compiled_package =
         decode_install_request_bytes(body_bytes).map_err(StageInstallError::from_install_error)?;
-
-    let schema = match &install_request {
-        InstallRequest::SchemaOnly(schema) => schema,
-        InstallRequest::WithArtifacts(payload) => &payload.schema,
-    };
+    let schema = &install_compiled_package.schema;
 
     if !txn.has_claim(schema.id(), USER_WRITE) {
         return Err(StageInstallError::unauthorized(
@@ -99,7 +95,7 @@ pub(crate) async fn decode_authorize_and_stage_install(
     }
 
     registry
-        .stage_install_request(txn.id(), install_request)
+        .stage_install_request(txn.id(), install_compiled_package)
         .await
         .map_err(StageInstallError::from_install_error)
 }

@@ -6,7 +6,7 @@ use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use tc_ir::{LibrarySchema, Scalar, TxnId};
+use tc_ir::{Scalar, TxnId};
 use tc_value::Value;
 use url::form_urlencoded;
 
@@ -195,18 +195,6 @@ pub(super) fn parse_path_and_txn_id(path: &str) -> PyResult<(String, Option<TxnI
     } else {
         Ok((path.to_string(), None))
     }
-}
-
-async fn decode_schema_from_bytes_async(bytes: Vec<u8>) -> Result<LibrarySchema, String> {
-    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(bytes))]);
-    destream_json::try_decode((), stream)
-        .await
-        .map_err(|err| err.to_string())
-}
-
-pub(super) fn decode_schema_from_json(json: &str) -> PyResult<LibrarySchema> {
-    executor::block_on(decode_schema_from_bytes_async(json.as_bytes().to_vec()))
-        .map_err(PyValueError::new_err)
 }
 
 async fn decode_scalar_from_bytes_async(bytes: Vec<u8>) -> Result<Scalar, String> {

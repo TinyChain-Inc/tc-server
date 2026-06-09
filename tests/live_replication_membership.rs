@@ -10,13 +10,12 @@ use tc_value::Value;
 use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore, Token};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
+use tinychain::library::CompiledLibraryPackage;
 use tinychain::library::http::{build_http_library_module, http_library_handlers};
-use tinychain::library::{InstallArtifacts, encode_install_payload_bytes};
 use tinychain::replication::{
-    ReplicationIssuer, discover_library_paths, export_handler, fetch_library_export,
+    ReplicationIssuer, discover_library_paths, export_handler, fetch_compiled_library_package,
     parse_psk_keys, replication_token_handler, request_replication_token,
 };
-use tinychain::storage::Artifact;
 use umask::USER_WRITE;
 
 #[tokio::test]
@@ -30,14 +29,14 @@ async fn replication_export_tracks_new_installs() {
     let schema_a = sample_schema("/lib/example-devco/live-forward/0.1.0");
     install_with_write_token(&server, &schema_a).await;
 
-    let payload_a = fetch_payload_for_schema(&server, &schema_a).await;
-    assert_eq!(payload_a.schema.id(), schema_a.id());
+    let definition_a = fetch_compiled_package_for_schema(&server, &schema_a).await;
+    assert_eq!(definition_a.schema.id(), schema_a.id());
 
     let schema_b = sample_schema("/lib/example-devco/live-forward/0.2.0");
     install_with_write_token(&server, &schema_b).await;
 
-    let payload_b = fetch_payload_for_schema(&server, &schema_b).await;
-    assert_eq!(payload_b.schema.id(), schema_b.id());
+    let definition_b = fetch_compiled_package_for_schema(&server, &schema_b).await;
+    assert_eq!(definition_b.schema.id(), schema_b.id());
 }
 
 #[tokio::test]
@@ -85,34 +84,13 @@ fn sample_schema(id: &str) -> LibrarySchema {
     LibrarySchema::new(Link::from_str(id).expect("schema link"), "0.1.0", vec![])
 }
 
-fn ir_bytes_for_schema(schema: &LibrarySchema) -> Vec<u8> {
+fn library_definition_for_schema(schema: &LibrarySchema) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
-        "schema": {
-            "id": schema.id().to_string(),
-            "version": schema.version(),
-            "dependencies": [],
-        },
-        "routes": [
-            {
-                "path": "/ok",
-                "value": { "ok": true }
-            }
-        ]
+        schema.id().to_string(): {
+            "ok": { "ok": true }
+        }
     }))
-    .expect("ir manifest bytes")
-}
-
-fn install_payload_for_schema(schema: &LibrarySchema, artifact_bytes: Vec<u8>) -> Vec<u8> {
-    let artifacts = vec![Artifact {
-        path: schema.id().to_string(),
-        content_type: tinychain::ir::IR_ARTIFACT_CONTENT_TYPE.to_string(),
-        bytes: artifact_bytes,
-    }];
-    let payload = InstallArtifacts {
-        schema: schema.clone(),
-        artifacts,
-    };
-    encode_install_payload_bytes(&payload).expect("install payload bytes")
+    .expect("library definition bytes")
 }
 
 fn shared_replication_keys() -> Vec<aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>> {
@@ -171,27 +149,32 @@ async fn install_with_write_token(server: &RunningServer, schema: &LibrarySchema
     let token = token_for_schema(&server.actor, schema, USER_WRITE);
     let txn_id = begin_transaction(server.addr, token).await;
     let txn_token = token_for_schema_and_txn(&server.actor, schema, USER_WRITE, txn_id);
-    let payload = install_payload_for_schema(schema, ir_bytes_for_schema(schema));
-    let response =
-        put_install_payload(server.addr, Some(txn_token.clone()), payload, Some(txn_id)).await;
+    let definition = library_definition_for_schema(schema);
+    let response = put_library_definition(
+        server.addr,
+        Some(txn_token.clone()),
+        definition,
+        Some(txn_id),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let finalize = finalize_install(server.addr, &txn_token, txn_id, true).await;
     assert_eq!(finalize.status(), StatusCode::NO_CONTENT);
 }
 
-async fn fetch_payload_for_schema(
+async fn fetch_compiled_package_for_schema(
     server: &RunningServer,
     schema: &LibrarySchema,
-) -> tinychain::library::InstallArtifacts {
+) -> CompiledLibraryPackage {
     let peer = format!("http://{}", server.addr);
     let token = request_replication_token(&peer, &schema.id().to_string(), &server.keys)
         .await
         .expect("replication token");
 
-    fetch_library_export(&peer, &token)
+    fetch_compiled_library_package(&peer, &token)
         .await
         .expect("export request")
-        .expect("export payload")
+        .expect("export compiled package")
 }
 
 fn token_for_schema(actor: &Actor, schema: &LibrarySchema, mask: umask::Mode) -> String {
@@ -274,10 +257,10 @@ async fn finalize_install(
         .expect("finalize response")
 }
 
-async fn put_install_payload(
+async fn put_library_definition(
     addr: std::net::SocketAddr,
     bearer: Option<String>,
-    payload: Vec<u8>,
+    definition: Vec<u8>,
     txn_id: Option<TxnId>,
 ) -> hyper::Response<Body> {
     let uri = match txn_id {
@@ -291,7 +274,7 @@ async fn put_install_payload(
     if let Some(token) = bearer {
         req = req.header(hyper::header::AUTHORIZATION, format!("Bearer {token}"));
     }
-    let request = req.body(Body::from(payload)).expect("request");
+    let request = req.body(Body::from(definition)).expect("request");
     Client::new().request(request).await.expect("response")
 }
 

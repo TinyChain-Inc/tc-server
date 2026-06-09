@@ -12,7 +12,7 @@ use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
 use tinychain::library::http::{build_http_library_module, http_library_handlers};
 use tinychain::replication::{
-    ReplicationIssuer, export_handler, fetch_library_export, parse_psk_keys,
+    ReplicationIssuer, export_handler, fetch_compiled_library_package, parse_psk_keys,
     replication_token_handler, request_replication_token,
 };
 use tinychain::storage::{Artifact, LibraryStore};
@@ -79,7 +79,7 @@ async fn rotates_psk_keys_for_export_integration() {
         .await
         .expect("token");
 
-    let payload = fetch_library_export(&peer, &token)
+    let payload = fetch_compiled_library_package(&peer, &token)
         .await
         .expect("export")
         .expect("payload");
@@ -103,7 +103,7 @@ async fn rotates_psk_keys_for_export_integration() {
     let token_new = request_replication_token(&peer_new, &schema.id().to_string(), &keys_new_only)
         .await
         .expect("token");
-    let payload = fetch_library_export(&peer_new, &token_new)
+    let payload = fetch_compiled_library_package(&peer_new, &token_new)
         .await
         .expect("export")
         .expect("payload");

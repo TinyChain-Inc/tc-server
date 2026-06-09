@@ -72,10 +72,10 @@ pub async fn begin_transaction(addr: std::net::SocketAddr, bearer: String) -> Tx
     TxnId::from_str(raw).expect("parse txn id")
 }
 
-pub async fn put_install_payload(
+pub async fn put_library_definition(
     addr: std::net::SocketAddr,
     bearer: Option<String>,
-    payload: Vec<u8>,
+    definition: Vec<u8>,
     txn_id: Option<TxnId>,
 ) -> hyper::Response<Body> {
     let uri = match txn_id {
@@ -89,7 +89,7 @@ pub async fn put_install_payload(
     if let Some(token) = bearer {
         req = req.header(hyper::header::AUTHORIZATION, format!("Bearer {token}"));
     }
-    let request = req.body(Body::from(payload)).expect("request");
+    let request = req.body(Body::from(definition)).expect("request");
     Client::new().request(request).await.expect("response")
 }
 
