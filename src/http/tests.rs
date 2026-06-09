@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_owned_anonymous_txn_exposes_no_transaction_headers() {
+    async fn adapter_owned_unauthenticated_txn_exposes_no_transaction_headers() {
         let kernel: Kernel = Kernel::builder()
             .with_lib_handler(ok_handler())
             .with_lib_put_handler(ok_handler())
@@ -230,7 +230,7 @@ mod tests {
             .expect("context body");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("context json");
         assert_eq!(payload["principal"], serde_json::Value::String("/host::owner-a".to_string()));
-        assert!(payload["txn_id"].is_string());
+        assert!(payload.get("txn_id").is_none());
         assert!(payload["txn_timestamp_nanos"].is_u64());
         assert!(payload["token_verified_at_nanos"].is_u64());
         assert!(payload["claims"].is_array());

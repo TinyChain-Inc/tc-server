@@ -61,7 +61,7 @@ async fn rotates_psk_keys_for_export_integration() {
     let store = LibraryStore::open(dir.clone()).await.expect("store");
     let store = store.for_schema(&schema).await.expect("store");
     store
-        .persist_artifact(
+        .persist_artifact_immediate(
             &schema,
             &Artifact {
                 path: schema.id().to_string(),

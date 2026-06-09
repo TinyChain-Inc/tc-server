@@ -9,12 +9,12 @@ use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule, PyType};
-use tc_ir::{Claim, OpRef, Scalar, Subject, TxnId};
+use tc_ir::{Claim, OpRef, Scalar, Subject};
 use tc_value::Value;
 use umask;
 
 use crate::{
-    Body, Kernel, KernelDispatch, KernelHandler, Method, Request, StatusCode,
+    Body, Kernel, KernelDispatch, KernelHandler, Request, StatusCode,
     library::decode_compiled_library_package,
     library::decode_install_request_bytes,
     library::http as http_library,
@@ -370,12 +370,11 @@ impl KernelHandle {
                 .map_err(|_| PyValueError::new_err("invalid component root"))?,
             umask::USER_READ,
         );
-        let _ = self
-            .txn_manager
-            .record_claim(&txn_handle.id(), read_claim.clone());
+        self.txn_manager
+            .record_claim(&txn_handle.id(), read_claim.clone())
+            .map_err(|_| PyValueError::new_err("unknown transaction id"))?;
         txn_handle = txn_handle.with_claims(vec![read_claim]);
         let txn = self.inner.with_resolver(txn_handle.clone());
-        let txn_id = txn_handle.id();
 
         let scalar = if let Some(body) = body.clone() {
             let bytes = request_body_bytes(Some(body))?;
@@ -398,14 +397,6 @@ impl KernelHandle {
 
         let resolved = self.block_on(op.resolve(&txn));
 
-        let rollback_op = OpRef::Delete((
-            Subject::Link(
-                Link::from_str(component_root)
-                    .map_err(|_| PyValueError::new_err("invalid component root"))?,
-            ),
-            Scalar::default(),
-        ));
-
         let response = match resolved {
             Ok(state) => Python::with_gil(|py| {
                 let body_bytes = encode_state_to_bytes(state)?;
@@ -422,8 +413,8 @@ impl KernelHandle {
             Err(err) => Err(PyValueError::new_err(err.message().to_string())),
         };
 
-        let _ = self.block_on(rollback_op.resolve(&txn));
-        let _ = self.txn_manager.rollback(txn_id);
+        self.block_on(self.inner.finalize_transaction(txn_handle, false))
+            .map_err(|err| PyValueError::new_err(err.message().to_string()))?;
 
         response
     }
@@ -472,7 +463,7 @@ impl KernelHandle {
             },
         ) {
             Ok(KernelDispatch::Response(resp)) => {
-                let mut response =
+                let response =
                     self.block_on(async move { py_response_from_http(resp.await).await })?;
                 if inbound_txn_id.is_none() {
                     if let Some(txn) = minted_txn {

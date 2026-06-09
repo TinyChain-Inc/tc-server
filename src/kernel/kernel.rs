@@ -124,7 +124,9 @@ impl Kernel {
             if let Some(module) = &self.library_module {
                 module.discard_txn(*txn_id);
             }
-            let _ = self.txn_manager.rollback(*txn_id);
+            self.txn_manager
+                .rollback(*txn_id)
+                .expect("expired transaction must still be pending");
         }
         expired
     }
@@ -135,11 +137,7 @@ impl Kernel {
         commit: bool,
     ) -> TCResult<()> {
         if let Some(finalize_hook) = &self.txn_finalize_hook {
-            if commit {
-                finalize_hook(txn.clone(), true).await?;
-            } else if let Err(err) = finalize_hook(txn.clone(), false).await {
-                eprintln!("rollback finalize hook failed: {err}");
-            }
+            finalize_hook(txn.clone(), commit).await?;
         }
 
         if let Some(module) = &self.library_module {

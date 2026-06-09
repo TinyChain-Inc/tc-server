@@ -5,6 +5,7 @@ pub mod ir;
 pub mod kernel;
 pub mod op_executor;
 pub mod op_plan;
+pub(crate) mod outbound_http;
 pub mod reflect;
 pub mod replication;
 pub mod resolve;

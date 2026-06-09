@@ -8,7 +8,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use tc_ir::{Scalar, TxnId};
 use tc_value::Value;
-use url::form_urlencoded;
 
 use crate::{Body, Method, Request, Response, State, StatusCode};
 use tc_state::null_transaction;
@@ -175,26 +174,8 @@ pub(crate) fn py_bearer_token(request: &PyKernelRequest) -> Option<String> {
 }
 
 pub(super) fn parse_path_and_txn_id(path: &str) -> PyResult<(String, Option<TxnId>)> {
-    use std::str::FromStr;
-
-    if let Some((base, query)) = path.split_once('?') {
-        let txn = form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .find(|(k, _)| k.eq_ignore_ascii_case("txn_id"))
-            .map(|(_, v)| v);
-
-        let parsed = match txn {
-            Some(value) => Some(
-                TxnId::from_str(&value)
-                    .map_err(|_| PyValueError::new_err("invalid transaction id"))?,
-            ),
-            None => None,
-        };
-
-        Ok((base.to_string(), parsed))
-    } else {
-        Ok((path.to_string(), None))
-    }
+    crate::txn::wire::split_path_and_txn_id(path)
+        .map_err(|_| PyValueError::new_err("invalid transaction id"))
 }
 
 async fn decode_scalar_from_bytes_async(bytes: Vec<u8>) -> Result<Scalar, String> {

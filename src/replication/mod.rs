@@ -1,5 +1,6 @@
 mod client;
 mod crypto;
+mod gateway;
 mod handler;
 mod http_util;
 mod issuer;
@@ -21,9 +22,7 @@ use aes_gcm_siv::{Aes256GcmSiv, Key};
 use futures::future::{FutureExt, join_all};
 use hyper::body::to_bytes;
 use hyper::{Body, Request, StatusCode};
-use parking_lot::Mutex;
 use tc_error::{TCError, TCResult};
-use tc_ir::TxnId;
 
 use self::http_util::{bad_request, empty_response, text_response};
 
@@ -36,11 +35,27 @@ pub const FORWARDED_HEADER: &str = "x-tc-replicated";
 const TOKEN_PATH: &str = "/";
 const REPLICATION_TTL: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Copy, Debug)]
+pub struct ReplicationPolicy {
+    pub max_fanout_attempts: usize,
+    pub membership_failure_threshold: u8,
+}
+
+impl Default for ReplicationPolicy {
+    fn default() -> Self {
+        Self {
+            max_fanout_attempts: 3,
+            membership_failure_threshold: 3,
+        }
+    }
+}
+
 pub use client::{
-    PeerClusterListing, discover_library_paths, fetch_compiled_library_package,
+    HttpClusterGateway, PeerClusterListing, discover_library_paths, fetch_compiled_library_package,
     fetch_library_listing, fetch_library_schema, heartbeat_peer, leave_peer_cluster,
     list_peer_cluster, normalize_peer, register_with_peer, request_replication_token,
 };
+pub use gateway::ClusterGateway;
 pub use handler::{export_handler, replication_token_handler};
 pub use issuer::{ReplicationIssuer, parse_psk_keys, parse_psk_list};
 pub use membership::{PeerDescriptor, PeerIdentity, PeerMembership};
@@ -116,57 +131,102 @@ fn normalize_cluster_root(value: &str) -> TCResult<String> {
     Ok(root.to_string())
 }
 
-#[derive(Clone, Default)]
-pub struct ReplicatedTxnTracker {
-    txns: Arc<Mutex<std::collections::BTreeSet<TxnId>>>,
+struct ParticipantFanoutError {
+    delivered: Vec<String>,
+    err: TCError,
 }
 
-impl ReplicatedTxnTracker {
-    pub fn mark(&self, txn_id: TxnId) {
-        self.txns.lock().insert(txn_id);
+#[must_use]
+#[derive(Clone, Debug, Default)]
+pub struct ReplicationReport {
+    pub installed: Vec<String>,
+    pub unavailable: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+impl ReplicationReport {
+    pub fn is_clean(&self) -> bool {
+        self.unavailable.is_empty() && self.skipped.is_empty() && self.failed.is_empty()
     }
 
-    pub fn take(&self, txn_id: TxnId) -> bool {
-        self.txns.lock().remove(&txn_id)
+    fn record_installed(&mut self, peer: &str, path: &str) {
+        self.installed.push(format!("{peer} {path}"));
     }
+
+    fn record_unavailable(&mut self, peer: &str, err: impl std::fmt::Display) {
+        self.unavailable.push(format!("{peer}: {err}"));
+    }
+
+    fn record_skipped(&mut self, peer: &str, path: &str) {
+        self.skipped.push(format!("{peer} {path}"));
+    }
+
+    fn record_failed(&mut self, peer: &str, path: &str, err: impl std::fmt::Display) {
+        self.failed.push(format!("{peer} {path}: {err}"));
+    }
+}
+
+#[must_use]
+#[derive(Clone, Debug, Default)]
+pub struct ClusterJoinReport {
+    pub contacted: Vec<String>,
+    pub failed: Vec<String>,
+    pub discovered: Vec<String>,
 }
 
 pub async fn replicate_from_peers(
     registry: &Arc<LibraryRegistry>,
     peers: &[String],
     keys: &[Key<Aes256GcmSiv>],
-) {
+) -> ReplicationReport {
+    replicate_from_peers_with_gateway(registry, peers, keys, &HttpClusterGateway).await
+}
+
+pub async fn replicate_from_peers_with_gateway<G>(
+    registry: &Arc<LibraryRegistry>,
+    peers: &[String],
+    keys: &[Key<Aes256GcmSiv>],
+    gateway: &G,
+) -> ReplicationReport
+where
+    G: ClusterGateway,
+{
+    let mut report = ReplicationReport::default();
+
     for peer in peers {
-        let library_paths = match discover_library_paths(peer).await {
+        let library_paths = match gateway.discover_library_paths(peer).await {
             Ok(paths) => paths,
             Err(err) => {
-                eprintln!("replication from {peer} failed: {err}");
+                report.record_unavailable(peer, err);
                 continue;
             }
         };
 
         for path in library_paths {
-            let token = match request_replication_token(peer, &path, keys).await {
+            let token = match gateway.request_replication_token(peer, &path, keys).await {
                 Ok(token) => token,
                 Err(err) => {
-                    eprintln!("replication from {peer} failed: {err}");
+                    report.record_failed(peer, &path, err);
                     continue;
                 }
             };
 
-            match fetch_compiled_library_package(peer, &token).await {
+            match gateway.fetch_compiled_library_package(peer, &token).await {
                 Ok(Some(payload)) => {
                     if let Err(err) = registry.install_compiled_package(payload).await {
-                        eprintln!("replication from {peer} failed: {}", err.message());
+                        report.record_failed(peer, &path, err.message());
                     } else {
-                        eprintln!("replicated library {path} from {peer}");
+                        report.record_installed(peer, &path);
                     }
                 }
-                Ok(None) => eprintln!("peer {peer} has no exportable library for {path}"),
-                Err(err) => eprintln!("replication from {peer} failed: {err}"),
+                Ok(None) => report.record_skipped(peer, &path),
+                Err(err) => report.record_failed(peer, &path, err),
             }
         }
     }
+
+    report
 }
 
 pub async fn announce_self_to_cluster(
@@ -175,7 +235,30 @@ pub async fn announce_self_to_cluster(
     routes: &PeerRoutes,
     keys: &[Key<Aes256GcmSiv>],
     issuer: &ReplicationIssuer,
-) {
+) -> ClusterJoinReport {
+    announce_self_to_cluster_with_gateway(
+        membership,
+        self_identity,
+        routes,
+        keys,
+        issuer,
+        &HttpClusterGateway,
+    )
+    .await
+}
+
+pub async fn announce_self_to_cluster_with_gateway<G>(
+    membership: &PeerMembership,
+    self_identity: &PeerIdentity,
+    routes: &PeerRoutes,
+    keys: &[Key<Aes256GcmSiv>],
+    issuer: &ReplicationIssuer,
+    gateway: &G,
+) -> ClusterJoinReport
+where
+    G: ClusterGateway,
+{
+    let mut report = ClusterJoinReport::default();
     let mut pending = membership.active_peers();
     let mut visited = std::collections::HashSet::new();
     while let Some(seed) = pending.pop() {
@@ -183,8 +266,12 @@ pub async fn announce_self_to_cluster(
             continue;
         }
 
-        match register_with_peer(&seed, self_identity, routes, keys).await {
+        match gateway
+            .register_with_peer(&seed, self_identity, routes, keys)
+            .await
+        {
             Ok(discovered) => {
+                report.contacted.push(seed.clone());
                 membership.mark_success(&seed);
                 for identity in discovered.identities {
                     if identity.peer == self_identity.peer {
@@ -192,13 +279,12 @@ pub async fn announce_self_to_cluster(
                     }
 
                     if let Err(err) = issuer.register_peer_identity(&identity) {
-                        eprintln!(
-                            "announce_self_to_cluster: invalid peer identity from {seed}: {err}"
-                        );
+                        report.failed.push(format!("{seed}: {err}"));
                         continue;
                     }
 
                     if membership.upsert_identity(identity.clone()) {
+                        report.discovered.push(identity.peer.clone());
                         pending.push(identity.peer);
                     }
                 }
@@ -208,26 +294,30 @@ pub async fn announce_self_to_cluster(
                         continue;
                     }
                     if membership.upsert_active(peer.clone()) {
+                        report.discovered.push(peer.clone());
                         pending.push(peer);
                     }
                 }
             }
-            Err(_) => membership.mark_failure(&seed),
+            Err(err) => {
+                membership.mark_failure(&seed);
+                report.failed.push(format!("{seed}: {err}"));
+            }
         }
     }
+
+    report
 }
 
 pub fn live_replicating_install_put_handler(
     registry: Arc<LibraryRegistry>,
     membership: PeerMembership,
     keys: Vec<Key<Aes256GcmSiv>>,
-    tracker: ReplicatedTxnTracker,
 ) -> impl crate::KernelHandler {
     move |req: Request<Body>| {
         let registry = Arc::clone(&registry);
         let membership = membership.clone();
         let keys = keys.clone();
-        let tracker = tracker.clone();
         async move {
             let forwarded = req
                 .headers()
@@ -264,7 +354,9 @@ pub fn live_replicating_install_put_handler(
                 )
                 .await
                 {
-                    Ok(()) => tracker.mark(txn.id()),
+                    Ok(participants) => {
+                        registry.record_replication_participants(txn.id(), participants)
+                    }
                     Err(err) => {
                         registry.discard_txn(txn.id());
                         return text_response(StatusCode::BAD_GATEWAY, err.to_string());
@@ -284,47 +376,89 @@ pub async fn forward_install_to_peers(
     schema_path: &str,
     install_compiled_package: Vec<u8>,
     keys: &[Key<Aes256GcmSiv>],
-) -> TCResult<()> {
+) -> TCResult<Vec<String>> {
+    forward_install_to_peers_with_gateway(
+        membership,
+        txn,
+        schema_path,
+        install_compiled_package,
+        keys,
+        &HttpClusterGateway,
+    )
+    .await
+}
+
+pub async fn forward_install_to_peers_with_gateway<G>(
+    membership: &PeerMembership,
+    txn: &crate::txn::TxnHandle,
+    schema_path: &str,
+    install_compiled_package: Vec<u8>,
+    keys: &[Key<Aes256GcmSiv>],
+    gateway: &G,
+) -> TCResult<Vec<String>>
+where
+    G: ClusterGateway,
+{
     let token = txn
         .raw_token()
         .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?
         .to_string();
     let txn_id = txn.id();
 
-    fanout_peers(membership, "install payload", |peer| {
-        let token = token.clone();
-        let payload = install_compiled_package.clone();
-        async move {
-            request_replication_token(&peer, schema_path, keys)
-                .await
-                .map_err(|err| {
-                    tc_error::TCError::bad_gateway(format!(
-                        "failed to request replication token from {peer}: {err}"
-                    ))
-                })?;
+    fanout_peers(
+        membership,
+        "install payload",
+        ReplicationPolicy::default(),
+        |peer| {
+            let token = token.clone();
+            let payload = install_compiled_package.clone();
+            let gateway = gateway;
+            async move {
+                gateway
+                    .request_replication_token(&peer, schema_path, keys)
+                    .await
+                    .map_err(|err| {
+                        tc_error::TCError::bad_gateway(format!(
+                            "failed to request replication token from {peer}: {err}"
+                        ))
+                    })?;
 
-            client::push_install_compiled_package(&peer, &token, txn_id, payload).await
-        }
-    })
+                gateway
+                    .push_install_compiled_package(&peer, &token, txn_id, payload)
+                    .await
+            }
+        },
+    )
     .await
 }
 
 pub fn live_replicating_finalize_hook(
-    membership: PeerMembership,
-    tracker: ReplicatedTxnTracker,
+    registry: Arc<LibraryRegistry>,
 ) -> impl Fn(crate::txn::TxnHandle, bool) -> futures::future::BoxFuture<'static, TCResult<()>>
 + Send
 + Sync
 + 'static {
     move |txn: crate::txn::TxnHandle, commit: bool| {
-        let membership = membership.clone();
-        let tracker = tracker.clone();
+        let registry = Arc::clone(&registry);
         async move {
-            if !tracker.take(txn.id()) {
+            let Some(participants) = registry.replication_participants(txn.id()) else {
                 return Ok(());
-            }
+            };
 
-            forward_finalize_to_peers(&membership, &txn, commit).await
+            match forward_finalize_to_participants_progress(
+                &participants,
+                &txn,
+                commit,
+                &HttpClusterGateway,
+            )
+            .await
+            {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    registry.retain_unfinished_replication_participants(txn.id(), &err.delivered);
+                    Err(err.err)
+                }
+            }
         }
         .boxed()
     }
@@ -335,35 +469,88 @@ pub async fn forward_finalize_to_peers(
     txn: &crate::txn::TxnHandle,
     commit: bool,
 ) -> TCResult<()> {
+    let participants = membership.active_peers();
+    forward_finalize_to_participants(&participants, txn, commit, &HttpClusterGateway).await
+}
+
+pub async fn forward_finalize_to_peers_with_gateway<G>(
+    membership: &PeerMembership,
+    txn: &crate::txn::TxnHandle,
+    commit: bool,
+    gateway: &G,
+) -> TCResult<()>
+where
+    G: ClusterGateway,
+{
+    let participants = membership.active_peers();
+    forward_finalize_to_participants(&participants, txn, commit, gateway).await
+}
+
+async fn forward_finalize_to_participants<G>(
+    participants: &[String],
+    txn: &crate::txn::TxnHandle,
+    commit: bool,
+    gateway: &G,
+) -> TCResult<()>
+where
+    G: ClusterGateway,
+{
+    let _ = forward_finalize_to_participants_progress(participants, txn, commit, gateway)
+        .await
+        .map_err(|err| err.err)?;
+    Ok(())
+}
+
+async fn forward_finalize_to_participants_progress<G>(
+    participants: &[String],
+    txn: &crate::txn::TxnHandle,
+    commit: bool,
+    gateway: &G,
+) -> Result<Vec<String>, ParticipantFanoutError>
+where
+    G: ClusterGateway,
+{
     let token = txn
         .raw_token()
-        .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?
+        .ok_or_else(|| ParticipantFanoutError {
+            delivered: Vec::new(),
+            err: tc_error::TCError::unauthorized("missing bearer token"),
+        })?
         .to_string();
     let txn_id = txn.id();
 
-    fanout_peers(membership, "finalize transaction", |peer| {
-        let token = token.clone();
-        async move { client::finalize_install_txn(&peer, &token, txn_id, commit).await }
-    })
+    fanout_participants(
+        participants,
+        "finalize transaction",
+        ReplicationPolicy::default(),
+        |peer| {
+            let token = token.clone();
+            let gateway = gateway;
+            async move {
+                gateway
+                    .finalize_install_txn(&peer, &token, txn_id, commit)
+                    .await
+            }
+        },
+    )
     .await
 }
 
 async fn fanout_peers<F, Fut>(
     membership: &PeerMembership,
     operation: &str,
+    policy: ReplicationPolicy,
     apply: F,
-) -> TCResult<()>
+) -> TCResult<Vec<String>>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = TCResult<()>>,
 {
-    const FANOUT_MAX_ATTEMPTS: usize = 3;
-
     let mut delivered = HashSet::new();
     let mut first_error = None;
     let mut had_targets = false;
 
-    for attempt in 1..=FANOUT_MAX_ATTEMPTS {
+    for _ in 1..=policy.max_fanout_attempts {
         let targets = membership
             .active_peers()
             .into_iter()
@@ -388,10 +575,10 @@ where
                     delivered.insert(peer);
                 }
                 Err(err) => {
-                    eprintln!(
-                        "live replication: failed to {operation} on {peer} (attempt {attempt}/{FANOUT_MAX_ATTEMPTS}): {err}"
+                    membership.mark_failure_with_membership_threshold(
+                        &peer,
+                        policy.membership_failure_threshold,
                     );
-                    membership.mark_failure(&peer);
                     if first_error.is_none() {
                         first_error = Some(err);
                     }
@@ -412,7 +599,9 @@ where
                 TCError::bad_gateway(format!("failed to {operation}: no reachable peers"))
             }))
         } else {
-            Ok(())
+            let mut delivered = delivered.into_iter().collect::<Vec<_>>();
+            delivered.sort();
+            Ok(delivered)
         }
     } else {
         Err(first_error.unwrap_or_else(|| {
@@ -421,5 +610,76 @@ where
                 unresolved.join(", ")
             ))
         }))
+    }
+}
+
+async fn fanout_participants<F, Fut>(
+    participants: &[String],
+    operation: &str,
+    policy: ReplicationPolicy,
+    apply: F,
+) -> Result<Vec<String>, ParticipantFanoutError>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = TCResult<()>>,
+{
+    let mut delivered = HashSet::new();
+    let mut first_error = None;
+
+    for _ in 1..=policy.max_fanout_attempts {
+        let targets = participants
+            .iter()
+            .filter(|peer| !delivered.contains(*peer))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if targets.is_empty() {
+            let mut delivered = delivered.into_iter().collect::<Vec<_>>();
+            delivered.sort();
+            return Ok(delivered);
+        }
+
+        let results = join_all(targets.into_iter().map(|peer| {
+            let fut = apply(peer.clone());
+            async move { (peer, fut.await) }
+        }))
+        .await;
+
+        for (peer, result) in results {
+            match result {
+                Ok(()) => {
+                    delivered.insert(peer);
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+    }
+
+    let unresolved = participants
+        .iter()
+        .filter(|peer| !delivered.contains(*peer))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if unresolved.is_empty() {
+        let mut delivered = delivered.into_iter().collect::<Vec<_>>();
+        delivered.sort();
+        Ok(delivered)
+    } else {
+        let mut delivered = delivered.into_iter().collect::<Vec<_>>();
+        delivered.sort();
+        Err(ParticipantFanoutError {
+            delivered,
+            err: first_error.unwrap_or_else(|| {
+                TCError::bad_gateway(format!(
+                    "failed to {operation} on transaction participants: {}",
+                    unresolved.join(", ")
+                ))
+            }),
+        })
     }
 }

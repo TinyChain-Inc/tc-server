@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use futures::{FutureExt, TryFutureExt, future::BoxFuture};
+use futures::{FutureExt, future::BoxFuture};
 use pathlink::Link;
 use std::sync::Arc;
 use tc_error::{TCError, TCResult};
@@ -8,11 +8,7 @@ use tc_state::State;
 use tc_value::Value;
 use url::form_urlencoded;
 
-use crate::{
-    Method,
-    gateway::RpcGateway,
-    uri::{component_root, normalize_path},
-};
+use crate::{Method, gateway::RpcGateway};
 
 #[derive(Clone)]
 pub struct HttpRpcGateway {
@@ -33,68 +29,6 @@ impl Default for HttpRpcGateway {
     }
 }
 
-/// Post state params to a TinyChain route URL without appending transaction query params.
-///
-/// This is intended for externally versioned library routes where the caller must use
-/// exact route paths and bearer-token auth, but does not own TinyChain txn lifecycle.
-pub async fn post_state_raw(
-    endpoint: &str,
-    bearer_token: Option<&str>,
-    params: Map<State>,
-) -> TCResult<State> {
-    let uri: http::Uri = endpoint
-        .parse()
-        .map_err(|err| TCError::bad_request(format!("invalid URI: {err}")))?;
-
-    let body = if params.is_empty() {
-        Vec::new()
-    } else {
-        encode_params_body(params)?
-    };
-
-    let mut builder = http::Request::builder()
-        .method(hyper::Method::POST)
-        .uri(uri);
-
-    if let Some(token) = bearer_token {
-        let token = token.trim();
-        if !token.is_empty() {
-            builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {token}"));
-        }
-    }
-
-    if !body.is_empty() {
-        builder = builder.header(http::header::CONTENT_TYPE, "application/json");
-    }
-
-    let request = builder
-        .body(hyper::Body::from(body))
-        .map_err(|err| TCError::bad_request(err.to_string()))?;
-
-    let response = hyper::Client::new()
-        .request(request)
-        .map_err(|err| TCError::bad_gateway(err.to_string()))
-        .await?;
-
-    let status = response.status();
-    let body_bytes = hyper::body::to_bytes(response.into_body())
-        .map_err(|err| TCError::bad_gateway(err.to_string()))
-        .await?;
-
-    if !status.is_success() {
-        return Err(tc_error_from_status(status, body_bytes));
-    }
-
-    if body_bytes.is_empty() || body_bytes.iter().all(|b| b.is_ascii_whitespace()) {
-        return Ok(State::None);
-    }
-
-    let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(body_bytes)]);
-    destream_json::try_decode(tc_state::null_transaction(), stream)
-        .await
-        .map_err(|err| TCError::bad_request(err.to_string()))
-}
-
 impl RpcGateway for HttpRpcGateway {
     fn get(
         &self,
@@ -102,7 +36,7 @@ impl RpcGateway for HttpRpcGateway {
         txn: crate::txn::TxnHandle,
         key: Value,
     ) -> BoxFuture<'static, TCResult<State>> {
-        let uri = match append_txn_id_and_key(&target.to_string(), txn.id(), &key) {
+        let uri = match append_kernel_txn_query(&target.to_string(), txn.id(), Some(&key)) {
             Ok(uri) => uri,
             Err(err) => return futures::future::ready(Err(err)).boxed(),
         };
@@ -119,19 +53,10 @@ impl RpcGateway for HttpRpcGateway {
 
         let client = self.client.clone();
         async move {
-            let response = client
-                .request(request)
-                .map_err(|err| TCError::bad_gateway(err.to_string()))
-                .await?;
-
-            let status = response.status();
-            let body_bytes = hyper::body::to_bytes(response.into_body())
-                .map_err(|err| TCError::bad_gateway(err.to_string()))
-                .await?;
-
-            if !status.is_success() {
-                return Err(tc_error_from_status(status, body_bytes));
-            }
+            let (status, body_bytes) =
+                crate::outbound_http::send(&client, request, crate::outbound_http::DEFAULT_TIMEOUT)
+                    .await?;
+            let body_bytes = crate::outbound_http::ensure_success(status, body_bytes)?;
 
             decode_state_body(body_bytes, &txn).await
         }
@@ -145,7 +70,7 @@ impl RpcGateway for HttpRpcGateway {
         key: Value,
         value: State,
     ) -> BoxFuture<'static, TCResult<()>> {
-        let uri = match append_txn_id_and_key(&target.to_string(), txn.id(), &key) {
+        let uri = match append_kernel_txn_query(&target.to_string(), txn.id(), Some(&key)) {
             Ok(uri) => uri,
             Err(err) => return futures::future::ready(Err(err)).boxed(),
         };
@@ -162,19 +87,10 @@ impl RpcGateway for HttpRpcGateway {
 
         let client = self.client.clone();
         async move {
-            let response = client
-                .request(request)
-                .map_err(|err| TCError::bad_gateway(err.to_string()))
-                .await?;
-
-            let status = response.status();
-            let body_bytes = hyper::body::to_bytes(response.into_body())
-                .map_err(|err| TCError::bad_gateway(err.to_string()))
-                .await?;
-
-            if !status.is_success() {
-                return Err(tc_error_from_status(status, body_bytes));
-            }
+            let (status, body_bytes) =
+                crate::outbound_http::send(&client, request, crate::outbound_http::DEFAULT_TIMEOUT)
+                    .await?;
+            let _ = crate::outbound_http::ensure_success(status, body_bytes)?;
 
             Ok(())
         }
@@ -187,7 +103,7 @@ impl RpcGateway for HttpRpcGateway {
         txn: crate::txn::TxnHandle,
         params: Map<State>,
     ) -> BoxFuture<'static, TCResult<State>> {
-        let uri = match append_txn_id_and_key(&target.to_string(), txn.id(), &Value::None) {
+        let uri = match append_kernel_txn_query(&target.to_string(), txn.id(), None) {
             Ok(uri) => uri,
             Err(err) => return futures::future::ready(Err(err)).boxed(),
         };
@@ -208,19 +124,10 @@ impl RpcGateway for HttpRpcGateway {
 
         let client = self.client.clone();
         async move {
-            let response = client
-                .request(request)
-                .map_err(|err| TCError::bad_gateway(err.to_string()))
-                .await?;
-
-            let status = response.status();
-            let body_bytes = hyper::body::to_bytes(response.into_body())
-                .map_err(|err| TCError::bad_gateway(err.to_string()))
-                .await?;
-
-            if !status.is_success() {
-                return Err(tc_error_from_status(status, body_bytes));
-            }
+            let (status, body_bytes) =
+                crate::outbound_http::send(&client, request, crate::outbound_http::DEFAULT_TIMEOUT)
+                    .await?;
+            let body_bytes = crate::outbound_http::ensure_success(status, body_bytes)?;
 
             decode_state_body(body_bytes, &txn).await
         }
@@ -233,7 +140,7 @@ impl RpcGateway for HttpRpcGateway {
         txn: crate::txn::TxnHandle,
         key: Value,
     ) -> BoxFuture<'static, TCResult<()>> {
-        let uri = match append_txn_id_and_key(&target.to_string(), txn.id(), &key) {
+        let uri = match append_kernel_txn_query(&target.to_string(), txn.id(), Some(&key)) {
             Ok(uri) => uri,
             Err(err) => return futures::future::ready(Err(err)).boxed(),
         };
@@ -246,44 +153,15 @@ impl RpcGateway for HttpRpcGateway {
 
         let client = self.client.clone();
         async move {
-            let response = client
-                .request(request)
-                .map_err(|err| TCError::bad_gateway(err.to_string()))
-                .await?;
-
-            let status = response.status();
-            let body_bytes = hyper::body::to_bytes(response.into_body())
-                .map_err(|err| TCError::bad_gateway(err.to_string()))
-                .await?;
-
-            if !status.is_success() {
-                return Err(tc_error_from_status(status, body_bytes));
-            }
+            let (status, body_bytes) =
+                crate::outbound_http::send(&client, request, crate::outbound_http::DEFAULT_TIMEOUT)
+                    .await?;
+            let _ = crate::outbound_http::ensure_success(status, body_bytes)?;
 
             Ok(())
         }
         .boxed()
     }
-}
-
-#[allow(dead_code)]
-fn validate_finalize_target(uri: &str) -> TCResult<String> {
-    let parsed: http::Uri = uri
-        .parse()
-        .map_err(|err| TCError::bad_request(format!("invalid URI: {err}")))?;
-
-    let path = normalize_path(parsed.path());
-    let root = component_root(path).ok_or_else(|| {
-        TCError::bad_request("commit/rollback target is not a TinyChain component".to_string())
-    })?;
-
-    if root != path {
-        return Err(TCError::bad_request(format!(
-            "commit/rollback target must be component root (got {path})"
-        )));
-    }
-
-    Ok(uri.to_string())
 }
 
 fn build_request(
@@ -407,7 +285,15 @@ async fn decode_state_body(body: Bytes, txn: &crate::txn::TxnHandle) -> TCResult
         .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
-fn append_txn_id_and_key(uri: &str, txn_id: TxnId, key: &Value) -> TCResult<String> {
+/// Append the kernel-owned transaction query parameters for internal host-to-host RPC.
+///
+/// Public clients must not construct these URLs. This helper rejects targets which already
+/// contain `txn_id` so callers cannot override the active transaction context.
+pub(crate) fn append_kernel_txn_query(
+    uri: &str,
+    txn_id: TxnId,
+    key: Option<&Value>,
+) -> TCResult<String> {
     let parsed: http::Uri = uri
         .parse()
         .map_err(|err| TCError::bad_request(format!("invalid URI: {err}")))?;
@@ -430,7 +316,7 @@ fn append_txn_id_and_key(uri: &str, txn_id: TxnId, key: &Value) -> TCResult<Stri
         serializer.append_pair(&key, &value);
     }
     serializer.append_pair("txn_id", &txn_id.to_string());
-    if !matches!(key, Value::None) {
+    if let Some(key) = key.filter(|key| !matches!(key, Value::None)) {
         let key_json = encode_value_json(key)?;
         serializer.append_pair("key", &key_json);
     }
@@ -454,19 +340,6 @@ fn append_txn_id_and_key(uri: &str, txn_id: TxnId, key: &Value) -> TCResult<Stri
     Ok(rebuilt.to_string())
 }
 
-fn tc_error_from_status(status: http::StatusCode, body: Bytes) -> TCError {
-    let message = String::from_utf8_lossy(&body).to_string();
-    match status {
-        http::StatusCode::BAD_REQUEST => TCError::bad_request(message),
-        http::StatusCode::UNAUTHORIZED => TCError::unauthorized(message),
-        http::StatusCode::NOT_FOUND => TCError::not_found(message),
-        http::StatusCode::CONFLICT => TCError::conflict(message),
-        http::StatusCode::METHOD_NOT_ALLOWED => TCError::method_not_allowed("request", message),
-        http::StatusCode::BAD_GATEWAY => TCError::bad_gateway(message),
-        _ => TCError::internal(message),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,7 +350,7 @@ mod tests {
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0_u8; 32]);
 
         let uri = "http://localhost:8702/lib?foo=bar";
-        let updated = append_txn_id_and_key(uri, txn_id, &Value::None).expect("append txn_id");
+        let updated = append_kernel_txn_query(uri, txn_id, None).expect("append txn_id");
         assert!(updated.contains("foo=bar"));
         assert!(updated.contains("txn_id="));
     }
@@ -487,8 +360,8 @@ mod tests {
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(2), 2).with_trace([0_u8; 32]);
 
         let uri = "http://localhost:8702/lib?txn_id=old&foo=bar";
-        let err = append_txn_id_and_key(uri, txn_id, &Value::None)
-            .expect_err("should reject existing txn_id");
+        let err =
+            append_kernel_txn_query(uri, txn_id, None).expect_err("should reject existing txn_id");
         assert!(err.message().contains("must not include txn_id"));
     }
 
@@ -504,18 +377,5 @@ mod tests {
 
         let auth = request.headers().get("authorization").expect("auth header");
         assert_eq!(auth.to_str().expect("auth header str"), "Bearer abc.def");
-    }
-
-    #[test]
-    fn rejects_finalize_to_non_root() {
-        let err = validate_finalize_target("http://localhost:8702/lib/acme/foo/1.0.0/echo")
-            .expect_err("should reject");
-        assert!(err.message().contains("component root"));
-    }
-
-    #[test]
-    fn accepts_finalize_to_root() {
-        validate_finalize_target("http://localhost:8702/lib/acme/foo/1.0.0")
-            .expect("should accept");
     }
 }

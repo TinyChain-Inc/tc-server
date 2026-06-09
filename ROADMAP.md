@@ -11,38 +11,39 @@ behavior of the upstream `host` crate.
   `TxnManager::begin` (`/host/...` and `/healthz` are non-transactional).
   The handler executes immediately within that transaction, then the adapter commits or rolls it
   back before returning. The transaction ID is not exposed in response headers.
-- **Continue:** Subsequent requests to transactional endpoints include `?txn_id=<id>` in the URI.
-  The dispatcher
-  loads the pending transaction, verifies the same `Authorization: Bearer ...` owner token (when
-  present), and stores the `TxnHandle` (including its resolver context, plus parsed body state)
-  in the request extensions before
-  invoking the kernel handler. A previously-unseen `?txn_id=...` is only accepted when a bearer
-  token is present, so the kernel can pin transaction ownership before executing any handler.
-- **Finalize:** Sending an *empty* `POST` to the **canonical component root** with
-  `?txn_id=<id>` commits the transaction. Sending an empty `DELETE` to the same root rolls it
-  back. “Component root” means the canonical library/service path derived from its manifest
-  at install time (or `/lib` for `/lib` installs). Finalize requests are **root-only**: an
-  empty `POST`/`DELETE` to a subpath must be treated as an ordinary request, not a
-  commit/rollback signal.
+- **Continue:** Host-owned gateways and replication fanout continue an existing transaction by
+  including `?txn_id=<id>` in the URI. Public clients do not construct or receive transaction IDs.
+  The dispatcher loads the pending transaction, verifies the same `Authorization: Bearer ...`
+  owner token (when present), and stores the `TxnHandle` (including its resolver context, plus
+  parsed body state) in the request extensions before invoking the kernel handler. A
+  previously-unseen `?txn_id=...` is only accepted when a bearer token is present, so the kernel
+  can pin transaction ownership before executing any handler.
+- **Finalize:** Host-owned gateways and replication fanout finalize by sending an *empty* `POST`
+  to the **canonical component root** with `?txn_id=<id>` to commit, or an empty `DELETE` to roll
+  back. Public clients never call these endpoints directly. “Component root” means the canonical
+  library/service path derived from its manifest at install time (or `/lib` for `/lib` installs).
+  Finalize requests are **root-only**: an empty `POST`/`DELETE` to a subpath must be treated as an
+  ordinary request, not a commit/rollback signal.
 - **Body parsing:** The HTTP layer buffers each request body, converts it into a placeholder
   `State`, and only treats the payload as “empty” when it consists solely of ASCII whitespace.
   This ensures real payloads won’t be mistaken for finalize calls once richer `State`/`Value`
   types land.
 
-The `Kernel` owns this state machine so every protocol stack (HTTP, PyO3, future gRPC, etc.)
-shares a single implementation: adapters identify the `txn_id` and whether the body is empty,
-then delegate to `Kernel::route_request`, which decides whether to begin, continue, commit, or
-roll back. Keeping this logic centralized is critical—moving begin/commit heuristics into a
-protocol adapter would bypass shared tests and risks future regressions.
+The `Kernel` owns this state machine so every protocol stack (HTTP, PyO3, etc.) shares a single
+implementation: adapters identify the reserved wire transaction context and whether the body is
+empty, then delegate to `Kernel::route_request`, which decides whether to begin, continue, commit,
+or roll back. Keeping this logic centralized is critical—moving begin/commit heuristics into a
+protocol adapter or public client would bypass shared tests and risks future regressions.
 
 ### Minimal publisher kit (in progress)
 
 Goal: expose the router and transaction primitives directly from `tc-server` without forcing
 publishers to pull in any adapters or the Wasmtime dependency. Actions:
 
-- Re-export `Dir`, `Route`, `Handler`, and `Transaction` (from `tc-ir`) plus `Kernel` and
-  `TxnManager`/`TxnHandle` from `tc-server::lib` so bespoke hosts can reuse the same routing
-  semantics and transaction handling (begin/continue/finalize via `?txn_id=...`).
+- Re-export `Dir`, `Route`, `Handler`, and `Transaction` (from `tc-ir`) plus `Kernel` and the
+  minimal host-owned transaction primitives from `tc-server::lib` so bespoke hosts can reuse the
+  same routing semantics and transaction handling without exposing `txn_id` to application
+  clients.
 - Add a `wasm` feature gate (default-on) so `tc-server` can build with `default-features = false`
   for adapter-less kernels while preserving the current default behavior for HTTP/PyO3 stacks.
 - Document the feature matrix in `PROTOCOL_COMPATIBILITY.md` so publishers know when to enable
@@ -73,12 +74,12 @@ ops atomic and deterministic.
     `Leader` handles with `commit/rollback` callbacks.
 - Update `Kernel::dispatch` to:
   1. Acquire (or receive) a `Txn` before invoking any handler.
-  2. Ensure the HTTP layer ties a request to one of three modes:
-     - `Begin`: create a txn, return its ID.
-     - `Continue`: pass the txn ID via `?txn_id=...`; server looks it up.
-     - `Finalize`: explicit `commit` or `rollback`.
-  3. On handler success, defer commit until the client sends `Finalize`; on error, auto-roll
-     back and surface the failure.
+  2. Ensure the HTTP/PyO3 layers tie each request to a host-owned mode:
+     - `Begin`: create a transaction for ordinary caller requests which omit `txn_id`.
+     - `Continue`: host-owned gateway/replication calls pass `txn_id`; the server looks it up.
+     - `Finalize`: host-owned gateway/replication calls commit or roll back at the component root.
+  3. On ordinary caller success, finalize before returning; on error, roll back and surface the
+     failure.
 
 ### Transaction ownership + leadership claims (work needed)
 
@@ -147,15 +148,16 @@ only forward `txn_id`, request metadata, and an opaque bearer token.
    workspace cleanup is deferred until txfs is integrated.
 
 7. **Harden txn ergonomics + permission checks (v1 parity).**
-   - Distinguish “system” vs “user” transactions (explicit constructors) so external callers
-     cannot mint ownerless or privileged txns by accident.
+   - Keep one transaction class only: kernel-owned top-level transactions. Do not introduce
+     privileged “system” transactions, sub-transactions, transaction-version IDs, or side-table
+     mappings from one transaction identity to another.
    - Keep bearer tokens kernel-private; adapters only pass opaque strings and never expose them
      via public `TxnHandle` accessors or Debug output.
-   - Add `TxnHandle` permission helpers (e.g., `has_permission`) backed by signed token claims,
-     including an explicit “anonymous” token with zero permissions.
+   - Add `TxnHandle` permission helpers (e.g., `has_permission`) backed by signed token claims.
    - Enforce claim invariants in one place (kernel/txn), not per-adapter; add tests for invalid
-     owner/lock shapes and anonymous-deny behavior.
-   - Require explicit token/anonymous handling at adapter boundaries (no silent fallbacks).
+     owner/lock shapes and unauthenticated-deny behavior.
+   - Require explicit authenticated-vs-unauthenticated handling at adapter boundaries (no silent
+     fallbacks).
    - Gate commit/rollback on ownership/lock claims in the kernel’s finalize path (single source).
    - Use URI builder helpers consistently (avoid hardcoded `/service`/`/lib` strings in tests/docs).
    - Ensure internal install APIs are either gated by txn claims or clearly marked internal-only.
@@ -233,9 +235,10 @@ Implementation import notes (v1 reference points, repo-relative):
   while relying on cluster registration for replica discovery:
   - v1: `host/server/src/cluster/mod.rs` (`ClusterEgress` records downstream links; `replicate_txn_state`)
   - v1: `host/server/src/client.rs` (egress hook placement is in the gateway)
-  - v2: replace v1’s “record and allow” placeholder with “check manifest allowlist and record”
-    so finalize propagation only targets allowed dependencies, and use cluster startup registration
-    to resolve the live replica set for each participant.
+  - v2 status: live library install replication now records successfully prepared peers on the
+    staged `LibraryRegistry` transaction record. Finalize uses that fixed participant snapshot,
+    not live membership, and retains only unresolved peers after partial finalize failure so the
+    same transaction can be retried after a temporary partition heals.
 - **Token chaining on route.** Import the idea that the kernel extends a transaction’s capability
   token as it routes into additional components:
   - v1: `host/server/src/txn/mod.rs` (`Txn::grant` constructs/extends the token with a new claim)
@@ -264,9 +267,10 @@ Additional v1 details to import (correctness and UX):
   - require each class/library/service to register with its cluster at host startup,
   - resolve replica sets and canonical authorities via that registry (lead host or production DNS),
   - use the registry as the source of truth for routing finalize propagation.
-- **Finalize propagation failure policy.** Define the expected behavior when some replicas or
-  downstream participants cannot be reached during commit/rollback (retry vs fail commit vs mark
-  degraded) and test it explicitly:
+- **Finalize propagation failure policy.** Keep the strict all-prepared-participant rule:
+  49% and 51% participant failures both fail closed unless every prepared participant eventually
+  finalizes. Majority commit semantics require a real consensus log and are not part of HTTP
+  replication fanout.
   - v1: `host/server/src/cluster/mod.rs` (`replicate_txn_state` failure handling)
 - **Subcontext discipline.** Preserve the “subcontext per decode/encode” discipline so request
   body decoding, caching, and cleanup remain deterministic:
@@ -284,16 +288,102 @@ Testing plan (cross-service transactions and failure cases):
 - **Rollback semantics.** Force an error in a downstream participant mid-txn and verify an empty
   `DELETE` rollback leaves no partial writes across all participants.
 - **Partial outage on finalize.** Simulate one remote participant being unavailable during
-  commit/rollback and assert the chosen failure policy (fail-fast vs retry vs degrade) is
-  followed deterministically.
+  commit/rollback and assert the strict retry policy: the first finalize attempt fails, successful
+  participants are removed from the unresolved set, and retry after the partition heals finalizes
+  the remaining prepared participants.
 - **Replicated service participation.** Run a service with multiple live replicas (distinct hosts
   serving the same canonical component root), then execute a cross-service transaction which
   touches that service and verifies:
   - the leader/lock rules gate commit authority correctly,
-  - replicas converge after commit (or roll back after rollback) according to the cluster’s
-    majority correctness rule, and
-  - failure of a minority of replicas does not corrupt the committed state; lagging replicas
-    converge on restart via chain replication.
+  - replicas converge after commit (or roll back after rollback) according to the prepared
+    participant set, and
+  - temporary participant failure does not corrupt committed state; unresolved participants are
+    retried rather than silently pruned.
+
+Remaining storage-layer durability work:
+
+- **Recover staged txfs versions after process restart.** `LibraryStore` now stages directly by
+  the canonical TinyChain transaction ID (wrapped only for `freqfs::Name`/orphan-rule reasons).
+  Committed libraries hydrate correctly from the txfs-backed store, but in-flight prepared
+  versions still need a startup recovery policy which can discover pending txfs versions and
+  reconcile them with staged registry metadata.
+- **Recover staged install metadata after process restart.** `LibraryRegistry` now owns staged
+  install records and replication participants in one place, but those records are in memory. The
+  durable solution is to persist/recover staged registry metadata through the same library store
+  transaction record, not to add another replication tracker or JSON side table.
+- **Crash/restart integration tests.** Once txfs exposes recoverable pending versions, extend
+  `tests/live_replication_membership.rs` to cover primary restart after prepare and peer restart
+  after prepare. Until then, the live HTTP test covers real network partition and retry while
+  prepared hosts remain alive.
+
+Preliminary chain work for durable recovery:
+
+- **Port `SyncChain` before adding host recovery logic.** Recovery needs an append-only,
+  replayable record of prepared transactions, staged install metadata, and unresolved finalize
+  participants. Until `SyncChain` exists, keep restart recovery explicitly incomplete rather than
+  adding adapter-local JSON files, process-global maps, transaction side tables, or derived
+  transaction IDs.
+- **Use `BlockChain` for attested multi-host recovery.** `SyncChain` is enough for host-local
+  replay; `BlockChain` should add ordered, checkpointable, auditable records for replicated
+  clusters and cross-cluster convergence. Do not implement quorum-style transaction finalization
+  before that consensus/attestation layer exists.
+- **Construct chains from canonical component identity.** Chain construction should be
+  deterministic from the owning library/service manifest and canonical component root, using
+  shared URI builders rather than raw string concatenation. The host may choose where the chain is
+  stored under its `data_dir`, but the chain identity belongs to the component, not to an adapter,
+  HTTP endpoint, or client request.
+- **Keep chain records transaction-native.** A recovery record stores the original `TxnId`, the
+  component root, staged artifact references, prepared participant set, validated authority/claim
+  context needed to retry finalize, and a small status such as prepared, commit-pending,
+  rollback-pending, or finalized. It must not introduce `TxnVersionId`, sub-transactions, or a
+  second commit/rollback state machine.
+- **Replay through the same kernel path.** Startup recovery should hydrate committed libraries
+  from canonical txfs snapshots, replay unresolved chain records, rebuild the staged registry
+  entry for the same `TxnId`, then retry commit/rollback through the existing kernel finalize
+  path. If the record lacks enough authority or participant context to safely continue, fail
+  closed and leave the recovery item visible for operator intervention.
+- **Test the future port against failure boundaries.** Add crash/restart tests for primary
+  restart after prepare, peer restart after prepare, partial finalize followed by restart and
+  retry, membership change during recovery, and explicit rejection of any replay path that mints a
+  new transaction identity.
+
+### v1 simplicity audit: remaining transaction/cluster cleanup
+
+The transaction and replication model should stay as close as possible to the v1
+distributed-computing shape: one transaction identity, one prepared participant set,
+one finalize path, and no adapter-owned lifecycle controls. The current code has removed
+`TxnVersionId`, transaction side tables, synthetic read transactions, and quorum-style
+finalize shortcuts. The remaining cleanup is to trim unused or confusing entry points so
+future contributors cannot accidentally create a second code path.
+
+Cleanup status:
+
+- **Direct runtime install bypasses removed.** Installs now route through
+  `LibraryRegistry::{stage_compiled_package, install_compiled_package}` rather than mutating
+  `LibraryRuntime` storage/routes directly.
+- **Immediate install helpers are explicit.** `LibraryStore::{persist_schema_immediate,
+  persist_artifact_immediate}` are reserved for top-level bootstrap/import operations outside an
+  active kernel transaction; transactional installs use `stage_*` plus kernel finalize.
+- **Dead finalize helper removed.** Root-only finalize enforcement lives at the kernel/HTTP
+  boundary, not in the outbound RPC client.
+- **Clarify gateway boundaries.** Keep `RpcGateway` for application route execution under an
+  active transaction and `ClusterGateway` for peer discovery/export/install control-plane
+  actions, but ensure both share the same HTTP send/error utilities and that only the kernel
+  gateway appends/continues `txn_id`.
+- **Keep participant finalization separate from membership health.** Continue using the staged
+  registry transaction record as the source of truth for prepared participants; membership
+  pruning may affect future prepare fanout only, never an in-flight finalize set.
+- **Finalize failures are explicit.** Commit and rollback finalize hooks return errors instead of
+  logging and continuing, so unresolved participants keep the transaction visible for retry.
+- **Bootstrap reports are explicit.** Non-transactional peer bootstrap/reconcile returns a
+  structured `ReplicationReport` instead of relying on best-effort logs.
+- **Document participant continuation.** `TxnManager::interpret_request(Some(txn_id), owner, token)`
+  may create a local pending handle for the same inbound `txn_id` on a participant host. This is
+  transaction continuation, not a nested transaction, and must never allocate a different ID.
+- **Add regression tests for forbidden paths.** Cover: no `txn_id` in public client responses,
+  no synthetic transaction for committed library reads, no finalize to live membership instead of
+  prepared participants, and no commit/rollback success unless every prepared participant
+  eventually finalizes.
 
 ## 2. Transactional `/lib` installs
 
@@ -317,13 +407,14 @@ becomes visible after commit.
   }
   ```
   The install handler:
-  1. Reads `?txn_id=...` (or begins a transaction when omitted).
-  2. Streams the payload via destream, persisting artifacts to a txn-scoped store
+  1. Receives the kernel-owned transaction handle from `Kernel::route_request`.
+  2. Streams the payload via destream, persisting artifacts to a transaction-scoped store
      (e.g., `txn_tmp/{txn_id}/artifact-id`).
   3. Registers staged handlers in the `Dir`.
-  4. Returns `202 Accepted` plus the minted `txn_id`; caller finalizes later.
-- On `commit`, the owner moves artifacts into the permanent store and publishes the schema;
-  on `rollback`, it deletes the staged files and leaves the live directory untouched.
+  4. Returns the standard response; ordinary caller requests are finalized by the adapter before
+     the response is returned.
+- On kernel-owned `commit`, the owner moves artifacts into the permanent store and publishes the
+  schema; on `rollback`, it deletes the staged files and leaves the live directory untouched.
 - Extend the spec with a concrete manifest/example for WASM installs (showing the `routes[*].wasm_export`
   metadata) plus a documented CLI or script that compiles a TinyChain library to `.wasm`, embeds the
   manifest, and issues the `/lib` install request. This becomes the reference workflow for proprietary
@@ -332,15 +423,17 @@ becomes visible after commit.
 
 ## 3. Python + HTTP integration
 
-**Objective:** Client-visible tests prove the transactional contract.
+**Objective:** Client-visible tests prove the ergonomic contract while Rust host tests prove the
+internal transaction contract.
 
 - Add pytest cases that:
-  1. Install a library via `PUT /lib` (no `txn_id`), capture the minted `txn_id`, and assert
-     `GET /lib` without `txn_id` still returns the old schema while `GET /lib?txn_id=...` shows
-     staged changes.
-  2. Roll back and verify the new schema never appears.
-  3. Reinstall, commit, and verify `/lib` reflects the new schema plus the library’s routes.
-  4. Exercise error paths: double install in same txn, install after commit, etc.
+  1. Install a library via `tc.install(..., remote=tc.Host(...))` with no transaction parameters.
+  2. Verify the installed `/lib/...` route is visible after the call returns.
+  3. Verify route calls and generated browser URLs work without custom request parsing or status
+     wrappers.
+  4. Verify Python clients reject caller-supplied transaction controls.
+- Keep Rust host integration tests for internal staging/rollback/finalize behavior, including
+  explicit `txn_id` continuation used by the host-owned gateway and replication fanout.
 - Wire these tests into CI: stand up `tc-server` under Pytest (possibly via `uvicorn`-style
   harness), run the scenarios, and ensure they pass before merging.
 
@@ -394,11 +487,12 @@ Plan:
 
 We consider the transactional foundation “done” when:
 
-- `Kernel::dispatch` refuses to invoke handlers without a `Txn`, and HTTP clients can manage
-  txn lifecycle through the documented `?txn_id=...` query parameter and finalize verbs.
-- `/lib` installs are invisible outside their txn until commit.
+- `Kernel::dispatch` refuses to invoke handlers without a transaction, and only host-owned
+  gateways/replication fanout continue or finalize via the reserved `txn_id` wire parameter.
+- `/lib` installs are invisible outside their transaction until kernel-owned commit.
 - `cargo test --features http-server` runs the new integration tests successfully.
-- The Python test suite exercises begin/install/commit/rollback flows end-to-end.
+- The Python test suite exercises install/call flows end-to-end without exposing transaction
+  handles; Rust host tests exercise internal begin/continue/finalize/rollback flows.
 - The runtime enforces manifest-declared dependency edges for outbound calls, with parity across
   local dispatch and remote HTTP proxying.
 
@@ -410,7 +504,7 @@ We consider the transactional foundation “done” when:
 - Teach `TxnManager`/`TxnHandle` to retain the caller's `Claim` (parsed from control-plane tokens) so the WASM adapter can include it when constructing the serialized payload.
 - Add a Wasmtime-backed adapter that:
   - Loads a WASM binary whose manifest points to a `tc_library_entry` export describing the schema/routes.
-  - Maps each route to a WASM export (e.g., `/hello` → `hello`) and invokes it, passing pointers/lengths for the serialized transaction header + request body. Keep the `/lib` manifest layout aligned with existing TinyChain practice (`LibrarySchema` plus the `Library.__json__` body produced by the Python client): each method entry simply gains a `"wasm_export"` (or equivalent) field that names the exported function, so legacy clients continue to parse the manifest unmodified while the host gets the extra routing hint.
+  - Maps each route to a WASM export (e.g., `/hello` → `hello`) and invokes it, passing pointers/lengths for the serialized transaction header + request body. Keep the `/lib` manifest layout aligned with existing TinyChain practice (`LibrarySchema` plus the `Library.__json__` body produced by the Python client): each method entry includes a `"wasm_export"` (or equivalent) field that names the exported function, so every adapter reads the same manifest.
   - Requires each export to return a `destream`-encoded `State` envelope (matching the HTTP handler contract). On error, the payload carries a serialized `TCError`, so the host maps it back to the appropriate HTTP/PyO3 status code (authorization failure, bad request, etc.).
 - Update `tc-wasm` to expose helpers that deserialize the transaction payload into a type implementing `tc_ir::Transaction`, and refresh the example module to export `tc_library_entry` plus per-route functions that consume the serialized header/body.
 - Add integration tests that load the example WASM library under `tc-server`, exercise an authorized request, and confirm unauthorized requests fail both in the guest (via `Claim::allows`) and at the host boundary.

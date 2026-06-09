@@ -5,7 +5,7 @@ use tc_ir::{Claim, NetworkTime, TxnId};
 use umask::Mode;
 
 #[test]
-fn does_not_mint_bearer_token_for_anonymous_txn() {
+fn does_not_mint_bearer_token_for_unauthenticated_txn() {
     let manager = TxnManager::with_host_id("test-host");
     let handle = manager.begin();
 
@@ -86,7 +86,16 @@ fn unknown_txn_continuation_requires_authenticated_owner() {
     assert!(matches!(rejected, Err(TxnError::NotFound)));
 
     let accepted = manager.interpret_request(Some(unknown), Some("owner-a"), Some("token-a"));
-    assert!(matches!(accepted, Ok(TxnFlow::Begin(_))));
+    let handle = match accepted {
+        Ok(TxnFlow::Begin(handle)) => handle,
+        Ok(TxnFlow::Use(_)) => panic!("unknown participant txn must create a local continuation"),
+        Err(err) => panic!("authenticated continuation rejected: {err:?}"),
+    };
+    assert_eq!(
+        handle.id(),
+        unknown,
+        "participant continuation must reuse the inbound txn ID"
+    );
 }
 
 #[test]

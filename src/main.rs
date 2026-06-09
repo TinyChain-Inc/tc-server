@@ -24,10 +24,10 @@ use tinychain::http::{
 };
 use tinychain::kernel::KernelHandler;
 use tinychain::replication::{
-    PeerMembership, PeerRoutes, ReplicatedTxnTracker, ReplicationIssuer, announce_self_to_cluster,
-    export_handler, is_peer_membership_path, live_replicating_finalize_hook,
-    live_replicating_install_put_handler, parse_psk_keys, parse_psk_list, peer_membership_handler,
-    replicate_from_peers, replication_token_handler,
+    PeerMembership, PeerRoutes, ReplicationIssuer, announce_self_to_cluster, export_handler,
+    is_peer_membership_path, live_replicating_finalize_hook, live_replicating_install_put_handler,
+    parse_psk_keys, parse_psk_list, peer_membership_handler, replicate_from_peers,
+    replication_token_handler,
 };
 
 const DEFAULT_BIND: &str = "0.0.0.0:8702";
@@ -367,7 +367,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let replication_actor_id_for_kernel = replication_actor_id.clone();
     let peer_routes_for_kernel = peer_routes.clone();
     let keys_for_kernel = keys.clone();
-    let tracker_for_kernel = ReplicatedTxnTracker::default();
     let (kernel, registry) = build_http_kernel_and_registry_with_config_and_builder(
         kernel_config,
         ok_handler(),
@@ -395,12 +394,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 registry.clone(),
                 membership_for_kernel.clone(),
                 keys_for_kernel.clone(),
-                tracker_for_kernel.clone(),
             );
-            let finalize_hook = live_replicating_finalize_hook(
-                membership_for_kernel.clone(),
-                tracker_for_kernel.clone(),
-            );
+            let finalize_hook = live_replicating_finalize_hook(registry.clone());
 
             builder
                 .with_kernel_handler(host_handler)
@@ -421,13 +416,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_issuer = issuer.clone();
     tokio::spawn(async move {
         if bootstrap_replicate && !bootstrap_peers.is_empty() {
-            replicate_from_peers(&bootstrap_registry, &bootstrap_peers, &bootstrap_keys).await;
+            let report =
+                replicate_from_peers(&bootstrap_registry, &bootstrap_peers, &bootstrap_keys).await;
+            if !report.is_clean() {
+                eprintln!("replication bootstrap completed with partial failures: {report:?}");
+            }
         }
 
         if let Some(self_peer) = bootstrap_self_peer {
             match bootstrap_issuer.self_identity(self_peer) {
                 Ok(identity) => {
-                    announce_self_to_cluster(
+                    let report = announce_self_to_cluster(
                         &bootstrap_membership,
                         &identity,
                         &bootstrap_routes,
@@ -435,6 +434,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &bootstrap_issuer,
                     )
                     .await;
+                    if !report.failed.is_empty() {
+                        eprintln!("cluster join completed with partial failures: {report:?}");
+                    }
                 }
                 Err(err) => eprintln!("failed to build replication identity: {err}"),
             }
@@ -819,7 +821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trusted_installer_verifier_rejects_opaque_anonymous_tokens() {
+    async fn trusted_installer_verifier_rejects_opaque_unauthenticated_tokens() {
         let policy =
             TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
         let verifier = TrustedInstallerTokenVerifier::new(
@@ -829,7 +831,9 @@ mod tests {
             "replication:local".to_string(),
         );
 
-        let result = verifier.verify("anonymous-session-token".to_string()).await;
+        let result = verifier
+            .verify("unauthenticated-session-token".to_string())
+            .await;
         assert!(matches!(
             result,
             Err(tinychain::txn::TxnError::Unauthorized)

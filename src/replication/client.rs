@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::str::FromStr;
-use std::time::Duration;
 
-use hyper::body::to_bytes;
-use hyper::{Body, Request, Response, StatusCode};
+use bytes::Bytes;
+use hyper::{Body, Request, StatusCode};
 use number_general::Number;
 use pathlink::Link;
 use tc_error::{TCError, TCResult};
@@ -19,9 +18,8 @@ use super::crypto::{
     decode_encrypted_payload, decrypt_token_with_key, encode_encrypted_payload,
     encrypt_path_with_key,
 };
+use super::gateway::ClusterGateway;
 use super::{FORWARDED_HEADER, LIBRARY_EXPORT_PATH, PeerIdentity, PeerRoutes, TOKEN_PATH};
-
-const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Default)]
 pub struct PeerClusterListing {
@@ -29,19 +27,66 @@ pub struct PeerClusterListing {
     pub identities: Vec<PeerIdentity>,
 }
 
-async fn send_peer_request(req: Request<Body>) -> TCResult<Response<Body>> {
-    let client = hyper::Client::new();
-    let response = tokio::time::timeout(PEER_REQUEST_TIMEOUT, client.request(req))
-        .await
-        .map_err(|_| {
-            TCError::bad_gateway(format!(
-                "peer request timed out after {}s",
-                PEER_REQUEST_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HttpClusterGateway;
 
-    Ok(response)
+#[async_trait::async_trait]
+impl ClusterGateway for HttpClusterGateway {
+    async fn discover_library_paths(&self, peer: &str) -> TCResult<Vec<String>> {
+        discover_library_paths(peer).await
+    }
+
+    async fn request_replication_token(
+        &self,
+        peer: &str,
+        path: &str,
+        keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+    ) -> TCResult<String> {
+        request_replication_token(peer, path, keys).await
+    }
+
+    async fn fetch_compiled_library_package(
+        &self,
+        peer: &str,
+        token: &str,
+    ) -> TCResult<Option<CompiledLibraryPackage>> {
+        fetch_compiled_library_package(peer, token).await
+    }
+
+    async fn register_with_peer(
+        &self,
+        seed: &str,
+        joiner: &PeerIdentity,
+        routes: &PeerRoutes,
+        keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+    ) -> TCResult<PeerClusterListing> {
+        register_with_peer(seed, joiner, routes, keys).await
+    }
+
+    async fn push_install_compiled_package(
+        &self,
+        peer: &str,
+        token: &str,
+        txn_id: TxnId,
+        payload: Vec<u8>,
+    ) -> TCResult<()> {
+        push_install_compiled_package(peer, token, txn_id, payload).await
+    }
+
+    async fn finalize_install_txn(
+        &self,
+        peer: &str,
+        token: &str,
+        txn_id: TxnId,
+        commit: bool,
+    ) -> TCResult<()> {
+        finalize_install_txn(peer, token, txn_id, commit).await
+    }
+}
+
+async fn send_peer_request(req: Request<Body>) -> TCResult<(StatusCode, Bytes)> {
+    let client = hyper::Client::new();
+    crate::outbound_http::send(&client, req, crate::outbound_http::DEFAULT_TIMEOUT).await
 }
 
 pub async fn fetch_compiled_library_package(
@@ -52,20 +97,16 @@ pub async fn fetch_compiled_library_package(
     url.set_path(LIBRARY_EXPORT_PATH);
 
     let req = build_export_request(url, token)?;
-    let response = send_peer_request(req).await?;
+    let (status, body_bytes) = send_peer_request(req).await?;
 
-    if response.status() == StatusCode::NOT_FOUND {
+    if status == StatusCode::NOT_FOUND {
         return Ok(None);
     }
 
-    let status = response.status();
-    let body_bytes = to_bytes(response.into_body())
-        .await
-        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
-
     if !status.is_success() {
         return Err(TCError::bad_gateway(format!(
-            "peer {peer} export failed with status {status}"
+            "peer {peer} export failed with status {status}: {}",
+            String::from_utf8_lossy(&body_bytes)
         )));
     }
 
@@ -84,16 +125,12 @@ pub async fn fetch_library_schema(peer: &str, path: &str) -> TCResult<tc_ir::Lib
         .body(Body::empty())
         .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-    let response = send_peer_request(req).await?;
-
-    let status = response.status();
-    let body_bytes = to_bytes(response.into_body())
-        .await
-        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+    let (status, body_bytes) = send_peer_request(req).await?;
 
     if !status.is_success() {
         return Err(TCError::bad_gateway(format!(
-            "peer {peer} schema request failed with status {status}"
+            "peer {peer} schema request failed with status {status}: {}",
+            String::from_utf8_lossy(&body_bytes)
         )));
     }
 
@@ -110,16 +147,12 @@ pub async fn fetch_library_listing(peer: &str, path: &str) -> TCResult<tc_ir::Ma
         .body(Body::empty())
         .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-    let response = send_peer_request(req).await?;
-
-    let status = response.status();
-    let body_bytes = to_bytes(response.into_body())
-        .await
-        .map_err(|err| TCError::bad_gateway(err.to_string()))?;
+    let (status, body_bytes) = send_peer_request(req).await?;
 
     if !status.is_success() {
         return Err(TCError::bad_gateway(format!(
-            "peer {peer} listing request failed with status {status}"
+            "peer {peer} listing request failed with status {status}: {}",
+            String::from_utf8_lossy(&body_bytes)
         )));
     }
 
@@ -174,14 +207,9 @@ pub async fn request_replication_token(
                     .body(Body::from(body))
                     .map_err(|err| format!("key[{idx}] invalid request: {err}"))?;
 
-                let response = send_peer_request(req)
+                let (status, body_bytes) = send_peer_request(req)
                     .await
                     .map_err(|err| format!("key[{idx}] request failed: {err}"))?;
-
-                let status = response.status();
-                let body_bytes = to_bytes(response.into_body())
-                    .await
-                    .map_err(|err| format!("key[{idx}] response body read failed: {err}"))?;
 
                 if !status.is_success() {
                     let message = String::from_utf8_lossy(&body_bytes);
@@ -299,28 +327,25 @@ pub(crate) async fn push_install_compiled_package(
 ) -> TCResult<()> {
     let mut url = peer_to_url(peer)?;
     url.set_path(crate::uri::LIB_ROOT);
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("txn_id", &txn_id.to_string());
-    }
+    let url = crate::uri::append_kernel_txn_id(&mut url, txn_id)?;
 
     let req = Request::builder()
         .method("PUT")
-        .uri(url.as_str())
+        .uri(url)
         .header(hyper::header::AUTHORIZATION, format!("Bearer {token}"))
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .header(FORWARDED_HEADER, "1")
         .body(Body::from(payload))
         .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-    let response = send_peer_request(req).await?;
+    let (status, body) = send_peer_request(req).await?;
 
-    if response.status().is_success() {
+    if status.is_success() {
         Ok(())
     } else {
         Err(TCError::bad_gateway(format!(
-            "peer {peer} install failed with status {}",
-            response.status()
+            "peer {peer} install failed with status {status}: {}",
+            String::from_utf8_lossy(&body)
         )))
     }
 }
@@ -333,26 +358,23 @@ pub(crate) async fn finalize_install_txn(
 ) -> TCResult<()> {
     let mut url = peer_to_url(peer)?;
     url.set_path(crate::uri::LIB_ROOT);
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("txn_id", &txn_id.to_string());
-    }
+    let url = crate::uri::append_kernel_txn_id(&mut url, txn_id)?;
 
     let method = if commit { "POST" } else { "DELETE" };
     let req = Request::builder()
         .method(method)
-        .uri(url.as_str())
+        .uri(url)
         .header(hyper::header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-    let response = send_peer_request(req).await?;
-    if response.status().is_success() {
+    let (status, body) = send_peer_request(req).await?;
+    if status.is_success() {
         Ok(())
     } else {
         Err(TCError::bad_gateway(format!(
-            "peer {peer} finalize failed with status {}",
-            response.status()
+            "peer {peer} finalize failed with status {status}: {}",
+            String::from_utf8_lossy(&body)
         )))
     }
 }
@@ -402,17 +424,13 @@ async fn post_encrypted_peer_action(
                     .body(Body::from(body))
                     .map_err(|err| format!("key[{idx}] invalid request: {err}"))?;
 
-                let response = send_peer_request(req)
+                let (status, body) = send_peer_request(req)
                     .await
                     .map_err(|err| format!("key[{idx}] request failed: {err}"))?;
-                if response.status().is_success() {
+                if status.is_success() {
                     return Ok(Some(()));
                 }
 
-                let status = response.status();
-                let body = to_bytes(response.into_body())
-                    .await
-                    .map_err(|err| format!("key[{idx}] response body read failed: {err}"))?;
                 let message = String::from_utf8_lossy(&body);
                 Err(format!("key[{idx}] status {status}: {message}"))
             }
@@ -456,13 +474,9 @@ async fn post_encrypted_peer_action_with_listing(
                     .body(Body::from(body))
                     .map_err(|err| format!("key[{idx}] invalid request: {err}"))?;
 
-                let response = send_peer_request(req)
+                let (status, body) = send_peer_request(req)
                     .await
                     .map_err(|err| format!("key[{idx}] request failed: {err}"))?;
-                let status = response.status();
-                let body = to_bytes(response.into_body())
-                    .await
-                    .map_err(|err| format!("key[{idx}] response body read failed: {err}"))?;
 
                 if !status.is_success() {
                     let message = String::from_utf8_lossy(&body);

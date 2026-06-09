@@ -132,20 +132,6 @@ impl TxnHandle {
         }
     }
 
-    pub(crate) fn without_bearer_token(&self) -> Self {
-        Self {
-            id: self.id,
-            claim: self.claim.clone(),
-            claims: self.claims.clone(),
-            owner_id: self.owner_id.clone(),
-            bearer_token: None,
-            resolver: self.resolver.clone(),
-            ttl: self.ttl,
-            token: self.token.clone(),
-            auth_context: self.auth_context.clone(),
-        }
-    }
-
     pub fn header(&self) -> TxnHeader {
         TxnHeader::new(self.id, self.id.timestamp(), self.claim.clone())
     }

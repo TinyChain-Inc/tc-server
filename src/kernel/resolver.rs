@@ -287,7 +287,7 @@ impl KernelTxnResolver {
 
         let outbound_txn = match bearer_token {
             Some(token) => txn.with_bearer_token(token),
-            None => txn.without_bearer_token(),
+            None => txn.clone(),
         };
         Ok((resolved, outbound_txn))
     }

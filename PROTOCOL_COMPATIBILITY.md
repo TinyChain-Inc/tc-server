@@ -4,7 +4,11 @@ This note explains how to stand up a TinyChain-compatible server (or custom adap
 
 ## Compatibility targets
 
-- **HTTP semantics:** Match the v1 API shapes documented at docs.tinychain.net (`txn_id` query parameter, `/state/...` paths, `/lib` installer shape, root-only empty-body commit/rollback). The v1 GitBook remains the authoritative description of these verbs and resource layouts.
+- **HTTP semantics:** Match the v1 wire shapes documented at docs.tinychain.net (`txn_id`
+  query parameter, `/state/...` paths, `/lib` installer shape, root-only empty-body
+  commit/rollback) while keeping transaction lifecycle control inside the host/kernel. Public
+  clients call routes and provide auth; they do not mint, continue, commit, or roll back
+  transactions directly.
 - **IR contract:** Route inbound requests into `tc-ir` handlers so the same capability manifests and IR types are exercised regardless of transport.
 - **Transaction + auth surface:** Preserve the `txn_id` lifecycle and capability masks; adapters only translate protocol details and defer begin/commit/rollback to the shared kernel (`Kernel::route_request`).
 
@@ -47,8 +51,9 @@ touches additional components.
   requests uniformly across adapters.
 - **Adapter-owned default transactions.** When a request omits `?txn_id=...`, the adapter begins a
   transaction, executes the handler, and finalizes it before returning. The transaction ID is not
-  exposed in response headers; proxies must not be part of the transaction protocol. Callers only
-  use `?txn_id=...` when intentionally continuing an explicit transaction.
+  exposed in response headers; proxies must not be part of the transaction protocol. Public
+  clients never supply `?txn_id=...`; only host-owned gateways, replication fanout, and internal
+  test harnesses may continue/finalize an existing transaction.
 - **Transaction ownership is pinned.** For any active `txn_id`, the kernel rejects requests whose
   `Authorization: Bearer ...` token does not resolve to the same owner identity which began the
   transaction. Additionally, the kernel only accepts a previously-unseen `?txn_id=...` when a
@@ -62,7 +67,9 @@ touches additional components.
   owner claim.
 - **Transaction-owned HTTP egress.** When routing a request to a remote host, the transaction
   context constructs outbound HTTP requests via its shared gateway so `?txn_id=...` and
-  `Authorization: Bearer ...` propagation is implemented once (not duplicated in adapters).
+  `Authorization: Bearer ...` propagation is kernel-owned (not duplicated in public clients or
+  adapters). Replication fanout uses the same reserved `txn_id` construction helper and remains a
+  host-internal path.
 - **Transaction-owned token verification/chaining hooks.** Adapters treat the bearer token as
   opaque and forward it into the kernel. The transaction resolver resolves a stable owner identity
   via its configured `TokenVerifier` and uses the same hook to extend/chains tokens for outbound
@@ -79,26 +86,35 @@ touches additional components.
   the transaction token with the minimal claim required for that component and mode. As the
   transaction touches more components, the token accumulates one claim per participating
   library/service so downstream hosts can verify the full authorization chain.
-- **Remote calls preserve txn context.** Outbound requests include the existing `txn_id` and the
-  current chained token, so the remote host participates in the same transaction context rather
-  than starting a new one.
+- **Remote calls preserve txn context.** Outbound host-owned requests include the existing
+  `txn_id` and the current chained token, so the remote host participates in the same transaction
+  context rather than starting a new one.
 - **Host endpoints are non-transactional.** `/host/...` and `/healthz` routes do not begin,
   continue, or finalize transactions. They may receive a `txn_id` query parameter (because the
   kernel always propagates it for RPC), but the host handler ignores it.
 
 ## Cluster replication, correctness, and restart convergence
 
-TinyChain does not define a “repair” protocol. Correctness is determined by the cluster’s
-replication rules:
+Live install replication uses strict prepared-participant semantics:
 
-- **Majority correctness.** For a given transaction, the version replicated across at least half
-  of a cluster’s hosts is considered the correct version for that transaction’s outcome.
-- **Restart convergence.** Hosts which missed the correct version converge on restart:
-  - `SyncChain` replicas replicate directly from the correct version.
-  - `BlockChain` replicas converge by backtracking to a correct prefix and replaying forward.
+- **Prepared participant set.** During prepare/install, the kernel records the peers which
+  successfully staged the transaction on the staged library transaction record itself.
+- **Finalize all prepared participants.** Commit or rollback targets that fixed participant set.
+  Live replica membership changes do not redefine transaction success.
+- **Retry unresolved participants.** If a finalize attempt reaches some participants but not
+  others, the staged transaction retains only the unresolved participants so the same transaction
+  can be retried after a temporary partition heals.
+- **No implicit quorum shortcut.** A 49% or 51% participant failure both fail closed unless every
+  prepared participant eventually finalizes. Majority commit semantics require a real consensus log
+  and are intentionally not inferred by the HTTP replication fanout layer.
+- **Restart convergence.** Committed libraries hydrate from the txfs-backed library store on
+  restart. Storage now stages directly by the canonical TinyChain transaction ID. Recovery of
+  in-flight prepared transactions still requires staged registry metadata recovery; until that
+  storage-layer work lands, the tested guarantee is retry across network partitions while the
+  preparing hosts remain alive.
 
-These semantics bound failure recovery to restart-time replication rather than an online repair
-workflow.
+Replica health/discovery remains separate from transaction finalization. Health checks may prune
+stale peers, but finalization must never prune the transaction’s prepared participant set.
 
 ## Participant discovery and canonicalization
 
@@ -174,7 +190,9 @@ must match the URI segments exactly so HTTP, PyO3, and future adapters stay alig
 ## Fastest paths to a bespoke server
 
 1. **Reuse the kernel, swap the transport.** Instantiate the reference kernel via `tc_server::http::build_http_kernel_with_config` (or the config-free builder) and mount it behind your own HTTP/gRPC/serverless adapter. Your adapter should:
-   - Parse the same transaction cues as the v1 HTTP protocol (`?txn_id=...`, and root-only empty POST/DELETE for finalize) and attach them to the request extensions.
+   - Parse the same transaction cues as the v1 HTTP wire protocol (`?txn_id=...`, and root-only
+     empty POST/DELETE for finalize) and attach them to the request extensions. Do not expose
+     helpers which ask application clients to construct those cues.
    - Translate HTTP-style verbs/paths into the `Route` + `State` types expected by `Kernel::route_request`.
    - Map `TCError` categories back to protocol status codes consistent with docs.tinychain.net.
 2. **Use `tc-server` as a minimal kernel crate.** When you want the TinyChain router primitives without the built-in HTTP/PyO3/WASM adapters, depend on `tc-server` with `default-features = false`. This exposes `Dir`, `Route`, `Handler`, `Transaction`, `Kernel`, and the `TxnManager`/`TxnHandle` pair while skipping optional transports. Re-enable adapters explicitly via `features = ["http-server"]`, `features = ["pyo3"]`, or `features = ["wasm"]` as needed for your embedding.

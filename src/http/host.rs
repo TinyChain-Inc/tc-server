@@ -73,7 +73,6 @@ pub fn host_handler_with_public_keys(
                         .collect::<Vec<_>>();
                     let payload = serde_json::json!({
                         "principal": auth.principal,
-                        "txn_id": txn.id().to_string(),
                         "txn_timestamp_nanos": txn.id().timestamp().as_nanos(),
                         "token_verified_at_nanos": auth.verified_at_nanos,
                         "token_hosts": auth.token_hosts(),
