@@ -13,7 +13,7 @@ use tc_state::{State, null_transaction};
 use tc_value::Value;
 use url::Url;
 
-use crate::library::{InstallArtifacts, InstallRequest, decode_install_request_bytes};
+use crate::library::{CompiledLibraryPackage, decode_compiled_library_package};
 
 use super::crypto::{
     decode_encrypted_payload, decrypt_token_with_key, encode_encrypted_payload,
@@ -44,7 +44,10 @@ async fn send_peer_request(req: Request<Body>) -> TCResult<Response<Body>> {
     Ok(response)
 }
 
-pub async fn fetch_library_export(peer: &str, token: &str) -> TCResult<Option<InstallArtifacts>> {
+pub async fn fetch_compiled_library_package(
+    peer: &str,
+    token: &str,
+) -> TCResult<Option<CompiledLibraryPackage>> {
     let mut url = peer_to_url(peer)?;
     url.set_path(LIBRARY_EXPORT_PATH);
 
@@ -66,13 +69,9 @@ pub async fn fetch_library_export(peer: &str, token: &str) -> TCResult<Option<In
         )));
     }
 
-    let request = decode_install_request_bytes(&body_bytes)
+    let payload = decode_compiled_library_package(&body_bytes)
         .map_err(|err| TCError::bad_gateway(err.message().to_string()))?;
-
-    match request {
-        InstallRequest::WithArtifacts(payload) => Ok(Some(payload)),
-        InstallRequest::SchemaOnly(_) => Ok(None),
-    }
+    Ok(Some(payload))
 }
 
 pub async fn fetch_library_schema(peer: &str, path: &str) -> TCResult<tc_ir::LibrarySchema> {
@@ -292,7 +291,7 @@ pub async fn list_peer_cluster(
     .await
 }
 
-pub(crate) async fn push_install_payload(
+pub(crate) async fn push_install_compiled_package(
     peer: &str,
     token: &str,
     txn_id: TxnId,

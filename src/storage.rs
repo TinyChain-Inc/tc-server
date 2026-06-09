@@ -533,9 +533,8 @@ fn map_txfs(err: txfs::Error) -> TCError {
     TCError::internal(err.to_string())
 }
 
-// Schema payloads are tiny (tens of bytes) and must already be buffered so we can
-// distinguish between schema-only installs and schema+artifact payloads. Using
-// `serde_json` here avoids spinning up nested async executors inside adapters.
+// Stored schema payloads are tiny (tens of bytes) and bounded. Using `serde_json`
+// here avoids spinning up nested async executors inside storage/bootstrap adapters.
 pub fn decode_schema_bytes(bytes: &[u8]) -> Result<LibrarySchema, String> {
     let parsed: RawSchema =
         serde_json::from_slice(bytes).map_err(|err| format!("invalid schema json: {err}"))?;

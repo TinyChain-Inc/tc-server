@@ -6,7 +6,7 @@ use futures::FutureExt;
 use hyper::{Body, Request, StatusCode};
 
 use crate::KernelHandler;
-use crate::library::{LibraryRegistry, encode_install_payload_bytes};
+use crate::library::{LibraryRegistry, encode_compiled_library_package};
 use crate::txn::TxnHandle;
 
 use super::crypto::{encode_encrypted_payload, encrypt_token_with_key};
@@ -74,7 +74,7 @@ pub fn export_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
                 return text_response(StatusCode::UNAUTHORIZED, "missing transaction context");
             };
 
-            let payload = match registry.export_payload_for_claims(txn).await {
+            let payload = match registry.export_compiled_package_for_claims(txn).await {
                 Ok(Some(payload)) => payload,
                 Ok(None) => return empty_response(StatusCode::NOT_FOUND),
                 Err(err) if err.code() == tc_error::ErrorKind::Unauthorized => {
@@ -83,7 +83,7 @@ pub fn export_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
                 Err(err) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, err),
             };
 
-            let bytes = match encode_install_payload_bytes(&payload) {
+            let bytes = match encode_compiled_library_package(&payload) {
                 Ok(bytes) => bytes,
                 Err(err) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, err),
             };

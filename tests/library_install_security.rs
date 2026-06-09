@@ -12,28 +12,27 @@ use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
 use tinychain::library::LibraryRegistry;
+use tinychain::library::default_library_schema;
 use tinychain::library::http::{build_http_library_module, http_library_handlers};
-use tinychain::library::{InstallArtifacts, default_library_schema, encode_install_payload_bytes};
 use tinychain::replication::{
     ReplicationIssuer, export_handler, parse_psk_keys, replicate_from_peers,
     replication_token_handler,
 };
-use tinychain::storage::Artifact;
 use umask::{USER_READ, USER_WRITE};
 
 mod support;
 
 use support::{
     begin_transaction, combine_host_handlers, finalize_install, get_library_status,
-    put_install_payload, token_for_schema, token_for_schema_and_txn,
+    put_library_definition, token_for_schema, token_for_schema_and_txn,
 };
 
 #[tokio::test]
 async fn install_rejects_missing_token() {
     let schema = sample_schema("/lib/example-devco/alpha/0.1.0");
     let server = start_server("missing-token").await;
-    let payload = install_payload_for_schema(&schema, ir_bytes_for_schema(&schema));
-    let response = put_install_payload(server.addr, None, payload, None).await;
+    let definition = library_definition_for_schema(&schema);
+    let response = put_library_definition(server.addr, None, definition, None).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -43,20 +42,9 @@ async fn install_rejects_wrong_scope_token() {
     let wrong_schema = sample_schema("/lib/example-devco/beta/0.1.0");
     let server = start_server("wrong-scope").await;
     let token = token_for_schema(&server.actor, &wrong_schema, USER_WRITE);
-    let payload = install_payload_for_schema(&schema, ir_bytes_for_schema(&schema));
-    let response = put_install_payload(server.addr, Some(token), payload, None).await;
+    let definition = library_definition_for_schema(&schema);
+    let response = put_library_definition(server.addr, Some(token), definition, None).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn install_rejects_mismatched_manifest() {
-    let schema = sample_schema("/lib/example-devco/alpha/0.1.0");
-    let mismatched_schema = sample_schema("/lib/example-devco/beta/0.1.0");
-    let server = start_server("manifest-mismatch").await;
-    let token = token_for_schema(&server.actor, &schema, USER_WRITE);
-    let payload = install_payload_for_schema(&schema, ir_bytes_for_schema(&mismatched_schema));
-    let response = put_install_payload(server.addr, Some(token), payload, None).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -64,8 +52,8 @@ async fn install_rejects_read_only_token() {
     let schema = sample_schema("/lib/example-devco/alpha/0.1.0");
     let server = start_server("read-only").await;
     let token = token_for_schema(&server.actor, &schema, USER_READ);
-    let payload = install_payload_for_schema(&schema, ir_bytes_for_schema(&schema));
-    let response = put_install_payload(server.addr, Some(token), payload, None).await;
+    let definition = library_definition_for_schema(&schema);
+    let response = put_library_definition(server.addr, Some(token), definition, None).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -89,11 +77,11 @@ async fn install_rejects_txn_hijack_by_different_authorized_actor() {
 
     // Attacker has a valid signer + write claim for the same schema, but does not own this txn.
     let attacker_token = token_for_schema_and_txn(&attacker_actor, &schema, USER_WRITE, txn_id);
-    let payload = install_payload_for_schema(&schema, ir_bytes_for_schema(&schema));
-    let hijack_put = put_install_payload(
+    let definition = library_definition_for_schema(&schema);
+    let hijack_put = put_library_definition(
         server.addr,
         Some(attacker_token.clone()),
-        payload.clone(),
+        definition.clone(),
         Some(txn_id),
     )
     .await;
@@ -103,10 +91,10 @@ async fn install_rejects_txn_hijack_by_different_authorized_actor() {
     assert_eq!(hijack_finalize.status(), StatusCode::UNAUTHORIZED);
 
     let owner_token = token_for_schema_and_txn(&server.actor, &schema, USER_WRITE, txn_id);
-    let owner_put = put_install_payload(
+    let owner_put = put_library_definition(
         server.addr,
         Some(owner_token.clone()),
-        payload,
+        definition,
         Some(txn_id),
     )
     .await;
@@ -276,34 +264,13 @@ fn sample_schema(id: &str) -> LibrarySchema {
     LibrarySchema::new(Link::from_str(id).expect("schema link"), "0.1.0", vec![])
 }
 
-fn ir_bytes_for_schema(schema: &LibrarySchema) -> Vec<u8> {
+fn library_definition_for_schema(schema: &LibrarySchema) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
-        "schema": {
-            "id": schema.id().to_string(),
-            "version": schema.version(),
-            "dependencies": [],
-        },
-        "routes": [
-            {
-                "path": "/ok",
-                "value": { "ok": true }
-            }
-        ]
+        schema.id().to_string(): {
+            "ok": { "ok": true }
+        }
     }))
-    .expect("ir manifest bytes")
-}
-
-fn install_payload_for_schema(schema: &LibrarySchema, artifact_bytes: Vec<u8>) -> Vec<u8> {
-    let artifacts = vec![Artifact {
-        path: schema.id().to_string(),
-        content_type: tinychain::ir::IR_ARTIFACT_CONTENT_TYPE.to_string(),
-        bytes: artifact_bytes,
-    }];
-    let payload = InstallArtifacts {
-        schema: schema.clone(),
-        artifacts,
-    };
-    encode_install_payload_bytes(&payload).expect("install payload bytes")
+    .expect("library definition bytes")
 }
 
 fn shared_replication_keys() -> Vec<aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>> {
@@ -447,9 +414,9 @@ async fn install_library_with_write_token(server: &RunningServer, schema: &Libra
     let begin_token = token_for_schema(&server.actor, schema, USER_WRITE);
     let txn_id = begin_transaction(server.addr, begin_token).await;
     let token = token_for_schema_and_txn(&server.actor, schema, USER_WRITE, txn_id);
-    let payload = install_payload_for_schema(schema, ir_bytes_for_schema(schema));
+    let definition = library_definition_for_schema(schema);
     let response =
-        put_install_payload(server.addr, Some(token.clone()), payload, Some(txn_id)).await;
+        put_library_definition(server.addr, Some(token.clone()), definition, Some(txn_id)).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let commit = finalize_install(server.addr, &token, txn_id, true).await;
     assert_eq!(commit.status(), StatusCode::NO_CONTENT);

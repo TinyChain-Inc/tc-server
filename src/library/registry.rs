@@ -13,7 +13,7 @@ use crate::{
 };
 
 use super::LibraryFactory;
-use super::install::{InstallArtifacts, InstallError, InstallRequest};
+use super::install::{CompiledLibraryPackage, InstallError};
 use super::runtime::LibraryRuntime;
 use super::util::{canonical_link, is_path_prefix, normalize_path, schemas_equivalent};
 use super::{HandlerArc, SchemaRoutes};
@@ -35,9 +35,6 @@ struct StagedInstall {
 
 #[derive(Clone)]
 enum PreparedInstall {
-    Schema {
-        schema: LibrarySchema,
-    },
     Payload {
         schema: LibrarySchema,
         routes: SchemaRoutes,
@@ -176,52 +173,44 @@ impl LibraryRegistry {
     }
 
     pub async fn install_schema(&self, schema: LibrarySchema) -> Result<(), InstallError> {
-        let prepared = self.prepare_schema_install(schema).await?;
-        self.apply_prepared_install(&prepared).await
+        if let Some(store) = self.store.as_ref() {
+            let store = store
+                .for_schema(&schema)
+                .await
+                .map_err(|err| InstallError::internal(err.to_string()))?;
+            store
+                .persist_schema(&schema)
+                .await
+                .map_err(|err| InstallError::internal(err.to_string()))?;
+        }
+
+        self.insert_schema(schema)
+            .await
+            .map_err(|err| InstallError::internal(err.to_string()))
     }
 
-    pub async fn install_payload(&self, payload: InstallArtifacts) -> Result<(), InstallError> {
-        let prepared = self.prepare_payload_install(payload).await?;
+    pub async fn install_compiled_package(
+        &self,
+        payload: CompiledLibraryPackage,
+    ) -> Result<(), InstallError> {
+        let prepared = self.prepare_compiled_package(payload).await?;
         self.apply_prepared_install(&prepared).await
     }
 
     pub async fn stage_install_request(
         &self,
         txn_id: TxnId,
-        request: InstallRequest,
+        payload: CompiledLibraryPackage,
     ) -> Result<String, InstallError> {
-        match request {
-            InstallRequest::SchemaOnly(schema) => self.stage_install_schema(txn_id, schema).await,
-            InstallRequest::WithArtifacts(payload) => {
-                self.stage_install_payload(txn_id, payload).await
-            }
-        }
+        self.stage_compiled_package(txn_id, payload).await
     }
 
-    pub async fn stage_install_schema(
+    pub async fn stage_compiled_package(
         &self,
         txn_id: TxnId,
-        schema: LibrarySchema,
+        payload: CompiledLibraryPackage,
     ) -> Result<String, InstallError> {
-        let prepared = self.prepare_schema_install(schema).await?;
-        if let Err(err) = self.stage_prepared_storage(txn_id, &prepared).await {
-            if let Some(store) = prepared.runtime.store.as_ref() {
-                let _ = store.finalize_txn(txn_id, false).await;
-            }
-            return Err(err);
-        }
-
-        let schema_path = prepared.schema_path.clone();
-        self.record_staged_install(txn_id, prepared);
-        Ok(schema_path)
-    }
-
-    pub async fn stage_install_payload(
-        &self,
-        txn_id: TxnId,
-        payload: InstallArtifacts,
-    ) -> Result<String, InstallError> {
-        let prepared = self.prepare_payload_install(payload).await?;
+        let prepared = self.prepare_compiled_package(payload).await?;
         if let Err(err) = self.stage_prepared_storage(txn_id, &prepared).await {
             if let Some(store) = prepared.runtime.store.as_ref() {
                 let _ = store.finalize_txn(txn_id, false).await;
@@ -287,10 +276,10 @@ impl LibraryRegistry {
         Ok(())
     }
 
-    pub async fn export_payload_for_claims(
+    pub async fn export_compiled_package_for_claims(
         &self,
         txn: &TxnHandle,
-    ) -> Result<Option<InstallArtifacts>, TCError> {
+    ) -> Result<Option<CompiledLibraryPackage>, TCError> {
         let runtimes = {
             let entries = self.entries.read().expect("library registry read lock");
             entries.values().cloned().collect::<Vec<_>>()
@@ -313,7 +302,7 @@ impl LibraryRegistry {
                     bytes: artifact.bytes,
                 }];
 
-                return Ok(Some(InstallArtifacts { schema, artifacts }));
+                return Ok(Some(CompiledLibraryPackage { schema, artifacts }));
             }
         }
 
@@ -349,26 +338,9 @@ impl LibraryRegistry {
         txn.push(install);
     }
 
-    async fn prepare_schema_install(
+    async fn prepare_compiled_package(
         &self,
-        schema: LibrarySchema,
-    ) -> Result<StagedInstall, InstallError> {
-        let schema_path = schema.id().to_string();
-        let runtime = self
-            .runtime_for_schema(&schema)
-            .await
-            .map_err(|err| InstallError::internal(err.to_string()))?;
-
-        Ok(StagedInstall {
-            schema_path,
-            runtime,
-            install: PreparedInstall::Schema { schema },
-        })
-    }
-
-    async fn prepare_payload_install(
-        &self,
-        payload: InstallArtifacts,
+        payload: CompiledLibraryPackage,
     ) -> Result<StagedInstall, InstallError> {
         let runtime = self
             .runtime_for_schema(&payload.schema)
@@ -432,10 +404,6 @@ impl LibraryRegistry {
 
     fn apply_prepared_runtime(&self, install: &StagedInstall) {
         match &install.install {
-            PreparedInstall::Schema { schema } => {
-                install.runtime.state.replace_schema(schema.clone());
-                install.runtime.routes.clear();
-            }
             PreparedInstall::Payload {
                 schema,
                 routes,
@@ -457,10 +425,6 @@ impl LibraryRegistry {
         };
 
         match &install.install {
-            PreparedInstall::Schema { schema } => store
-                .persist_schema(schema)
-                .await
-                .map_err(|err| InstallError::internal(err.to_string())),
             PreparedInstall::Payload {
                 schema, artifact, ..
             } => store
@@ -480,10 +444,6 @@ impl LibraryRegistry {
         };
 
         match &install.install {
-            PreparedInstall::Schema { schema } => store
-                .stage_schema(txn_id, schema)
-                .await
-                .map_err(|err| InstallError::internal(err.to_string())),
             PreparedInstall::Payload {
                 schema, artifact, ..
             } => store

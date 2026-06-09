@@ -203,7 +203,11 @@ pub fn http_ir_route_handler_from_bytes(
                     let method = req.method().clone();
                     let result = match opdef {
                         OpDef::Get(_) if method == HttpMethod::GET => {
-                            let key = match decode_value_body(&req).await {
+                            let key_name = match &opdef {
+                                OpDef::Get((key_name, _)) => Some(key_name.as_str()),
+                                _ => None,
+                            };
+                            let key = match decode_value_body_for_key(&req, key_name).await {
                                 Ok(Some(value)) => value,
                                 Ok(None) => Value::None,
                                 Err(err) => return tc_error_response(err),
@@ -296,15 +300,13 @@ pub fn http_ir_route_handler_from_bytes(
     }
 
     #[allow(clippy::collapsible_if)]
-    async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> {
+    async fn decode_value_body_for_key(
+        req: &Request,
+        key_name: Option<&str>,
+    ) -> TCResult<Option<Value>> {
         if let Some(body) = req.extensions().get::<RequestBody>() {
             if !body.is_empty() {
-                let stream =
-                    futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(body.clone_bytes())]);
-                return destream_json::try_decode((), stream)
-                    .await
-                    .map(Some)
-                    .map_err(|err| TCError::bad_request(err.to_string()));
+                return decode_value_bytes(body.clone_bytes(), key_name).await;
             }
         }
 
@@ -322,10 +324,32 @@ pub fn http_ir_route_handler_from_bytes(
             return Ok(Some(Value::None));
         }
 
-        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
-            raw.into_bytes(),
-        ))]);
+        decode_value_bytes(Bytes::from(raw.into_bytes()), key_name).await
+    }
 
+    async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> {
+        decode_value_body_for_key(req, None).await
+    }
+
+    async fn decode_value_bytes(bytes: Bytes, key_name: Option<&str>) -> TCResult<Option<Value>> {
+        let bytes = if let Some(key_name) = key_name {
+            match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(serde_json::Value::Object(mut object)) => {
+                    if let Some(value) = object.remove(key_name) {
+                        Bytes::from(serde_json::to_vec(&value).map_err(|err| {
+                            TCError::bad_request(format!("invalid key value: {err}"))
+                        })?)
+                    } else {
+                        bytes
+                    }
+                }
+                _ => bytes,
+            }
+        } else {
+            bytes
+        };
+
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(bytes)]);
         destream_json::try_decode((), stream)
             .await
             .map(Some)

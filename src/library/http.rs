@@ -207,8 +207,7 @@ mod tests {
     use super::*;
     use crate::http::{Body, header};
     use crate::library::{
-        InstallArtifacts, InstallRequest, decode_install_request_bytes,
-        encode_install_payload_bytes,
+        CompiledLibraryPackage, decode_compiled_library_package, encode_compiled_library_package,
     };
     use crate::storage::Artifact;
     use crate::{Method, kernel::Kernel};
@@ -228,14 +227,14 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_install_payload_bytes() {
+    fn round_trips_install_compiled_package_bytes() {
         let schema = LibrarySchema::new(
             Link::from_str("/lib/example-devco/hello/0.1.0").expect("link"),
             "0.1.0",
             vec![],
         );
 
-        let payload = InstallArtifacts {
+        let payload = CompiledLibraryPackage {
             schema: schema.clone(),
             artifacts: vec![Artifact {
                 path: schema.id().to_string(),
@@ -244,21 +243,16 @@ mod tests {
             }],
         };
 
-        let bytes = encode_install_payload_bytes(&payload).expect("encode payload");
-        let request = decode_install_request_bytes(&bytes).expect("decode payload");
+        let bytes = encode_compiled_library_package(&payload).expect("encode payload");
+        let decoded = decode_compiled_library_package(&bytes).expect("decode payload");
 
-        match request {
-            InstallRequest::WithArtifacts(decoded) => {
-                assert_eq!(decoded.schema.id(), schema.id());
-                assert_eq!(decoded.schema.version(), schema.version());
-                assert_eq!(decoded.artifacts.len(), 1);
-                assert_eq!(
-                    decoded.artifacts[0].content_type,
-                    WASM_ARTIFACT_CONTENT_TYPE
-                );
-            }
-            _ => panic!("expected artifacts payload"),
-        }
+        assert_eq!(decoded.schema.id(), schema.id());
+        assert_eq!(decoded.schema.version(), schema.version());
+        assert_eq!(decoded.artifacts.len(), 1);
+        assert_eq!(
+            decoded.artifacts[0].content_type,
+            WASM_ARTIFACT_CONTENT_TYPE
+        );
     }
 
     #[tokio::test]
@@ -338,7 +332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installs_schema_via_put() {
+    async fn rejects_schema_only_install_via_put() {
         use tc_ir::Claim;
         let initial = LibrarySchema::new(
             Link::from_str("/lib/example-devco/service/0.1.0").expect("link"),
@@ -375,7 +369,63 @@ mod tests {
             .txn_manager()
             .begin()
             .with_claims(vec![install_claim]);
-        put_request.extensions_mut().insert(install_txn);
+        put_request.extensions_mut().insert(install_txn.clone());
+
+        let put_response = kernel
+            .dispatch(Method::Put, "/lib", put_request)
+            .expect("put handler")
+            .await;
+
+        assert_eq!(put_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn installs_canonical_definition_and_serves_member_route() {
+        use tc_ir::Claim;
+        let initial = LibrarySchema::new(
+            Link::from_str("/lib/example-devco/service/0.1.0").expect("link"),
+            "0.1.0",
+            vec![],
+        );
+        let module = build_http_library_module(initial, None)
+            .await
+            .expect("module");
+        let handlers = http_library_handlers(&module);
+
+        let kernel = Kernel::builder()
+            .with_host_id("tc-library-test")
+            .with_library_module(module, handlers)
+            .finish();
+
+        let definition = serde_json::json!({
+            "/lib/example-devco/greeter/0.1.0": {
+                "hello": {
+                    "/state/scalar/op/get": [
+                        "name",
+                        [
+                            ["_tmp0", "Hello, {{name}}!"],
+                            ["result", {"$_tmp0/render": {"name": {"$name": []}}}]
+                        ]
+                    ]
+                }
+            }
+        });
+
+        let mut put_request = http::Request::builder()
+            .method("PUT")
+            .uri("/lib")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(definition.to_string()))
+            .expect("install request");
+        let install_claim = Claim::new(
+            Link::from_str("/lib/example-devco/greeter/0.1.0").expect("install link"),
+            umask::USER_WRITE,
+        );
+        let install_txn = kernel
+            .txn_manager()
+            .begin()
+            .with_claims(vec![install_claim]);
+        put_request.extensions_mut().insert(install_txn.clone());
 
         let put_response = kernel
             .dispatch(Method::Put, "/lib", put_request)
@@ -383,32 +433,44 @@ mod tests {
             .await;
 
         assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
+        kernel
+            .finalize_transaction(install_txn, true)
+            .await
+            .expect("commit install");
 
-        let get_request = http::Request::builder()
+        let mut route_request = http::Request::builder()
             .method("GET")
-            .uri("/lib/example-devco/updated/0.2.0")
+            .uri("/lib/example-devco/greeter/0.1.0/hello?key=%7B%22name%22%3A%22Ada%22%7D")
             .body(Body::empty())
-            .expect("get request");
+            .expect("route request");
+        let route_claim = Claim::new(
+            Link::from_str("/lib/example-devco/greeter/0.1.0").expect("route link"),
+            umask::USER_EXEC,
+        );
+        let route_txn = kernel.txn_manager().begin().with_claims(vec![route_claim]);
+        route_request.extensions_mut().insert(route_txn);
 
-        let get_response = kernel
-            .dispatch(Method::Get, "/lib/example-devco/updated/0.2.0", get_request)
-            .expect("get handler")
+        let route_response = kernel
+            .dispatch(
+                Method::Get,
+                "/lib/example-devco/greeter/0.1.0/hello",
+                route_request,
+            )
+            .expect("route handler")
             .await;
 
-        let body = to_bytes(get_response.into_body()).await.expect("body");
+        let status = route_response.status();
+        let body = to_bytes(route_response.into_body()).await.expect("body");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "route error: {}",
+            String::from_utf8_lossy(&body)
+        );
         let state = decode_state(body.to_vec()).await;
-        let State::Map(schema_map) = state else {
-            panic!("expected State::Map schema");
+        let State::Scalar(Scalar::Value(Value::String(value))) = state else {
+            panic!("expected string response");
         };
-        let id = match schema_map.get("id") {
-            Some(State::Scalar(Scalar::Value(Value::String(value)))) => value.as_str(),
-            _ => panic!("missing schema id"),
-        };
-        let version = match schema_map.get("version") {
-            Some(State::Scalar(Scalar::Value(Value::String(value)))) => value.as_str(),
-            _ => panic!("missing schema version"),
-        };
-        assert_eq!(id, "/lib/example-devco/updated/0.2.0");
-        assert_eq!(version, "0.2.0");
+        assert_eq!(value, "Hello, Ada!");
     }
 }

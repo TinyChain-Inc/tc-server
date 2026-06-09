@@ -1,9 +1,10 @@
 #[cfg(all(test, feature = "pyo3", feature = "http-server", feature = "wasm"))]
 mod tests {
     use crate::auth::{TokenContext, TokenVerifier};
-    use crate::{Body, Kernel, KernelHandler, Request, Response, StatusCode};
+    use crate::library::CompiledLibraryPackage;
     use crate::resolve::Resolve;
-    use base64::Engine as _;
+    use crate::storage::Artifact;
+    use crate::{Body, Kernel, KernelHandler, Request, Response, StatusCode};
     use futures::FutureExt;
     use hyper::body::to_bytes;
     use pathlink::Link;
@@ -247,45 +248,23 @@ mod tests {
             .with_health_handler(|_req| async move { Response::new(Body::empty()) })
             .finish();
 
-        let install_payload = serde_json::json!({
-            "schema": {
-                "id": "/lib/example-devco/example/0.1.0",
-                "version": "0.1.0",
-                "dependencies": []
-            },
-            "artifacts": [{
-                "path": "/lib/wasm",
-                "content_type": "application/wasm",
-                "bytes": base64::engine::general_purpose::STANDARD.encode(&bytes),
-            }]
-        });
-
-        let mut install_request = http::Request::builder()
-            .method("PUT")
-            .uri("/lib")
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(install_payload.to_string()))
-            .expect("install request");
-        let install_claim = tc_ir::Claim::new(
-            Link::from_str("/lib/example-devco/example/0.1.0").unwrap(),
-            umask::USER_WRITE,
-        );
-        let install_txn = remote_kernel
-            .txn_manager()
-            .begin()
-            .with_claims(vec![install_claim]);
-        let install_txn_for_commit = install_txn.clone();
-        install_request.extensions_mut().insert(install_txn);
-
-        let install_response = remote_kernel
-            .dispatch(crate::Method::Put, "/lib", install_request)
-            .expect("install handler")
-            .await;
-        assert_eq!(install_response.status(), StatusCode::NO_CONTENT);
         remote_kernel
-            .finalize_transaction(install_txn_for_commit, true)
+            .library_registry()
+            .expect("library registry")
+            .install_compiled_package(CompiledLibraryPackage {
+                schema: tc_ir::LibrarySchema::new(
+                    Link::from_str("/lib/example-devco/example/0.1.0").unwrap(),
+                    "0.1.0",
+                    vec![],
+                ),
+                artifacts: vec![Artifact {
+                    path: "/lib/wasm".to_string(),
+                    content_type: crate::ir::WASM_ARTIFACT_CONTENT_TYPE.to_string(),
+                    bytes,
+                }],
+            })
             .await
-            .expect("commit install");
+            .expect("install compiled package");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
