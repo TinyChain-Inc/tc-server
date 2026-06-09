@@ -10,6 +10,25 @@ pub(crate) const HOST_AUTH_CONTEXT: &str = "/host/auth/context";
 pub(crate) const HOST_LIBRARY_EXPORT: &str = "/host/library/export";
 pub(crate) const HEALTHZ: &str = "/healthz";
 
+pub(crate) fn append_kernel_txn_id(
+    url: &mut url::Url,
+    txn_id: tc_ir::TxnId,
+) -> tc_error::TCResult<String> {
+    if url
+        .query_pairs()
+        .any(|(key, _)| key.eq_ignore_ascii_case("txn_id"))
+    {
+        return Err(tc_error::TCError::bad_request(
+            "outbound targets must not include txn_id; it is supplied by the kernel".to_string(),
+        ));
+    }
+
+    url.query_pairs_mut()
+        .append_pair("txn_id", &txn_id.to_string());
+
+    Ok(url.as_str().to_string())
+}
+
 pub(crate) fn normalize_path(path: &str) -> &str {
     if path.len() > 1 {
         path.trim_end_matches('/')

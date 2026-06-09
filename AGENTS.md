@@ -71,6 +71,15 @@ Keep the following rules in mind whenever you extend the server:
     ordinary requests, not commit/rollback.
 * Only the kernel finalizes a transaction. Adapters must **not** call
   `TxnManager` directly except to parse/attach handles via `route_request`.
+* Finalize hooks are transaction-critical. Commit and rollback hook failures must
+  be returned to the caller so the transaction can be retried or inspected; do
+  not log-and-ignore participant finalize failures.
+* A transaction must never create or depend on another transaction ID, even for a
+  read-only lookup. Do not add sub-transactions, `TxnId -> version` maps, or
+  transaction side tables. If committed data must be read outside an active
+  transaction, use the storage layer's canonical committed snapshot API; if that
+  API is missing, extend the storage primitive instead of minting a synthetic
+  transaction.
 * The transaction owner enforces a **3-second** temporal locality window. Handlers
   that cannot respond inside that budget must short-circuit and push work onto a
   `While`-driven queue service: a single `While` loop whose state bridges many
@@ -114,6 +123,25 @@ Keep the following rules in mind whenever you extend the server:
   versions from its own `freqfs::Dir`/txfs directory, as in v1). Avoid central
   storage helpers or kernel/main orchestration that re-implements per-library
   persistence in aggregate; keep the registry/router thin.
+* Staged library install state owns live replication participant metadata. Do not
+  reintroduce a separate replication transaction tracker; finalization must read
+  the prepared participant set from the staged `LibraryRegistry` transaction
+  record and retry only unresolved participants.
+* Do not implement quorum or majority shortcuts in HTTP replication fanout. Until
+  a real consensus log exists, commit/rollback must fail closed unless every
+  prepared participant eventually finalizes.
+* Bootstrap/discovery replication may degrade, but it must return a structured
+  report of installed, skipped, unavailable, and failed peers rather than hiding
+  partial success behind logs.
+* Crash/restart recovery for in-flight installs belongs in txfs-backed staged
+  transaction recovery plus staged registry metadata recovery. Do not fake
+  durability with adapter-local JSON files, process-global side tables, or
+  transaction-version mappings.
+* When porting v1 `SyncChain`/`BlockChain`, treat chains as durable append/replay
+  logs for the existing kernel transaction protocol. Chain records must preserve
+  the original `TxnId`, canonical component root, and prepared participant set;
+  they must not introduce sub-transactions, alternate finalize paths, or client-
+  visible recovery controls.
 
 ## v1 lessons worth preserving
 

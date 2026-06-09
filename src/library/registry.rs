@@ -21,9 +21,15 @@ use super::{HandlerArc, SchemaRoutes};
 #[derive(Clone)]
 pub struct LibraryRegistry {
     entries: Arc<RwLock<BTreeMap<String, Arc<LibraryRuntime>>>>,
-    staged: Arc<RwLock<BTreeMap<TxnId, Vec<StagedInstall>>>>,
+    staged: Arc<RwLock<BTreeMap<TxnId, StagedTxn>>>,
     store: Option<LibraryStore>,
     factories: BTreeMap<String, LibraryFactory>,
+}
+
+#[derive(Clone, Default)]
+struct StagedTxn {
+    installs: Vec<StagedInstall>,
+    replication_participants: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -179,7 +185,7 @@ impl LibraryRegistry {
                 .await
                 .map_err(|err| InstallError::internal(err.to_string()))?;
             store
-                .persist_schema(&schema)
+                .persist_schema_immediate(&schema)
                 .await
                 .map_err(|err| InstallError::internal(err.to_string()))?;
         }
@@ -230,12 +236,37 @@ impl LibraryRegistry {
             .contains_key(&txn_id)
     }
 
+    pub fn record_replication_participants(&self, txn_id: TxnId, participants: Vec<String>) {
+        let mut staged = self.staged.write().expect("library staged write lock");
+        let txn = staged.entry(txn_id).or_default();
+        txn.replication_participants = participants;
+    }
+
+    pub fn replication_participants(&self, txn_id: TxnId) -> Option<Vec<String>> {
+        self.staged
+            .read()
+            .expect("library staged read lock")
+            .get(&txn_id)
+            .map(|txn| txn.replication_participants.clone())
+            .filter(|participants| !participants.is_empty())
+    }
+
+    pub fn retain_unfinished_replication_participants(&self, txn_id: TxnId, delivered: &[String]) {
+        let delivered = delivered.iter().collect::<std::collections::HashSet<_>>();
+        let mut staged = self.staged.write().expect("library staged write lock");
+        if let Some(txn) = staged.get_mut(&txn_id) {
+            txn.replication_participants
+                .retain(|peer| !delivered.contains(peer));
+        }
+    }
+
     pub fn discard_txn(&self, txn_id: TxnId) {
         let staged = self
             .staged
             .write()
             .expect("library staged write lock")
             .remove(&txn_id)
+            .map(|txn| txn.installs)
             .unwrap_or_default();
 
         if staged.is_empty() {
@@ -259,6 +290,7 @@ impl LibraryRegistry {
             .write()
             .expect("library staged write lock")
             .remove(&txn_id)
+            .map(|txn| txn.installs)
             .unwrap_or_default();
 
         for install in &staged {
@@ -326,7 +358,7 @@ impl LibraryRegistry {
 
     fn record_staged_install(&self, txn_id: TxnId, install: StagedInstall) {
         let mut staged = self.staged.write().expect("library staged write lock");
-        let txn = staged.entry(txn_id).or_default();
+        let txn = &mut staged.entry(txn_id).or_default().installs;
         if let Some(existing) = txn
             .iter_mut()
             .find(|existing| existing.schema_path == install.schema_path)
@@ -428,7 +460,7 @@ impl LibraryRegistry {
             PreparedInstall::Payload {
                 schema, artifact, ..
             } => store
-                .persist_artifact(schema, artifact)
+                .persist_artifact_immediate(schema, artifact)
                 .await
                 .map_err(|err| InstallError::internal(err.to_string())),
         }

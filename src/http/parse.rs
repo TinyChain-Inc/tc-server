@@ -5,7 +5,6 @@ use futures::stream;
 use hyper::header::AUTHORIZATION;
 use hyper::{body::to_bytes, header};
 use tc_error::{TCError, TCResult};
-use tc_ir::TxnId;
 use tc_value::Value;
 use url::form_urlencoded;
 
@@ -14,21 +13,8 @@ use crate::txn::TxnHandle;
 use super::response::{internal_error_response, payload_too_large_response};
 use super::{Request, Response};
 
-pub(crate) fn parse_txn_id(req: &Request) -> Result<Option<TxnId>, TxnParseError> {
-    use std::str::FromStr;
-
-    let query = req.uri().query().unwrap_or("");
-    let txn_id_param = form_urlencoded::parse(query.as_bytes())
-        .into_owned()
-        .find(|(k, _)| k.eq_ignore_ascii_case("txn_id"))
-        .map(|(_, v)| v);
-
-    match txn_id_param {
-        Some(raw) => TxnId::from_str(&raw)
-            .map(Some)
-            .map_err(|_| TxnParseError::Invalid),
-        None => Ok(None),
-    }
+pub(crate) fn parse_txn_id(req: &Request) -> Result<Option<tc_ir::TxnId>, TxnParseError> {
+    crate::txn::wire::parse_txn_id_query(req.uri().query()).map_err(|_| TxnParseError::Invalid)
 }
 
 pub(crate) enum TxnParseError {

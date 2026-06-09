@@ -464,20 +464,18 @@ mod http_tests {
             })
         };
 
+        let txn_id = TxnId::from_parts(NetworkTime::from_nanos(9), 1);
         let begin_request = ::http::Request::builder()
             .method("GET")
-            .uri(format!("http://{a_addr}{a_root}"))
-            .header(hyper::header::AUTHORIZATION, "Bearer demo-user")
+            .uri(format!("http://{a_addr}{a_root}?txn_id={txn_id}"))
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer demo-user|{txn_id}"),
+            )
             .body(Body::empty())?;
 
         let begin_response = Client::new().request(begin_request).await?;
         assert_eq!(begin_response.status(), StatusCode::OK);
-        let txn_id = begin_response
-            .headers()
-            .get("x-tc-txn-id")
-            .and_then(|value| value.to_str().ok())
-            .ok_or("missing x-tc-txn-id on begin response")?
-            .to_string();
 
         let request = ::http::Request::builder()
             .method("GET")

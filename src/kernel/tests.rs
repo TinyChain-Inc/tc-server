@@ -293,6 +293,31 @@ mod tests {
         assert!(continue_without_claim.is_ok());
     }
 
+    #[test]
+    fn rollback_finalize_hook_failure_is_not_best_effort() {
+        let kernel = Kernel::builder()
+            .with_lib_handler(ok_handler())
+            .with_txn_finalize_hook(|_txn, commit| async move {
+                if commit {
+                    Ok(())
+                } else {
+                    Err(tc_error::TCError::bad_gateway("participant rollback failed"))
+                }
+            })
+            .finish();
+
+        let txn = kernel.txn_manager().begin();
+        let txn_id = txn.id();
+        let err = futures::executor::block_on(kernel.finalize_transaction(txn, false))
+            .expect_err("rollback hook failure must propagate");
+
+        assert!(err.message().contains("participant rollback failed"));
+        assert!(
+            kernel.txn_manager().get(&txn_id).is_some(),
+            "failed rollback must keep the transaction available for retry"
+        );
+    }
+
     #[derive(Clone, Default)]
     struct MockGateway {
         calls: Arc<Mutex<Vec<pathlink::Link>>>,

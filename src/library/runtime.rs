@@ -2,9 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use tc_error::{TCError, TCResult};
 use tc_ir::LibrarySchema;
-use umask::Mode;
 
-use crate::storage::{Artifact, LibraryStore};
+use crate::storage::LibraryStore;
 
 use super::{LibraryFactory, LibraryRoutes, LibraryState};
 
@@ -56,51 +55,6 @@ impl LibraryRuntime {
         self.routes.replace_arc(handler);
 
         Ok(())
-    }
-
-    pub async fn install_artifact_bytes(
-        &self,
-        content_type: &str,
-        bytes: Vec<u8>,
-        txn: Option<&crate::txn::TxnHandle>,
-    ) -> TCResult<LibrarySchema> {
-        let factory = self
-            .factories
-            .get(content_type)
-            .ok_or_else(|| TCError::bad_request("artifact installs are not supported"))?;
-
-        let (manifest_schema, schema_routes, handler) = factory(bytes.clone())?;
-
-        match txn {
-            Some(txn)
-                if !txn.has_claim(
-                    manifest_schema.id(),
-                    Mode::new().with_class_perm(umask::USER, umask::WRITE),
-                ) =>
-            {
-                return Err(TCError::unauthorized("unauthorized library install"));
-            }
-            _ => {}
-        }
-
-        self.state
-            .replace_with_routes(manifest_schema.clone(), schema_routes);
-        self.routes.replace_arc(handler);
-
-        if let Some(store) = &self.store {
-            store
-                .persist_artifact(
-                    &manifest_schema,
-                    &Artifact {
-                        content_type: content_type.to_string(),
-                        bytes,
-                        path: manifest_schema.id().to_string(),
-                    },
-                )
-                .await?;
-        }
-
-        Ok(manifest_schema)
     }
 }
 

@@ -2,6 +2,7 @@ mod gateway;
 mod handle;
 mod manager;
 mod token;
+pub(crate) mod wire;
 
 #[cfg(test)]
 mod tests;

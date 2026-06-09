@@ -16,7 +16,79 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tc_ir::LibrarySchema;
+use tc_error::TCResult;
+use tc_ir::{LibrarySchema, TxnId};
+
+#[derive(Default)]
+struct RecordingClusterGateway {
+    calls: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl super::ClusterGateway for RecordingClusterGateway {
+    async fn discover_library_paths(&self, _peer: &str) -> TCResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn request_replication_token(
+        &self,
+        peer: &str,
+        path: &str,
+        _keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+    ) -> TCResult<String> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("token:{peer}:{path}"));
+        Ok("replication-token".to_string())
+    }
+
+    async fn fetch_compiled_library_package(
+        &self,
+        _peer: &str,
+        _token: &str,
+    ) -> TCResult<Option<crate::library::CompiledLibraryPackage>> {
+        Ok(None)
+    }
+
+    async fn register_with_peer(
+        &self,
+        _seed: &str,
+        _joiner: &super::PeerIdentity,
+        _routes: &super::PeerRoutes,
+        _keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+    ) -> TCResult<super::PeerClusterListing> {
+        Ok(super::PeerClusterListing::default())
+    }
+
+    async fn push_install_compiled_package(
+        &self,
+        peer: &str,
+        token: &str,
+        txn_id: TxnId,
+        payload: Vec<u8>,
+    ) -> TCResult<()> {
+        self.calls.lock().expect("calls").push(format!(
+            "install:{peer}:{token}:{txn_id}:{}",
+            String::from_utf8(payload).expect("payload")
+        ));
+        Ok(())
+    }
+
+    async fn finalize_install_txn(
+        &self,
+        peer: &str,
+        token: &str,
+        txn_id: TxnId,
+        commit: bool,
+    ) -> TCResult<()> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("finalize:{peer}:{token}:{txn_id}:{commit}"));
+        Ok(())
+    }
+}
 
 #[tokio::test]
 async fn issues_replication_token() {
@@ -38,7 +110,7 @@ async fn issues_replication_token() {
     let store = LibraryStore::from_root(root);
     let store = store.for_schema(&schema).await.expect("store");
     store
-        .persist_artifact(
+        .persist_artifact_immediate(
             &schema,
             &crate::storage::Artifact {
                 path: schema.id().to_string(),
@@ -222,21 +294,26 @@ async fn fanout_prunes_stale_peers_within_single_operation() {
     let calls: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     let calls_for_apply = calls.clone();
 
-    let result = super::fanout_peers(&membership, "test operation", move |peer| {
-        let calls = calls_for_apply.clone();
-        async move {
-            let mut calls = calls.lock().expect("calls lock");
-            let count = calls.entry(peer.clone()).or_insert(0);
-            *count += 1;
-            drop(calls);
+    let result = super::fanout_peers(
+        &membership,
+        "test operation",
+        ReplicationPolicy::default(),
+        move |peer| {
+            let calls = calls_for_apply.clone();
+            async move {
+                let mut calls = calls.lock().expect("calls lock");
+                let count = calls.entry(peer.clone()).or_insert(0);
+                *count += 1;
+                drop(calls);
 
-            if peer == "http://10.0.0.1:8702" {
-                Ok(())
-            } else {
-                Err(tc_error::TCError::bad_gateway("simulated stale peer"))
+                if peer == "http://10.0.0.1:8702" {
+                    Ok(())
+                } else {
+                    Err(tc_error::TCError::bad_gateway("simulated stale peer"))
+                }
             }
-        }
-    })
+        },
+    )
     .await;
 
     assert!(
@@ -262,9 +339,12 @@ async fn fanout_rejects_when_all_peers_are_unreachable() {
         "http://10.0.1.2:8702".to_string(),
     ]);
 
-    let result = super::fanout_peers(&membership, "test operation", |_peer| async move {
-        Err(tc_error::TCError::bad_gateway("simulated unreachable peer"))
-    })
+    let result = super::fanout_peers(
+        &membership,
+        "test operation",
+        ReplicationPolicy::default(),
+        |_peer| async move { Err(tc_error::TCError::bad_gateway("simulated unreachable peer")) },
+    )
     .await;
 
     assert!(
@@ -272,4 +352,141 @@ async fn fanout_rejects_when_all_peers_are_unreachable() {
         "fanout must fail when no peer is reachable"
     );
     assert!(membership.active_peers().is_empty());
+}
+
+#[tokio::test]
+async fn transaction_fanout_fails_on_single_participant_failure_without_pruning_membership() {
+    let participants = vec![
+        "http://10.0.2.1:8702".to_string(),
+        "http://10.0.2.2:8702".to_string(),
+        "http://10.0.2.3:8702".to_string(),
+    ];
+    let membership = PeerMembership::new(participants.clone());
+
+    let result = super::fanout_participants(
+        &participants,
+        "test transaction finalize",
+        ReplicationPolicy::default(),
+        |peer| async move {
+            if peer == "http://10.0.2.2:8702" {
+                Err(tc_error::TCError::bad_gateway(
+                    "simulated participant failure",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "transaction finalization must fail if any prepared participant fails"
+    );
+    assert_eq!(
+        membership.active_peers(),
+        participants,
+        "transaction finalization must not mutate live replica membership"
+    );
+}
+
+#[tokio::test]
+async fn transaction_fanout_rejects_49_percent_participant_failure() {
+    let participants = (0..100)
+        .map(|idx| format!("http://10.49.0.{idx}:8702"))
+        .collect::<Vec<_>>();
+
+    let result = super::fanout_participants(
+        &participants,
+        "test transaction finalize",
+        ReplicationPolicy::default(),
+        |peer| async move {
+            let octet = peer
+                .trim_start_matches("http://10.49.0.")
+                .trim_end_matches(":8702")
+                .parse::<usize>()
+                .expect("peer index");
+            if octet < 49 {
+                Err(tc_error::TCError::bad_gateway("simulated minority failure"))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "without a consensus log, 49% participant failure is not safe to commit"
+    );
+}
+
+#[tokio::test]
+async fn transaction_fanout_rejects_51_percent_participant_failure() {
+    let participants = (0..100)
+        .map(|idx| format!("http://10.51.0.{idx}:8702"))
+        .collect::<Vec<_>>();
+
+    let result = super::fanout_participants(
+        &participants,
+        "test transaction finalize",
+        ReplicationPolicy::default(),
+        |peer| async move {
+            let octet = peer
+                .trim_start_matches("http://10.51.0.")
+                .trim_end_matches(":8702")
+                .parse::<usize>()
+                .expect("peer index");
+            if octet < 51 {
+                Err(tc_error::TCError::bad_gateway("simulated majority failure"))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "majority failure must fail closed under all-participant transaction semantics"
+    );
+}
+
+#[tokio::test]
+async fn live_replication_fanout_uses_cluster_gateway() {
+    let membership = PeerMembership::new(vec!["http://10.0.0.1:8702".to_string()]);
+    let gateway = RecordingClusterGateway::default();
+    let txn = crate::txn::TxnManager::with_host_id("test-host")
+        .begin()
+        .with_bearer_token("owner-token".to_string());
+    let keys = parse_psk_keys(&[
+        "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+    ])
+    .expect("keys");
+
+    super::forward_install_to_peers_with_gateway(
+        &membership,
+        &txn,
+        "/lib/example-devco/hello/0.1.0",
+        b"payload".to_vec(),
+        &keys,
+        &gateway,
+    )
+    .await
+    .expect("install fanout");
+
+    super::forward_finalize_to_peers_with_gateway(&membership, &txn, true, &gateway)
+        .await
+        .expect("finalize fanout");
+
+    let calls = gateway.calls.lock().expect("calls").clone();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls[0],
+        "token:http://10.0.0.1:8702:/lib/example-devco/hello/0.1.0"
+    );
+    assert!(calls[1].starts_with("install:http://10.0.0.1:8702:owner-token:"));
+    assert!(calls[1].ends_with(":payload"));
+    assert!(calls[2].starts_with("finalize:http://10.0.0.1:8702:owner-token:"));
+    assert!(calls[2].ends_with(":true"));
 }
