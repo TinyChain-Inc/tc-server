@@ -9,9 +9,8 @@ behavior of the upstream `host` crate.
 
 - **Begin:** Any HTTP or PyO3 request to a transactional endpoint which omits `txn_id` triggers
   `TxnManager::begin` (`/host/...` and `/healthz` are non-transactional).
-  The handler executes immediately within that transaction and the server records the new ID.
-  Adapters return the minted ID in the `x-tc-txn-id` response header so callers can continue or
-  finalize without minting their own transaction IDs.
+  The handler executes immediately within that transaction, then the adapter commits or rolls it
+  back before returning. The transaction ID is not exposed in response headers.
 - **Continue:** Subsequent requests to transactional endpoints include `?txn_id=<id>` in the URI.
   The dispatcher
   loads the pending transaction, verifies the same `Authorization: Bearer ...` owner token (when

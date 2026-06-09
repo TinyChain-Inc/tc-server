@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use hyper::{Body, Client, Request, StatusCode};
 use pathlink::Link;
-use tc_ir::{Claim, LibrarySchema, TxnId};
+use tc_ir::{Claim, LibrarySchema, NetworkTime, TxnId};
 use tinychain::auth::{Actor, Token};
 use tinychain::replication::is_peer_membership_path;
 
@@ -53,9 +53,14 @@ pub fn token_for_schema_and_txn(
 }
 
 pub async fn begin_transaction(addr: std::net::SocketAddr, bearer: String) -> TxnId {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos() as u64;
+    let txn_id = TxnId::from_parts(NetworkTime::from_nanos(now), 0);
     let request = Request::builder()
         .method("GET")
-        .uri(format!("http://{addr}/lib"))
+        .uri(format!("http://{addr}/lib?txn_id={txn_id}"))
         .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
         .body(Body::empty())
         .expect("begin request");
@@ -64,12 +69,7 @@ pub async fn begin_transaction(addr: std::net::SocketAddr, bearer: String) -> Tx
         .await
         .expect("begin response");
     assert_eq!(response.status(), StatusCode::OK);
-    let raw = response
-        .headers()
-        .get("x-tc-txn-id")
-        .and_then(|value| value.to_str().ok())
-        .expect("missing x-tc-txn-id");
-    TxnId::from_str(raw).expect("parse txn id")
+    txn_id
 }
 
 pub async fn put_library_definition(

@@ -5,7 +5,6 @@ use std::{
 };
 
 use futures::future::BoxFuture;
-use hyper::header::HeaderValue;
 use tower::Service;
 
 use crate::{Kernel, KernelDispatch, Method};
@@ -128,7 +127,7 @@ impl Service<Request> for KernelService {
 
             let bearer = parse_bearer_token(&req);
             let inbound_txn_id = txn_id;
-            let mut minted_txn_id = None;
+            let mut minted_txn = None;
             let token = match bearer {
                 Some(token) => match kernel.token_verifier().verify(token).await {
                     Ok(token) => Some(token),
@@ -153,18 +152,18 @@ impl Service<Request> for KernelService {
                 body_is_none,
                 token.as_ref(),
                 |handle, req| {
-                    minted_txn_id = Some(handle.id());
+                    minted_txn = Some(handle.clone());
                     req.extensions_mut().insert(handle.clone());
                 },
             ) {
                 Ok(KernelDispatch::Response(resp)) => {
                     let mut response = resp.await;
                     if inbound_txn_id.is_none() {
-                        if let Some(value) = minted_txn_id
-                            .map(|txn_id| HeaderValue::from_str(&txn_id.to_string()))
-                            .and_then(Result::ok)
-                        {
-                            response.headers_mut().insert("x-tc-txn-id", value);
+                        if let Some(txn) = minted_txn {
+                            let commit = response.status().is_success();
+                            if let Err(err) = kernel.finalize_transaction(txn, commit).await {
+                                response = handle_finalize_result(Err(err));
+                            }
                         }
                     }
 

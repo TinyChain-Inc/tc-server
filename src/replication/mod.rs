@@ -18,7 +18,7 @@ use crate::library::{
     LibraryRegistry, decode_authorize_and_stage_install, stage_install_error_response,
 };
 use aes_gcm_siv::{Aes256GcmSiv, Key};
-use futures::FutureExt;
+use futures::future::{FutureExt, join_all};
 use hyper::body::to_bytes;
 use hyper::{Body, Request, StatusCode};
 use parking_lot::Mutex;
@@ -351,10 +351,10 @@ pub async fn forward_finalize_to_peers(
 async fn fanout_peers<F, Fut>(
     membership: &PeerMembership,
     operation: &str,
-    mut apply: F,
+    apply: F,
 ) -> TCResult<()>
 where
-    F: FnMut(String) -> Fut,
+    F: Fn(String) -> Fut,
     Fut: Future<Output = TCResult<()>>,
 {
     const FANOUT_MAX_ATTEMPTS: usize = 3;
@@ -375,8 +375,14 @@ where
         }
         had_targets = true;
 
-        for peer in targets {
-            match apply(peer.clone()).await {
+        let results = join_all(targets.into_iter().map(|peer| {
+            let fut = apply(peer.clone());
+            async move { (peer, fut.await) }
+        }))
+        .await;
+
+        for (peer, result) in results {
+            match result {
                 Ok(()) => {
                     membership.mark_success(&peer);
                     delivered.insert(peer);

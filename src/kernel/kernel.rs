@@ -279,7 +279,9 @@ impl Kernel {
 
                     let txn_link = pathlink::Link::from_str(&format!("/txn/{}", handle.id()))
                         .map_err(|_| crate::txn::TxnError::Unauthorized)?;
-                    if !handle.has_claim(&txn_link, required) {
+                    let has_required_txn_claim = handle.has_claim(&txn_link, required);
+                    let token_has_txn_claim = token.is_some_and(crate::txn::has_txn_claim);
+                    if token_has_txn_claim && !has_required_txn_claim {
                         return Err(crate::txn::TxnError::Unauthorized);
                     }
                     return Ok(KernelDispatch::Finalize {

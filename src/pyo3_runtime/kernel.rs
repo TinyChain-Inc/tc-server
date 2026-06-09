@@ -451,7 +451,6 @@ impl KernelHandle {
             None => None,
         };
         let inbound_txn_id = txn_id;
-        let mut minted_txn_id: Option<TxnId> = None;
         let mut minted_txn: Option<crate::txn::TxnHandle> = None;
         let mut request = http_request_from_py_with_body(&request, body_bytes.clone())?;
         if !body_bytes.is_empty() {
@@ -468,7 +467,6 @@ impl KernelHandle {
             body_is_none,
             token.as_ref(),
             |handle, req| {
-                minted_txn_id = Some(handle.id());
                 minted_txn = Some(handle.clone());
                 req.extensions_mut().insert(handle.clone());
             },
@@ -476,13 +474,8 @@ impl KernelHandle {
             Ok(KernelDispatch::Response(resp)) => {
                 let mut response =
                     self.block_on(async move { py_response_from_http(resp.await).await })?;
-                let mut auto_finalized = false;
-                if inbound_txn_id.is_none()
-                    && route_path == crate::uri::LIB_ROOT
-                    && matches!(method, Method::Put)
-                {
+                if inbound_txn_id.is_none() {
                     if let Some(txn) = minted_txn {
-                        auto_finalized = true;
                         let commit = response.status() < 400;
                         let result = self.block_on(self.inner.finalize_transaction(txn, commit));
                         if result.is_err() {
@@ -491,13 +484,6 @@ impl KernelHandle {
                     }
                 }
 
-                if !auto_finalized && inbound_txn_id.is_none() {
-                    if let Some(txn_id) = minted_txn_id {
-                        response
-                            .headers
-                            .push(("x-tc-txn-id".to_string(), txn_id.to_string()));
-                    }
-                }
                 Ok(response)
             }
             Ok(KernelDispatch::Finalize { commit, txn }) => {

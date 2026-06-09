@@ -45,9 +45,10 @@ touches additional components.
   derived from the manifest; rollback is an empty `DELETE` to the same root. Empty-body
   `POST`/`DELETE` requests to subpaths must not finalize. The kernel interprets finalize
   requests uniformly across adapters.
-- **Begin response includes the minted txn ID.** When a request omits `?txn_id=...`, the kernel
-  begins a transaction and adapters return the minted ID in the `x-tc-txn-id` response header so
-  callers can continue/finalize without minting their own IDs.
+- **Adapter-owned default transactions.** When a request omits `?txn_id=...`, the adapter begins a
+  transaction, executes the handler, and finalizes it before returning. The transaction ID is not
+  exposed in response headers; proxies must not be part of the transaction protocol. Callers only
+  use `?txn_id=...` when intentionally continuing an explicit transaction.
 - **Transaction ownership is pinned.** For any active `txn_id`, the kernel rejects requests whose
   `Authorization: Bearer ...` token does not resolve to the same owner identity which began the
   transaction. Additionally, the kernel only accepts a previously-unseen `?txn_id=...` when a

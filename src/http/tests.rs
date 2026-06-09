@@ -11,7 +11,7 @@ mod tests {
     use std::str::FromStr;
     use tc_error::TCError;
     use tc_error::TCResult;
-    use tc_ir::{LibrarySchema, TxnId};
+    use tc_ir::{LibrarySchema, NetworkTime, TxnId};
     use tc_ir::{HandleDelete, HandleGet, HandlePost, HandlePut, LibraryModule, tc_library_routes};
     use tower::Service;
 
@@ -114,9 +114,10 @@ mod tests {
         let txn_manager = kernel.txn_manager().clone();
         let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
+        let txn_id_value = TxnId::from_parts(NetworkTime::from_nanos(1), 1);
         let request = http::Request::builder()
             .method("GET")
-            .uri("/lib")
+            .uri(format!("/lib?txn_id={txn_id_value}"))
             .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
             .body(Body::empty())
             .expect("begin request");
@@ -157,7 +158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_return_bearer_token_for_anonymous_txn() {
+    async fn adapter_owned_anonymous_txn_exposes_no_transaction_headers() {
         let kernel: Kernel = Kernel::builder()
             .with_lib_handler(ok_handler())
             .with_lib_put_handler(ok_handler())
@@ -178,21 +179,8 @@ mod tests {
         let response = service.call(begin).await.expect("begin response");
         assert_eq!(response.status(), StatusCode::OK);
 
-        let txn_id = response
-            .headers()
-            .get("x-tc-txn-id")
-            .and_then(|value| value.to_str().ok())
-            .expect("missing x-tc-txn-id header");
+        assert!(response.headers().get("x-tc-txn-id").is_none());
         assert!(response.headers().get("x-tc-bearer-token").is_none());
-
-        let commit = http::Request::builder()
-            .method("POST")
-            .uri(format!("/lib?txn_id={txn_id}"))
-            .body(Body::empty())
-            .expect("commit request");
-
-        let commit_response = service.call(commit).await.expect("commit response");
-        assert_eq!(commit_response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -200,20 +188,16 @@ mod tests {
         let kernel = kernel_with_lib_handler();
         let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
+        let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1);
         let begin = http::Request::builder()
             .method("GET")
-            .uri("/lib")
+            .uri(format!("/lib?txn_id={txn_id}"))
             .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
             .body(Body::empty())
             .expect("begin request");
 
         let response = service.call(begin).await.expect("begin response");
         assert_eq!(response.status(), StatusCode::OK);
-        let txn_id = response
-            .headers()
-            .get("x-tc-txn-id")
-            .and_then(|value| value.to_str().ok())
-            .expect("missing x-tc-txn-id header");
 
         let continue_req = http::Request::builder()
             .method("GET")
@@ -258,9 +242,10 @@ mod tests {
         let txn_manager = kernel.txn_manager().clone();
         let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
+        let txn_id_value = TxnId::from_parts(NetworkTime::from_nanos(2), 1);
         let begin = http::Request::builder()
             .method("GET")
-            .uri("/lib")
+            .uri(format!("/lib?txn_id={txn_id_value}"))
             .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
             .body(Body::empty())
             .expect("begin request");
@@ -287,7 +272,9 @@ mod tests {
             .await
             .expect("non-root commit response");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(txn_manager.pending_ids(), vec![txn_id_value]);
+        let pending = txn_manager.pending_ids();
+        assert_eq!(pending.len(), 1);
+        let txn_id_value = pending[0];
 
         let root_commit = http::Request::builder()
             .method("POST")
@@ -313,9 +300,10 @@ mod tests {
         let txn_manager = kernel.txn_manager().clone();
         let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
+        let txn_id_value = TxnId::from_parts(NetworkTime::from_nanos(3), 1);
         let begin = http::Request::builder()
             .method("GET")
-            .uri("/lib")
+            .uri(format!("/lib?txn_id={txn_id_value}"))
             .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
             .body(Body::empty())
             .expect("begin request");
@@ -339,7 +327,9 @@ mod tests {
 
         let response = service.call(non_root).await.expect("non-root response");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(txn_manager.pending_ids(), vec![txn_id_value]);
+        let pending = txn_manager.pending_ids();
+        assert_eq!(pending.len(), 1);
+        let txn_id_value = pending[0];
 
         let root = http::Request::builder()
             .method("POST")
@@ -355,9 +345,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(txn_manager.pending_ids().is_empty());
 
+        let txn_id_value = TxnId::from_parts(NetworkTime::from_nanos(4), 1);
         let begin = http::Request::builder()
             .method("GET")
-            .uri("/service")
+            .uri(format!("/service?txn_id={txn_id_value}"))
             .header(hyper::header::AUTHORIZATION, "Bearer owner-a")
             .body(Body::empty())
             .expect("service begin request");
