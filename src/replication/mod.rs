@@ -36,17 +36,13 @@ const TOKEN_PATH: &str = "/";
 const REPLICATION_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug)]
-pub struct ReplicationPolicy {
-    pub max_fanout_attempts: usize,
-    pub membership_failure_threshold: u8,
+pub struct ParticipantFanoutPolicy {
+    pub max_attempts: usize,
 }
 
-impl Default for ReplicationPolicy {
+impl Default for ParticipantFanoutPolicy {
     fn default() -> Self {
-        Self {
-            max_fanout_attempts: 3,
-            membership_failure_threshold: 3,
-        }
+        Self { max_attempts: 3 }
     }
 }
 
@@ -259,7 +255,7 @@ where
     G: ClusterGateway,
 {
     let mut report = ClusterJoinReport::default();
-    let mut pending = membership.active_peers();
+    let mut pending = membership.snapshot_active_peers();
     let mut visited = std::collections::HashSet::new();
     while let Some(seed) = pending.pop() {
         if seed == self_identity.peer || !visited.insert(seed.clone()) {
@@ -272,7 +268,7 @@ where
         {
             Ok(discovered) => {
                 report.contacted.push(seed.clone());
-                membership.mark_success(&seed);
+                membership.record_discovery_success(&seed);
                 for identity in discovered.identities {
                     if identity.peer == self_identity.peer {
                         continue;
@@ -300,7 +296,7 @@ where
                 }
             }
             Err(err) => {
-                membership.mark_failure(&seed);
+                membership.record_discovery_failure(&seed);
                 report.failed.push(format!("{seed}: {err}"));
             }
         }
@@ -405,10 +401,11 @@ where
         .to_string();
     let txn_id = txn.id();
 
-    fanout_peers(
-        membership,
+    let participants = membership.snapshot_active_peers();
+    let delivered = fanout_participants(
+        &participants,
         "install payload",
-        ReplicationPolicy::default(),
+        ParticipantFanoutPolicy::default(),
         |peer| {
             let token = token.clone();
             let payload = install_compiled_package.clone();
@@ -430,6 +427,9 @@ where
         },
     )
     .await
+    .map_err(|err| err.err)?;
+
+    Ok(delivered)
 }
 
 pub fn live_replicating_finalize_hook(
@@ -469,7 +469,7 @@ pub async fn forward_finalize_to_peers(
     txn: &crate::txn::TxnHandle,
     commit: bool,
 ) -> TCResult<()> {
-    let participants = membership.active_peers();
+    let participants = membership.snapshot_active_peers();
     forward_finalize_to_participants(&participants, txn, commit, &HttpClusterGateway).await
 }
 
@@ -482,7 +482,7 @@ pub async fn forward_finalize_to_peers_with_gateway<G>(
 where
     G: ClusterGateway,
 {
-    let participants = membership.active_peers();
+    let participants = membership.snapshot_active_peers();
     forward_finalize_to_participants(&participants, txn, commit, gateway).await
 }
 
@@ -522,7 +522,7 @@ where
     fanout_participants(
         participants,
         "finalize transaction",
-        ReplicationPolicy::default(),
+        ParticipantFanoutPolicy::default(),
         |peer| {
             let token = token.clone();
             let gateway = gateway;
@@ -536,87 +536,10 @@ where
     .await
 }
 
-async fn fanout_peers<F, Fut>(
-    membership: &PeerMembership,
-    operation: &str,
-    policy: ReplicationPolicy,
-    apply: F,
-) -> TCResult<Vec<String>>
-where
-    F: Fn(String) -> Fut,
-    Fut: Future<Output = TCResult<()>>,
-{
-    let mut delivered = HashSet::new();
-    let mut first_error = None;
-    let mut had_targets = false;
-
-    for _ in 1..=policy.max_fanout_attempts {
-        let targets = membership
-            .active_peers()
-            .into_iter()
-            .filter(|peer| !delivered.contains(peer))
-            .collect::<Vec<_>>();
-
-        if targets.is_empty() {
-            break;
-        }
-        had_targets = true;
-
-        let results = join_all(targets.into_iter().map(|peer| {
-            let fut = apply(peer.clone());
-            async move { (peer, fut.await) }
-        }))
-        .await;
-
-        for (peer, result) in results {
-            match result {
-                Ok(()) => {
-                    membership.mark_success(&peer);
-                    delivered.insert(peer);
-                }
-                Err(err) => {
-                    membership.mark_failure_with_membership_threshold(
-                        &peer,
-                        policy.membership_failure_threshold,
-                    );
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                }
-            }
-        }
-    }
-
-    let unresolved = membership
-        .active_peers()
-        .into_iter()
-        .filter(|peer| !delivered.contains(peer))
-        .collect::<Vec<_>>();
-
-    if unresolved.is_empty() {
-        if had_targets && delivered.is_empty() {
-            Err(first_error.unwrap_or_else(|| {
-                TCError::bad_gateway(format!("failed to {operation}: no reachable peers"))
-            }))
-        } else {
-            let mut delivered = delivered.into_iter().collect::<Vec<_>>();
-            delivered.sort();
-            Ok(delivered)
-        }
-    } else {
-        Err(first_error.unwrap_or_else(|| {
-            TCError::bad_gateway(format!(
-                "failed to {operation} on unresolved peers: {}",
-                unresolved.join(", ")
-            ))
-        }))
-    }
-}
-
 async fn fanout_participants<F, Fut>(
     participants: &[String],
     operation: &str,
-    policy: ReplicationPolicy,
+    policy: ParticipantFanoutPolicy,
     apply: F,
 ) -> Result<Vec<String>, ParticipantFanoutError>
 where
@@ -626,7 +549,7 @@ where
     let mut delivered = HashSet::new();
     let mut first_error = None;
 
-    for _ in 1..=policy.max_fanout_attempts {
+    for _ in 1..=policy.max_attempts {
         let targets = participants
             .iter()
             .filter(|peer| !delivered.contains(*peer))

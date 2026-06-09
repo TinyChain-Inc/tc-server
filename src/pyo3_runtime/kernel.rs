@@ -71,7 +71,7 @@ pub(crate) fn python_kernel_builder_with_config(
         .expect("library hydrate");
     let library_handlers = http_library::http_library_handlers(&module);
 
-    let kernel_handler = crate::reflect::host_reflect_handler(Arc::new(python_handler(
+    let kernel_handler = crate::reflect::reflect_overlay_handler(Arc::new(python_handler(
         metrics.unwrap_or_else(stub_py_handler),
     )));
     let kernel_handler: Arc<dyn KernelHandler> = Arc::new(kernel_handler);

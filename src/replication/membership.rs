@@ -1,7 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
+
+const DISCOVERY_FAILURE_THRESHOLD: u8 = 3;
 
 #[derive(Clone, Default)]
 pub struct PeerMembership {
@@ -74,29 +76,26 @@ impl PeerMembership {
         was_new
     }
 
-    pub fn mark_success(&self, peer: &str) {
+    pub fn record_discovery_success(&self, peer: &str) {
         let mut peers = self.peers.write().expect("peer membership write");
         if let Some(health) = peers.get_mut(peer) {
             health.failures = 0;
         }
     }
 
-    pub fn mark_failure(&self, peer: &str) {
-        self.mark_failure_with_membership_threshold(
-            peer,
-            super::ReplicationPolicy::default().membership_failure_threshold,
-        )
+    pub fn record_discovery_failure(&self, peer: &str) {
+        self.record_discovery_failure_with_threshold(peer, DISCOVERY_FAILURE_THRESHOLD)
     }
 
-    pub fn mark_failure_with_membership_threshold(
+    pub fn record_discovery_failure_with_threshold(
         &self,
         peer: &str,
-        membership_failure_threshold: u8,
+        discovery_failure_threshold: u8,
     ) {
         let mut peers = self.peers.write().expect("peer membership write");
         if let Some(health) = peers.get_mut(peer) {
             health.failures = health.failures.saturating_add(1);
-            if health.failures >= membership_failure_threshold {
+            if health.failures >= discovery_failure_threshold {
                 peers.remove(peer);
             }
         }
@@ -109,15 +108,12 @@ impl PeerMembership {
             .remove(peer);
     }
 
-    pub fn retain<F>(&self, mut keep: F)
-    where
-        F: FnMut(&str) -> bool,
-    {
+    pub fn retain_discovered_peers(&self, discovered: &HashSet<String>) {
         let mut peers = self.peers.write().expect("peer membership write");
-        peers.retain(|peer, _| keep(peer));
+        peers.retain(|peer, _| discovered.contains(peer));
     }
 
-    pub fn active_peers(&self) -> Vec<String> {
+    pub fn snapshot_active_peers(&self) -> Vec<String> {
         let peers = self.peers.read().expect("peer membership read");
         let mut peers = peers.keys().cloned().collect::<Vec<_>>();
         peers.sort();
