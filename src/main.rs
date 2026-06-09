@@ -458,7 +458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 discovered = dedupe_peers(discovered);
                 discovered.retain(|peer| !is_self(peer, bind_ip, advertise_ip, discovery_port));
                 let resolved: HashSet<String> = discovered.iter().cloned().collect();
-                membership_for_discovery.retain(|peer| resolved.contains(peer));
+                membership_for_discovery.retain_discovered_peers(&resolved);
 
                 for peer in discovered {
                     match tinychain::replication::normalize_peer(&peer) {

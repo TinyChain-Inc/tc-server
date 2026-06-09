@@ -12,7 +12,6 @@ use hyper::body::to_bytes;
 use hyper::{Body, Request, StatusCode};
 use pathlink::Link;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,6 +21,11 @@ use tc_ir::{LibrarySchema, TxnId};
 #[derive(Default)]
 struct RecordingClusterGateway {
     calls: Mutex<Vec<String>>,
+}
+
+struct FailingInstallGateway {
+    calls: Mutex<Vec<String>>,
+    failing_peer: String,
 }
 
 #[async_trait::async_trait]
@@ -86,6 +90,74 @@ impl super::ClusterGateway for RecordingClusterGateway {
             .lock()
             .expect("calls")
             .push(format!("finalize:{peer}:{token}:{txn_id}:{commit}"));
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl super::ClusterGateway for FailingInstallGateway {
+    async fn discover_library_paths(&self, _peer: &str) -> TCResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn request_replication_token(
+        &self,
+        peer: &str,
+        path: &str,
+        _keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+    ) -> TCResult<String> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("token:{peer}:{path}"));
+        Ok("replication-token".to_string())
+    }
+
+    async fn fetch_compiled_library_package(
+        &self,
+        _peer: &str,
+        _token: &str,
+    ) -> TCResult<Option<crate::library::CompiledLibraryPackage>> {
+        Ok(None)
+    }
+
+    async fn register_with_peer(
+        &self,
+        _seed: &str,
+        _joiner: &super::PeerIdentity,
+        _routes: &super::PeerRoutes,
+        _keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
+    ) -> TCResult<super::PeerClusterListing> {
+        Ok(super::PeerClusterListing::default())
+    }
+
+    async fn push_install_compiled_package(
+        &self,
+        peer: &str,
+        _token: &str,
+        _txn_id: TxnId,
+        _payload: Vec<u8>,
+    ) -> TCResult<()> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("install:{peer}"));
+        if peer == self.failing_peer {
+            Err(tc_error::TCError::bad_gateway(
+                "simulated install participant failure",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn finalize_install_txn(
+        &self,
+        _peer: &str,
+        _token: &str,
+        _txn_id: TxnId,
+        _commit: bool,
+    ) -> TCResult<()> {
         Ok(())
     }
 }
@@ -284,77 +356,6 @@ async fn kernel_routes_cluster_membership_under_lib_prefix() {
 }
 
 #[tokio::test]
-async fn fanout_prunes_stale_peers_within_single_operation() {
-    let membership = PeerMembership::new(vec![
-        "http://10.0.0.1:8702".to_string(),
-        "http://10.0.0.2:8702".to_string(),
-        "http://10.0.0.3:8702".to_string(),
-    ]);
-
-    let calls: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
-    let calls_for_apply = calls.clone();
-
-    let result = super::fanout_peers(
-        &membership,
-        "test operation",
-        ReplicationPolicy::default(),
-        move |peer| {
-            let calls = calls_for_apply.clone();
-            async move {
-                let mut calls = calls.lock().expect("calls lock");
-                let count = calls.entry(peer.clone()).or_insert(0);
-                *count += 1;
-                drop(calls);
-
-                if peer == "http://10.0.0.1:8702" {
-                    Ok(())
-                } else {
-                    Err(tc_error::TCError::bad_gateway("simulated stale peer"))
-                }
-            }
-        },
-    )
-    .await;
-
-    assert!(
-        result.is_ok(),
-        "fanout should succeed after pruning stale peers"
-    );
-
-    let calls = calls.lock().expect("calls lock");
-    assert_eq!(calls.get("http://10.0.0.1:8702"), Some(&1));
-    assert_eq!(calls.get("http://10.0.0.2:8702"), Some(&3));
-    assert_eq!(calls.get("http://10.0.0.3:8702"), Some(&3));
-
-    assert_eq!(
-        membership.active_peers(),
-        vec!["http://10.0.0.1:8702".to_string()]
-    );
-}
-
-#[tokio::test]
-async fn fanout_rejects_when_all_peers_are_unreachable() {
-    let membership = PeerMembership::new(vec![
-        "http://10.0.1.1:8702".to_string(),
-        "http://10.0.1.2:8702".to_string(),
-    ]);
-
-    let result = super::fanout_peers(
-        &membership,
-        "test operation",
-        ReplicationPolicy::default(),
-        |_peer| async move { Err(tc_error::TCError::bad_gateway("simulated unreachable peer")) },
-    )
-    .await;
-
-    assert!(
-        result.is_err(),
-        "fanout must fail when no peer is reachable"
-    );
-    assert!(membership.active_peers().is_empty());
-}
-
-#[tokio::test]
 async fn transaction_fanout_fails_on_single_participant_failure_without_pruning_membership() {
     let participants = vec![
         "http://10.0.2.1:8702".to_string(),
@@ -366,7 +367,7 @@ async fn transaction_fanout_fails_on_single_participant_failure_without_pruning_
     let result = super::fanout_participants(
         &participants,
         "test transaction finalize",
-        ReplicationPolicy::default(),
+        ParticipantFanoutPolicy::default(),
         |peer| async move {
             if peer == "http://10.0.2.2:8702" {
                 Err(tc_error::TCError::bad_gateway(
@@ -384,9 +385,50 @@ async fn transaction_fanout_fails_on_single_participant_failure_without_pruning_
         "transaction finalization must fail if any prepared participant fails"
     );
     assert_eq!(
-        membership.active_peers(),
+        membership.snapshot_active_peers(),
         participants,
         "transaction finalization must not mutate live replica membership"
+    );
+}
+
+#[tokio::test]
+async fn install_prepare_fails_on_single_participant_failure_without_pruning_membership() {
+    let participants = vec![
+        "http://10.0.5.1:8702".to_string(),
+        "http://10.0.5.2:8702".to_string(),
+        "http://10.0.5.3:8702".to_string(),
+    ];
+    let membership = PeerMembership::new(participants.clone());
+    let gateway = FailingInstallGateway {
+        calls: Mutex::new(Vec::new()),
+        failing_peer: "http://10.0.5.2:8702".to_string(),
+    };
+    let txn = crate::txn::TxnManager::with_host_id("test-host")
+        .begin()
+        .with_bearer_token("owner-token".to_string());
+    let keys = parse_psk_keys(&[
+        "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+    ])
+    .expect("keys");
+
+    let result = super::forward_install_to_peers_with_gateway(
+        &membership,
+        &txn,
+        "/lib/example-devco/hello/0.1.0",
+        b"payload".to_vec(),
+        &keys,
+        &gateway,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "transactional install prepare must fail if any initial participant fails"
+    );
+    assert_eq!(
+        membership.snapshot_active_peers(),
+        participants,
+        "transactional install prepare must not prune live membership to make the active transaction succeed"
     );
 }
 
@@ -399,7 +441,7 @@ async fn transaction_fanout_rejects_49_percent_participant_failure() {
     let result = super::fanout_participants(
         &participants,
         "test transaction finalize",
-        ReplicationPolicy::default(),
+        ParticipantFanoutPolicy::default(),
         |peer| async move {
             let octet = peer
                 .trim_start_matches("http://10.49.0.")
@@ -430,7 +472,7 @@ async fn transaction_fanout_rejects_51_percent_participant_failure() {
     let result = super::fanout_participants(
         &participants,
         "test transaction finalize",
-        ReplicationPolicy::default(),
+        ParticipantFanoutPolicy::default(),
         |peer| async move {
             let octet = peer
                 .trim_start_matches("http://10.51.0.")

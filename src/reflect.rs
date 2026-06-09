@@ -50,16 +50,16 @@ pub fn reflect_handler() -> Arc<dyn KernelHandler> {
     Arc::new(|req: Request| async move { dispatch(req).await }.boxed())
 }
 
-pub fn host_reflect_handler(fallback: Arc<dyn KernelHandler>) -> impl KernelHandler {
+pub fn reflect_overlay_handler(inner: Arc<dyn KernelHandler>) -> impl KernelHandler {
     let reflect = reflect_handler();
     move |req: Request| {
         let reflect = reflect.clone();
-        let fallback = fallback.clone();
+        let inner = inner.clone();
         async move {
             if req.method() == hyper::Method::POST && reflect_path(req.uri().path()).is_some() {
                 return reflect.call(req).await;
             }
-            fallback.call(req).await
+            inner.call(req).await
         }
         .boxed()
     }

@@ -127,6 +127,9 @@ Keep the following rules in mind whenever you extend the server:
   reintroduce a separate replication transaction tracker; finalization must read
   the prepared participant set from the staged `LibraryRegistry` transaction
   record and retry only unresolved participants.
+* Keep discovery health separate from transaction obligations. Discovery code may
+  prune stale peers from `PeerMembership`, but transaction prepare/finalize must
+  snapshot its participant set once and fail closed against that immutable set.
 * Do not implement quorum or majority shortcuts in HTTP replication fanout. Until
   a real consensus log exists, commit/rollback must fail closed unless every
   prepared participant eventually finalizes.

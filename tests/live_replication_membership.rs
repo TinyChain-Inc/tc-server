@@ -135,6 +135,57 @@ async fn live_replicated_install_retry_finalizes_after_peer_recovers() {
     assert_eq!(peer_b_package.schema.id(), schema.id());
 }
 
+#[tokio::test]
+async fn live_replicated_install_prepare_fails_when_peer_unavailable() {
+    let actor = Actor::new(Value::from("live-replication-installer"));
+    let peer_a = start_replicating_server(
+        "prepare-peer-a",
+        actor.clone(),
+        Vec::new(),
+        Some(unique_temp_dir("prepare-peer-a")),
+    )
+    .await;
+    let peer_b = start_replicating_server(
+        "prepare-peer-b",
+        actor.clone(),
+        Vec::new(),
+        Some(unique_temp_dir("prepare-peer-b")),
+    )
+    .await;
+    let peer_b_proxy = TcpProxy::start(peer_b.addr).await;
+
+    let primary = start_replicating_server(
+        "prepare-primary",
+        actor.clone(),
+        vec![
+            format!("http://{}", peer_a.addr),
+            format!("http://{}", peer_b_proxy.addr),
+        ],
+        Some(unique_temp_dir("prepare-primary")),
+    )
+    .await;
+
+    peer_b_proxy.set_enabled(false);
+
+    let schema = sample_schema("/lib/example-devco/live-prepare-fail/0.1.0");
+    let token = token_for_schema(&actor, &schema, USER_WRITE);
+    let txn_id = begin_transaction(primary.addr, token).await;
+    let txn_token = token_for_schema_and_txn(&actor, &schema, USER_WRITE, txn_id);
+    let response = put_library_definition(
+        primary.addr,
+        Some(txn_token),
+        library_definition_for_schema(&schema),
+        Some(txn_id),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "install prepare must fail closed if any initial participant is unavailable"
+    );
+}
+
 struct RunningServer {
     addr: std::net::SocketAddr,
     actor: Actor,
