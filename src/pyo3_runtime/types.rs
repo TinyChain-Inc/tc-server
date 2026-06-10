@@ -3,7 +3,7 @@ use std::{fmt, marker::PhantomData, path::PathBuf, sync::Arc};
 use pyo3::prelude::*;
 use tc_ir::LibrarySchema;
 
-use crate::{Kernel, Method, library::default_library_schema};
+use crate::{Method, library::default_library_schema};
 
 use super::wire::parse_method;
 
@@ -166,9 +166,6 @@ pub struct PyKernelRequest {
     pub(super) path: String,
     pub(super) headers: Vec<(String, String)>,
     pub(super) body: Option<PyStateHandle>,
-    // Retained for future Python adapter hooks; kept in-sync with the HTTP kernel path.
-    #[allow(dead_code)]
-    pub(super) kernel: Option<Arc<Kernel>>,
 }
 
 impl fmt::Debug for PyKernelRequest {
@@ -195,7 +192,6 @@ impl PyKernelRequest {
             path: path.to_string(),
             headers: headers.unwrap_or_default(),
             body,
-            kernel: None,
         })
     }
 
@@ -227,18 +223,6 @@ impl PyKernelRequest {
 
     pub(crate) fn path_owned(&self) -> String {
         self.path.clone()
-    }
-
-    // Reserved for upcoming Python adapter integration; not wired yet.
-    #[allow(dead_code)]
-    pub(crate) fn bind_kernel(&mut self, kernel: Arc<Kernel>) {
-        self.kernel = Some(kernel);
-    }
-
-    // Reserved for upcoming Python adapter integration; not wired yet.
-    #[allow(dead_code)]
-    pub(crate) fn kernel(&self) -> Option<Arc<Kernel>> {
-        self.kernel.clone()
     }
 }
 

@@ -354,4 +354,169 @@ mod tests {
 
         assert_eq!(err.code(), tc_error::ErrorKind::Unauthorized);
     }
+
+    #[tokio::test]
+    async fn pyo3_request_prefers_native_state_extension() {
+        use super::state_handle_conversions::request_body_state;
+        use super::wire::py_request_from_http;
+
+        pyo3::prepare_freethreaded_python();
+
+        let mut request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/service/test")
+            .body(Body::from("not-json"))
+            .expect("request");
+
+        request
+            .extensions_mut()
+            .insert(crate::http::NativeStateBody::new(crate::State::from(
+                tc_value::Value::from("native-request"),
+            )));
+
+        let py_request = py_request_from_http(request).await.expect("py request");
+        let state = request_body_state(py_request.body())
+            .expect("state decode")
+            .expect("some state");
+
+        assert!(matches!(
+            state,
+            tc_state::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::String(ref s))) if s == "native-request"
+        ));
+    }
+
+    #[tokio::test]
+    async fn pyo3_request_native_state_extension_all_methods() {
+        use super::state_handle_conversions::request_body_state;
+        use super::wire::py_request_from_http;
+
+        pyo3::prepare_freethreaded_python();
+
+        let cases = [
+            (http::Method::GET, "GET"),
+            (http::Method::PUT, "PUT"),
+            (http::Method::POST, "POST"),
+            (http::Method::DELETE, "DELETE"),
+        ];
+
+        for (method, expected_method) in cases {
+            let mut request = http::Request::builder()
+                .method(method)
+                .uri("/service/test")
+                .body(Body::from("not-json"))
+                .expect("request");
+
+            request
+                .extensions_mut()
+                .insert(crate::http::NativeStateBody::new(crate::State::from(
+                    tc_value::Value::from("native-request"),
+                )));
+
+            let py_request = py_request_from_http(request).await.expect("py request");
+            assert_eq!(py_request.method(), expected_method);
+
+            let state = request_body_state(py_request.body())
+                .expect("state decode")
+                .expect("some state");
+
+            assert!(matches!(
+                state,
+                tc_state::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::String(ref s))) if s == "native-request"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn pyo3_request_rejects_non_native_non_empty_payload() {
+        use super::wire::py_request_from_http;
+
+        pyo3::prepare_freethreaded_python();
+
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/service/test")
+            .body(Body::from("{\"x\":1}"))
+            .expect("request");
+
+        let err = py_request_from_http(request)
+            .await
+            .expect_err("non-native payload should fail");
+
+        assert!(err
+            .to_string()
+            .contains("missing native request body extension"));
+    }
+
+    #[tokio::test]
+    async fn pyo3_response_to_http_sets_native_state_extension() {
+        use super::state_handle_conversions::py_state_handle_from_state;
+        use super::wire::py_response_to_http;
+        use super::PyKernelResponse;
+
+        pyo3::prepare_freethreaded_python();
+
+        let native = crate::State::from(tc_value::Value::from("native-response"));
+        let body = Some(py_state_handle_from_state(native.clone()).expect("state handle"));
+        let py_response = PyKernelResponse::new(200, None, body);
+
+        let response = py_response_to_http(py_response).await.expect("http response");
+        let native_ext = response
+            .extensions()
+            .get::<crate::http::NativeStateResponse>()
+            .expect("native extension");
+
+        assert!(matches!(
+            native_ext.clone_state(),
+            tc_state::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::String(ref s))) if s == "native-response"
+        ));
+    }
+
+    #[tokio::test]
+    async fn pyo3_response_prefers_native_state_extension() {
+        use super::state_handle_conversions::request_body_state;
+        use super::wire::py_response_from_http;
+
+        pyo3::prepare_freethreaded_python();
+
+        let mut response = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("not-json"))
+            .expect("response");
+
+        response
+            .extensions_mut()
+            .insert(crate::http::NativeStateResponse::new(crate::State::from(
+                tc_value::Value::from("native"),
+            )));
+
+        let py_response = py_response_from_http(response).await.expect("py response");
+        let state = request_body_state(py_response.body())
+            .expect("state decode")
+            .expect("some state");
+
+        assert!(matches!(
+            state,
+            tc_state::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::String(ref s))) if s == "native"
+        ));
+    }
+
+    #[tokio::test]
+    async fn pyo3_response_rejects_non_native_success_payload() {
+        use super::wire::py_response_from_http;
+
+        pyo3::prepare_freethreaded_python();
+
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("{\"ok\":true}"))
+            .expect("response");
+
+        let err = py_response_from_http(response)
+            .await
+            .expect_err("non-native success payload should fail");
+
+        assert!(err
+            .to_string()
+            .contains("missing native response extension"));
+    }
 }
