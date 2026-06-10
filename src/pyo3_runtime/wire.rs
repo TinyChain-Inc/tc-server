@@ -1,18 +1,11 @@
-use std::io;
-
-use bytes::Bytes;
-use futures::{TryStreamExt, executor, stream};
-use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
-use tc_ir::{Scalar, TxnId};
-use tc_value::Value;
+use pyo3::types::PyBytes;
+use tc_ir::TxnId;
 
-use crate::{Body, Method, Request, Response, State, StatusCode};
-use tc_state::null_transaction;
+use crate::{Body, Method, Request, Response, StatusCode};
 
-use super::state::PyState;
+use super::state_handle_conversions::{encode_state_to_bytes, py_state_handle_from_state, request_body_state};
 use super::types::{PyKernelRequest, PyKernelResponse, PyStateHandle};
 
 pub(super) fn parse_method(method: &str) -> PyResult<Method> {
@@ -65,14 +58,24 @@ pub(super) async fn py_request_from_http(req: Request) -> PyResult<PyKernelReque
         })
         .collect::<Vec<_>>();
 
-    let body_bytes = hyper::body::to_bytes(body)
-        .await
-        .map_err(|err| PyValueError::new_err(err.to_string()))?;
-    let body = if body_bytes.is_empty() {
-        None
+    let body = if let Some(native) = parts.extensions.get::<crate::http::NativeStateBody>() {
+        if native.is_none() {
+            None
+        } else {
+            Some(py_state_handle_from_state(native.clone_state())?)
+        }
     } else {
-        let state = decode_state_from_bytes(body_bytes.to_vec())?;
-        Some(py_state_handle_from_state(state)?)
+        let body_bytes = hyper::body::to_bytes(body)
+            .await
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        if body_bytes.is_empty() {
+            None
+        } else {
+            return Err(PyValueError::new_err(
+                "missing native request body extension for non-empty payload",
+            ));
+        }
     };
 
     Ok(PyKernelRequest {
@@ -80,7 +83,6 @@ pub(super) async fn py_request_from_http(req: Request) -> PyResult<PyKernelReque
         path,
         headers,
         body,
-        kernel: None,
     })
 }
 
@@ -94,6 +96,18 @@ pub(super) async fn py_response_from_http(response: Response) -> PyResult<PyKern
         })
         .collect::<Vec<_>>();
 
+    if status < 400 {
+        if let Some(native) = response.extensions().get::<crate::http::NativeStateResponse>() {
+            let body = if native.is_none() {
+                None
+            } else {
+                Some(py_state_handle_from_state(native.clone_state())?)
+            };
+
+            return Ok(PyKernelResponse::new(status, Some(headers), body));
+        }
+    }
+
     let body_bytes = hyper::body::to_bytes(response.into_body())
         .await
         .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -104,8 +118,9 @@ pub(super) async fn py_response_from_http(response: Response) -> PyResult<PyKern
             PyStateHandle::new(PyBytes::new_bound(py, &body_bytes).into_py(py))
         }))
     } else {
-        let state = decode_state_from_bytes(body_bytes.to_vec())?;
-        Some(py_state_handle_from_state(state)?)
+        return Err(PyValueError::new_err(
+            "missing native response extension for successful non-empty payload",
+        ));
     };
 
     Ok(PyKernelResponse::new(status, Some(headers), body))
@@ -117,33 +132,27 @@ pub(super) async fn py_response_to_http(response: PyKernelResponse) -> PyResult<
         builder = builder.header(name.as_str(), value.as_str());
     }
 
-    let body_bytes = request_body_bytes(response.body())?;
+    let native_state = request_body_state(response.body())?;
+    let body_bytes = match native_state.as_ref() {
+        None => Vec::new(),
+        Some(state) if state.is_none() => Vec::new(),
+        Some(state) => encode_state_to_bytes(state.clone())?,
+    };
     if !body_bytes.is_empty() {
         builder = builder.header(crate::header::CONTENT_TYPE, "application/json");
     }
 
-    builder
+    let mut response = builder
         .body(Body::from(body_bytes))
-        .map_err(|err| PyValueError::new_err(err.to_string()))
-}
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-fn py_state_handle_from_state(state: State) -> PyResult<PyStateHandle> {
-    Python::with_gil(|py| {
-        let initializer = PyState::initializer_from_state(state);
-        let py_state = Py::new(py, initializer)?;
-        Ok(PyStateHandle::new(py_state.into_py(py)))
-    })
-}
+    if let Some(state) = native_state {
+        response
+            .extensions_mut()
+            .insert(crate::http::NativeStateResponse::new(state));
+    }
 
-async fn decode_state_from_bytes_async(bytes: Vec<u8>) -> Result<State, String> {
-    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(bytes))]);
-    destream_json::try_decode(null_transaction(), stream)
-        .await
-        .map_err(|err| err.to_string())
-}
-
-fn decode_state_from_bytes(bytes: Vec<u8>) -> PyResult<State> {
-    executor::block_on(decode_state_from_bytes_async(bytes)).map_err(PyValueError::new_err)
+    Ok(response)
 }
 
 pub(super) fn py_error_response(err: PyErr) -> Response {
@@ -178,94 +187,3 @@ pub(super) fn parse_path_and_txn_id(path: &str) -> PyResult<(String, Option<TxnI
         .map_err(|_| PyValueError::new_err("invalid transaction id"))
 }
 
-async fn decode_scalar_from_bytes_async(bytes: Vec<u8>) -> Result<Scalar, String> {
-    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(bytes))]);
-    destream_json::try_decode((), stream)
-        .await
-        .map_err(|err| err.to_string())
-}
-
-pub(super) fn decode_scalar_from_bytes(bytes: Vec<u8>) -> PyResult<Scalar> {
-    executor::block_on(decode_scalar_from_bytes_async(bytes)).map_err(PyValueError::new_err)
-}
-
-pub(crate) fn request_body_bytes(body: Option<PyStateHandle>) -> PyResult<Vec<u8>> {
-    let handle = match body {
-        Some(handle) => handle,
-        None => return Ok(Vec::new()),
-    };
-    Python::with_gil(|py| {
-        let value = handle.value();
-        let any = value.bind(py);
-        if let Some(state) = try_extract_state(any)? {
-            if state.is_none() {
-                return Ok(Vec::new());
-            }
-
-            return encode_state_to_bytes(state);
-        }
-        if let Ok(bytes) = any.downcast::<PyBytes>() {
-            Ok(bytes.as_bytes().to_vec())
-        } else if let Ok(string) = any.downcast::<PyString>() {
-            let text = string.to_string();
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                Ok(Vec::new())
-            } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                Ok(text.into_bytes())
-            } else {
-                encode_state_to_bytes(State::from(Value::from(text)))
-            }
-        } else {
-            Err(PyValueError::new_err(
-                "request body must be a str or bytes-like object",
-            ))
-        }
-    })
-}
-
-fn try_extract_state(any: &Bound<'_, PyAny>) -> PyResult<Option<State>> {
-    if any.is_instance_of::<PyState>() {
-        let state_ref: PyRef<'_, PyState> = any.extract()?;
-        Ok(Some(state_ref.clone_state()))
-    } else {
-        Ok(None)
-    }
-}
-
-pub(crate) fn encode_state_to_bytes(state: State) -> PyResult<Vec<u8>> {
-    if state.is_none() {
-        Ok(Vec::new())
-    } else {
-        encode_state_via_destream(state)
-    }
-}
-
-fn encode_state_via_destream(state: State) -> PyResult<Vec<u8>> {
-    executor::block_on(encode_state_via_destream_async(state)).map_err(PyValueError::new_err)
-}
-
-async fn encode_state_via_destream_async(state: State) -> Result<Vec<u8>, String> {
-    let stream = destream_json::encode(state).map_err(|err| err.to_string())?;
-    stream
-        .map_err(|err| err.to_string())
-        .try_fold(Vec::new(), |mut acc, chunk| async move {
-            acc.extend_from_slice(&chunk);
-            Ok(acc)
-        })
-        .await
-}
-
-pub(super) fn py_body_is_none(body: Option<PyStateHandle>) -> bool {
-    match body {
-        None => true,
-        Some(handle) => Python::with_gil(|py| {
-            let value = handle.value();
-            let any = value.bind(py);
-            match try_extract_state(any) {
-                Ok(Some(state)) => state.is_none(),
-                _ => false,
-            }
-        }),
-    }
-}

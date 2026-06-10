@@ -8,7 +8,7 @@ use pathlink::Link;
 use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule, PyType};
+use pyo3::types::{PyModule, PyType};
 use tc_ir::{Claim, OpRef, Scalar, Subject};
 use tc_value::Value;
 use umask;
@@ -23,14 +23,16 @@ use crate::{
     txn::{TxnError, TxnManager},
 };
 
-use super::state::{PyCollection, PyScalar, PyState, PyTensor, PyValue};
+use super::state::{PyState, PyTensor};
+use super::state_handle_conversions::{
+    encode_state_to_bytes, py_state_handle_from_state, request_body_state,
+};
 use super::types::{
     PyKernelConfig, PyKernelRequest, PyKernelResponse, PyStateHandle, apply_config_overrides,
 };
 use super::wire::{
-    decode_scalar_from_bytes, encode_state_to_bytes, http_request_from_py_with_body,
-    parse_path_and_txn_id, py_bearer_token, py_body_is_none, py_error_response,
-    py_request_from_http, py_response_from_http, py_response_to_http, request_body_bytes,
+    http_request_from_py_with_body, parse_path_and_txn_id, py_bearer_token, py_error_response,
+    py_request_from_http, py_response_from_http, py_response_to_http,
 };
 
 pub(crate) fn python_kernel_builder_with_config(
@@ -377,14 +379,21 @@ impl KernelHandle {
         let txn = self.inner.with_resolver(txn_handle.clone());
 
         let scalar = if let Some(body) = body.clone() {
-            let bytes = request_body_bytes(Some(body))?;
-            if bearer_token.is_none() && bytes.len() > self.config.limits.max_request_bytes_unauth {
-                return Err(PyValueError::new_err("request payload too large"));
-            }
-            if bytes.is_empty() {
-                Scalar::default()
+            if let Some(state) = request_body_state(Some(body.clone()))? {
+                let bytes = encode_state_to_bytes(state.clone())?;
+                if bearer_token.is_none()
+                    && bytes.len() > self.config.limits.max_request_bytes_unauth
+                {
+                    return Err(PyValueError::new_err("request payload too large"));
+                }
+
+                match state {
+                    crate::State::None => Scalar::default(),
+                    crate::State::Scalar(scalar) => scalar,
+                    _ => return Err(PyValueError::new_err("expected scalar request body")),
+                }
             } else {
-                decode_scalar_from_bytes(bytes)?
+                return Err(PyValueError::new_err("expected tinychain.State body"));
             }
         } else {
             Scalar::default()
@@ -398,18 +407,15 @@ impl KernelHandle {
         let resolved = self.block_on(op.resolve(&txn));
 
         let response = match resolved {
-            Ok(state) => Python::with_gil(|py| {
-                let body_bytes = encode_state_to_bytes(state)?;
-                let body = if body_bytes.is_empty() {
+            Ok(state) => {
+                let body = if state.is_none() {
                     None
                 } else {
-                    Some(PyStateHandle::new(
-                        PyBytes::new_bound(py, &body_bytes).into_py(py),
-                    ))
+                    Some(py_state_handle_from_state(state)?)
                 };
 
                 Ok(PyKernelResponse::new(200, None, body))
-            }),
+            }
             Err(err) => Err(PyValueError::new_err(err.message().to_string())),
         };
 
@@ -423,16 +429,21 @@ impl KernelHandle {
         let method = request.method_enum();
         let raw_path = request.path_owned();
         let (route_path, txn_id) = parse_path_and_txn_id(&raw_path)?;
-        let body_is_none = py_body_is_none(request.body());
+        let native_state = request_body_state(request.body())?;
+        let body_is_none = native_state.as_ref().map(|state| state.is_none()).unwrap_or(true);
         let bearer = py_bearer_token(&request);
-        let body_bytes = if body_is_none {
-            Vec::new()
-        } else {
-            let bytes = request_body_bytes(request.body())?;
-            if bearer.is_none() && bytes.len() > self.config.limits.max_request_bytes_unauth {
-                return Ok(PyKernelResponse::new(413, None, None));
+        let body_bytes = if let Some(state) = native_state.as_ref() {
+            if state.is_none() {
+                Vec::new()
+            } else {
+                let bytes = encode_state_to_bytes(state.clone())?;
+                if bearer.is_none() && bytes.len() > self.config.limits.max_request_bytes_unauth {
+                    return Ok(PyKernelResponse::new(413, None, None));
+                }
+                bytes
             }
-            bytes
+        } else {
+            Vec::new()
         };
         let token = match bearer {
             Some(token) => Some(
@@ -444,6 +455,13 @@ impl KernelHandle {
         let inbound_txn_id = txn_id;
         let mut minted_txn: Option<crate::txn::TxnHandle> = None;
         let mut request = http_request_from_py_with_body(&request, body_bytes.clone())?;
+        if let Some(state) = native_state {
+            if !state.is_none() {
+                request
+                    .extensions_mut()
+                    .insert(crate::http::NativeStateBody::new(state));
+            }
+        }
         if !body_bytes.is_empty() {
             request
                 .extensions_mut()
@@ -580,10 +598,7 @@ pub fn register_python_api(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<KernelHandle>()?;
     module.add_class::<PyStateHandle>()?;
     module.add_class::<PyState>()?;
-    module.add_class::<PyScalar>()?;
-    module.add_class::<PyCollection>()?;
     module.add_class::<PyTensor>()?;
-    module.add_class::<PyValue>()?;
     module.add_class::<PyKernelRequest>()?;
     module.add_class::<PyKernelResponse>()?;
     module.add_class::<PyBackend>()
