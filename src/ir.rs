@@ -22,7 +22,8 @@ pub fn http_ir_route_handler_from_bytes(
     bytes: Vec<u8>,
 ) -> TCResult<(impl KernelHandler, LibrarySchema, SchemaRoutes)> {
     use crate::http::{
-        Body, HttpMethod, Request, RequestBody, Response, StatusCode, decode_request_body_with_txn,
+        Body, HttpMethod, NativeStateBody, Request, RequestBody, Response, StatusCode,
+        decode_request_body_with_txn,
         header,
     };
     use crate::resolve::Resolve;
@@ -304,6 +305,10 @@ pub fn http_ir_route_handler_from_bytes(
         req: &Request,
         key_name: Option<&str>,
     ) -> TCResult<Option<Value>> {
+        if let Some(body) = req.extensions().get::<NativeStateBody>() {
+            return decode_value_state_for_key(body.clone_state(), key_name);
+        }
+
         if let Some(body) = req.extensions().get::<RequestBody>() {
             if !body.is_empty() {
                 return decode_value_bytes(body.clone_bytes(), key_name).await;
@@ -329,6 +334,32 @@ pub fn http_ir_route_handler_from_bytes(
 
     async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> {
         decode_value_body_for_key(req, None).await
+    }
+
+    fn decode_value_state_for_key(state: State, key_name: Option<&str>) -> TCResult<Option<Value>> {
+        if state.is_none() {
+            return Ok(None);
+        }
+
+        if let (Some(key_name), State::Map(map)) = (key_name, &state) {
+            let id = key_name
+                .parse::<Id>()
+                .map_err(|err| TCError::bad_request(format!("invalid key name: {err}")))?;
+
+            if let Some(item) = map.get(&id) {
+                return state_to_value(item.clone()).map(Some);
+            }
+        }
+
+        state_to_value(state).map(Some)
+    }
+
+    fn state_to_value(state: State) -> TCResult<Value> {
+        match state {
+            State::None => Ok(Value::None),
+            State::Scalar(Scalar::Value(value)) => Ok(value),
+            _ => Err(TCError::bad_request("expected scalar value request body")),
+        }
     }
 
     async fn decode_value_bytes(bytes: Bytes, key_name: Option<&str>) -> TCResult<Option<Value>> {
@@ -357,6 +388,29 @@ pub fn http_ir_route_handler_from_bytes(
     }
 
     async fn decode_scalar_map_body(req: &Request) -> TCResult<Option<Map<State>>> {
+        if let Some(body) = req.extensions().get::<NativeStateBody>() {
+            let state = body.clone_state();
+            if state.is_none() {
+                return Ok(None);
+            }
+
+            return match state {
+                State::Map(map) => Ok(Some(map)),
+                State::Scalar(Scalar::Map(map)) => {
+                    let mut out = Map::new();
+                    for (id, scalar) in map {
+                        let state = match scalar {
+                            Scalar::Value(value) => State::from(value),
+                            other => State::Scalar(other),
+                        };
+                        out.insert(id, state);
+                    }
+                    Ok(Some(out))
+                }
+                _ => Err(TCError::bad_request("expected map request body".to_string())),
+            };
+        }
+
         let Some(body) = req.extensions().get::<RequestBody>() else {
             return Ok(None);
         };

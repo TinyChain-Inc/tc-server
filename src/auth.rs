@@ -288,10 +288,13 @@ mod rjwt_token {
 
     fn actor_identity(actor_id: &Value) -> String {
         match actor_id {
+            Value::Bool(value) => value.to_string(),
             Value::None => "none".to_string(),
             Value::Number(num) => num.to_string(),
             Value::String(value) => value.clone(),
             Value::Link(link) => link.to_string(),
+            Value::Map(value) => format!("{value:?}"),
+            Value::Tuple(value) => format!("{value:?}"),
         }
     }
 }

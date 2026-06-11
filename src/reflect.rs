@@ -171,7 +171,6 @@ fn class_from_opdef(opdef: &OpDef) -> Link {
 
 fn class_from_tcref(tc_ref: &TCRef) -> Link {
     let path = match tc_ref {
-        TCRef::If(_) => pathlink::PathBuf::from(tc_ir::TCREF_IF).to_string(),
         TCRef::Cond(_) => pathlink::PathBuf::from(tc_ir::TCREF_COND).to_string(),
         TCRef::While(_) => pathlink::PathBuf::from(tc_ir::TCREF_WHILE).to_string(),
         TCRef::ForEach(_) => pathlink::PathBuf::from(tc_ir::TCREF_FOR_EACH).to_string(),
@@ -202,15 +201,10 @@ async fn scalar_ref_parts(req: Request) -> Response {
     };
 
     let parts = match r.as_ref() {
-        TCRef::If(if_ref) => Scalar::Tuple(vec![
-            Scalar::from(if_ref.cond.clone()),
-            if_ref.then.clone(),
-            if_ref.or_else.clone(),
-        ]),
-        TCRef::Cond(cond_op) => Scalar::Tuple(vec![
-            Scalar::from(cond_op.cond.clone()),
-            Scalar::Op(cond_op.then.clone()),
-            Scalar::Op(cond_op.or_else.clone()),
+        TCRef::Cond(cond) => Scalar::Tuple(vec![
+            Scalar::from(cond.cond.clone()),
+            cond.then.clone(),
+            cond.or_else.clone(),
         ]),
         TCRef::While(while_ref) => Scalar::Tuple(vec![
             while_ref.cond.clone(),

@@ -11,3 +11,4 @@ pub use execute::{
     execute_post_with_self, execute_put, execute_put_with_self,
 };
 pub use executor::Executor;
+pub(crate) use resolve::resolve_scalar;
