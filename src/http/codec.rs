@@ -48,7 +48,7 @@ pub(crate) fn state_response(state: State) -> Response {
 
     match destream_json::encode(state) {
         Ok(stream) => {
-            let mut response = http::Response::builder()
+            let response = http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::wrap_stream(

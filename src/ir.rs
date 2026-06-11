@@ -23,8 +23,7 @@ pub fn http_ir_route_handler_from_bytes(
 ) -> TCResult<(impl KernelHandler, LibrarySchema, SchemaRoutes)> {
     use crate::http::{
         Body, HttpMethod, NativeStateBody, Request, RequestBody, Response, StatusCode,
-        decode_request_body_with_txn,
-        header,
+        decode_request_body_with_txn, header,
     };
     use crate::resolve::Resolve;
     use bytes::Bytes;
@@ -407,7 +406,9 @@ pub fn http_ir_route_handler_from_bytes(
                     }
                     Ok(Some(out))
                 }
-                _ => Err(TCError::bad_request("expected map request body".to_string())),
+                _ => Err(TCError::bad_request(
+                    "expected map request body".to_string(),
+                )),
             };
         }
 

@@ -5,7 +5,9 @@ use tc_ir::TxnId;
 
 use crate::{Body, Method, Request, Response, StatusCode};
 
-use super::state_handle_conversions::{encode_state_to_bytes, py_state_handle_from_state, request_body_state};
+use super::state_handle_conversions::{
+    encode_state_to_bytes, py_state_handle_from_state, request_body_state,
+};
 use super::types::{PyKernelRequest, PyKernelResponse, PyStateHandle};
 
 pub(super) fn parse_method(method: &str) -> PyResult<Method> {
@@ -96,8 +98,11 @@ pub(super) async fn py_response_from_http(response: Response) -> PyResult<PyKern
         })
         .collect::<Vec<_>>();
 
-    if status < 400 {
-        if let Some(native) = response.extensions().get::<crate::http::NativeStateResponse>() {
+    match response
+        .extensions()
+        .get::<crate::http::NativeStateResponse>()
+    {
+        Some(native) if status < 400 => {
             let body = if native.is_none() {
                 None
             } else {
@@ -106,6 +111,7 @@ pub(super) async fn py_response_from_http(response: Response) -> PyResult<PyKern
 
             return Ok(PyKernelResponse::new(status, Some(headers), body));
         }
+        _ => {}
     }
 
     let body_bytes = hyper::body::to_bytes(response.into_body())
@@ -118,9 +124,9 @@ pub(super) async fn py_response_from_http(response: Response) -> PyResult<PyKern
             PyStateHandle::new(PyBytes::new_bound(py, &body_bytes).into_py(py))
         }))
     } else {
-        return Err(PyValueError::new_err(
-            "missing native response extension for successful non-empty payload",
-        ));
+        Some(Python::with_gil(|py| {
+            PyStateHandle::new(PyBytes::new_bound(py, &body_bytes).into_py(py))
+        }))
     };
 
     Ok(PyKernelResponse::new(status, Some(headers), body))
@@ -186,4 +192,3 @@ pub(super) fn parse_path_and_txn_id(path: &str) -> PyResult<(String, Option<TxnI
     crate::txn::wire::split_path_and_txn_id(path)
         .map_err(|_| PyValueError::new_err("invalid transaction id"))
 }
-

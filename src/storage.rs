@@ -452,11 +452,9 @@ async fn discover_schemas(
             let guard = current.read().await;
             guard
                 .iter()
-                .filter_map(|(name, entry)| match entry {
-                    FsDirEntry::Dir(subdir) => {
-                        Some((name.clone(), FsDirEntry::Dir(subdir.clone())))
-                    }
-                    FsDirEntry::File(file) => Some((name.clone(), FsDirEntry::File(file.clone()))),
+                .map(|(name, entry)| match entry {
+                    FsDirEntry::Dir(subdir) => (name.clone(), FsDirEntry::Dir(subdir.clone())),
+                    FsDirEntry::File(file) => (name.clone(), FsDirEntry::File(file.clone())),
                 })
                 .collect::<Vec<_>>()
         };

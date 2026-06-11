@@ -158,12 +158,10 @@ impl Service<Request> for KernelService {
             ) {
                 Ok(KernelDispatch::Response(resp)) => {
                     let mut response = resp.await;
-                    if inbound_txn_id.is_none() {
-                        if let Some(txn) = minted_txn {
-                            let commit = response.status().is_success();
-                            if let Err(err) = kernel.finalize_transaction(txn, commit).await {
-                                response = handle_finalize_result(Err(err));
-                            }
+                    if let (true, Some(txn)) = (inbound_txn_id.is_none(), minted_txn) {
+                        let commit = response.status().is_success();
+                        if let Err(err) = kernel.finalize_transaction(txn, commit).await {
+                            response = handle_finalize_result(Err(err));
                         }
                     }
 

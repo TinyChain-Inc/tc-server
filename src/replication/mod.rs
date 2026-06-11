@@ -409,7 +409,6 @@ where
         |peer| {
             let token = token.clone();
             let payload = install_compiled_package.clone();
-            let gateway = gateway;
             async move {
                 gateway
                     .request_replication_token(&peer, schema_path, keys)
@@ -525,7 +524,6 @@ where
         ParticipantFanoutPolicy::default(),
         |peer| {
             let token = token.clone();
-            let gateway = gateway;
             async move {
                 gateway
                     .finalize_install_txn(&peer, &token, txn_id, commit)
