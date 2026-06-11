@@ -25,7 +25,7 @@ use crate::{
 
 use super::state::{PyState, PyTensor};
 use super::state_handle_conversions::{
-    encode_state_to_bytes, py_state_handle_from_state, request_body_state,
+    encode_state_to_bytes, py_state_handle_from_state, request_body_raw_bytes, request_body_state,
 };
 use super::types::{
     PyKernelConfig, PyKernelRequest, PyKernelResponse, PyStateHandle, apply_config_overrides,
@@ -430,9 +430,18 @@ impl KernelHandle {
         let raw_path = request.path_owned();
         let (route_path, txn_id) = parse_path_and_txn_id(&raw_path)?;
         let native_state = request_body_state(request.body())?;
-        let body_is_none = native_state.as_ref().map(|state| state.is_none()).unwrap_or(true);
+        let raw_body = request_body_raw_bytes(request.body())?;
+        let body_is_none = native_state
+            .as_ref()
+            .map(|state| state.is_none())
+            .unwrap_or(true);
         let bearer = py_bearer_token(&request);
-        let body_bytes = if let Some(state) = native_state.as_ref() {
+        let body_bytes = if let Some(bytes) = raw_body {
+            if bearer.is_none() && bytes.len() > self.config.limits.max_request_bytes_unauth {
+                return Ok(PyKernelResponse::new(413, None, None));
+            }
+            bytes
+        } else if let Some(state) = native_state.as_ref() {
             if state.is_none() {
                 Vec::new()
             } else {
@@ -455,12 +464,13 @@ impl KernelHandle {
         let inbound_txn_id = txn_id;
         let mut minted_txn: Option<crate::txn::TxnHandle> = None;
         let mut request = http_request_from_py_with_body(&request, body_bytes.clone())?;
-        if let Some(state) = native_state {
-            if !state.is_none() {
+        match native_state {
+            Some(state) if !state.is_none() => {
                 request
                     .extensions_mut()
                     .insert(crate::http::NativeStateBody::new(state));
             }
+            _ => {}
         }
         if !body_bytes.is_empty() {
             request
@@ -483,13 +493,11 @@ impl KernelHandle {
             Ok(KernelDispatch::Response(resp)) => {
                 let response =
                     self.block_on(async move { py_response_from_http(resp.await).await })?;
-                if inbound_txn_id.is_none() {
-                    if let Some(txn) = minted_txn {
-                        let commit = response.status() < 400;
-                        let result = self.block_on(self.inner.finalize_transaction(txn, commit));
-                        if result.is_err() {
-                            return Ok(PyKernelResponse::new(400, None, None));
-                        }
+                if let (true, Some(txn)) = (inbound_txn_id.is_none(), minted_txn) {
+                    let commit = response.status() < 400;
+                    let result = self.block_on(self.inner.finalize_transaction(txn, commit));
+                    if result.is_err() {
+                        return Ok(PyKernelResponse::new(400, None, None));
                     }
                 }
 

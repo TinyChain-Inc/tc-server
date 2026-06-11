@@ -8,6 +8,7 @@ mod tests {
     use futures::FutureExt;
     use hyper::body::to_bytes;
     use pathlink::Link;
+    use pyo3::prelude::*;
     use std::{net::TcpListener, str::FromStr};
     use tower::Service;
     use url::form_urlencoded;
@@ -501,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pyo3_response_rejects_non_native_success_payload() {
+    async fn pyo3_response_preserves_non_native_success_payload() {
         use super::wire::py_response_from_http;
 
         pyo3::prepare_freethreaded_python();
@@ -511,12 +512,15 @@ mod tests {
             .body(Body::from("{\"ok\":true}"))
             .expect("response");
 
-        let err = py_response_from_http(response)
+        let py_response = py_response_from_http(response)
             .await
-            .expect_err("non-native success payload should fail");
+            .expect("raw success response");
 
-        assert!(err
-            .to_string()
-            .contains("missing native response extension"));
+        Python::with_gil(|py| {
+            let body = py_response.body().expect("body");
+            let value = body.value();
+            let bytes = value.bind(py).downcast::<pyo3::types::PyBytes>().expect("bytes");
+            assert_eq!(bytes.as_bytes(), b"{\"ok\":true}");
+        });
     }
 }

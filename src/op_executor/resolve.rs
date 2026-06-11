@@ -3,18 +3,17 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use number_general::Number;
-use pathlink::Link;
+use pathlink::{Link, PathSegment};
 use safecast::CastInto;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Cond, ForEach, Id, Map, OpDef, OpRef, Scalar, Subject, TCRef, While};
-use tc_state::State;
+use tc_state::{Collection, State, Tensor};
 use tc_value::Value;
-
-use crate::gateway::RpcGateway;
-use crate::op_plan::opdef_free_ids;
 
 use super::execute::execute_post_with_self;
 use super::reflect::reflect_link;
+use crate::gateway::RpcGateway;
+use crate::op_plan::opdef_free_ids;
 
 pub(crate) fn resolve_scalar<'a>(
     scalar: Scalar,
@@ -70,7 +69,29 @@ fn resolve_opref(
     Box::pin(async move {
         match op {
             OpRef::Get((subject, key)) => match subject {
-                Subject::Link(_) | Subject::Ref(_, _) => {
+                Subject::Ref(id_ref, suffix) => {
+                    if let Some(state) = resolve_tensor_get(
+                        &id_ref,
+                        suffix.as_ref(),
+                        key.clone(),
+                        &values,
+                        &txn,
+                        self_link.as_ref(),
+                    )
+                    .await?
+                    {
+                        return Ok(state);
+                    }
+
+                    let link = resolve_subject(
+                        Subject::Ref(id_ref, suffix),
+                        values.as_ref(),
+                        self_link.as_ref(),
+                    )?;
+                    let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
+                    txn.get(link, txn.clone(), key).await
+                }
+                Subject::Link(_) => {
                     let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
                     let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
                     txn.get(link, txn.clone(), key).await
@@ -105,6 +126,18 @@ fn resolve_opref(
                         let params =
                             resolve_params(params, &values, &txn, self_link.as_ref()).await?;
                         return txn.post(link, txn.clone(), params).await;
+                    }
+                    if let Some(state) = resolve_tensor_post(
+                        &id_ref,
+                        suffix.as_ref(),
+                        &params,
+                        &values,
+                        &txn,
+                        self_link.as_ref(),
+                    )
+                    .await?
+                    {
+                        return Ok(state);
                     }
                     let segments = suffix.as_ref();
                     if segments.len() == 1 && segments[0].as_str() == "add" {
@@ -539,9 +572,9 @@ fn resolve_subject(
                     .ok_or_else(|| TCError::bad_request("OpDef has $self but no scope"))?
                     .clone()
             } else {
-                let state = values
-                    .get(id_ref.as_str())
-                    .ok_or_else(|| TCError::not_found(format!("unknown id ${}", id_ref.as_str())))?;
+                let state = values.get(id_ref.as_str()).ok_or_else(|| {
+                    TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
+                })?;
 
                 match state {
                     State::Scalar(Scalar::Value(Value::Link(link))) => link.clone(),
@@ -569,6 +602,406 @@ fn resolve_subject(
             Ok(link)
         }
     }
+}
+
+async fn resolve_tensor_get(
+    id_ref: &tc_ir::IdRef,
+    segments: &[PathSegment],
+    key: Scalar,
+    values: &Arc<HashMap<Id, State>>,
+    txn: &crate::txn::TxnHandle,
+    self_link: Option<&Link>,
+) -> TCResult<Option<State>> {
+    if segments.len() != 1 {
+        return Ok(None);
+    }
+
+    let Some(tensor) = tensor_for_id(id_ref, values)? else {
+        return Ok(None);
+    };
+
+    let state = match segments[0].as_str() {
+        "broadcast" => {
+            let shape = scalar_to_state(key, values, txn, self_link).await?;
+            tensor_broadcast(tensor, shape)?
+        }
+        "cast" => tensor,
+        "expand_dims" => {
+            let axes = scalar_to_state(key, values, txn, self_link).await?;
+            tensor_expand_dims(tensor, axes)?
+        }
+        "reshape" => {
+            let shape = scalar_to_state(key, values, txn, self_link).await?;
+            tensor_reshape(tensor, shape)?
+        }
+        "transpose" => {
+            let permutation = scalar_to_state(key, values, txn, self_link).await?;
+            tensor_transpose(tensor, permutation)?
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(State::Collection(Collection::Tensor(state))))
+}
+
+async fn resolve_tensor_post(
+    id_ref: &tc_ir::IdRef,
+    segments: &[PathSegment],
+    params: &Map<Scalar>,
+    values: &Arc<HashMap<Id, State>>,
+    txn: &crate::txn::TxnHandle,
+    self_link: Option<&Link>,
+) -> TCResult<Option<State>> {
+    if segments.len() != 1 {
+        return Ok(None);
+    }
+
+    let Some(tensor) = tensor_for_id(id_ref, values)? else {
+        return Ok(None);
+    };
+
+    let state = match segments[0].as_str() {
+        "dtype" => State::Scalar(Scalar::Value(Value::String(
+            tensor_dtype(&tensor).to_string(),
+        ))),
+        "ndim" => State::from(Value::Number(Number::from(tensor.shape().len() as u64))),
+        "shape" => State::Scalar(Scalar::Tuple(
+            tensor
+                .shape()
+                .iter()
+                .map(|dim| Scalar::Value(Value::Number(Number::from(*dim as u64))))
+                .collect(),
+        )),
+        "size" => State::from(Value::Number(Number::from(tensor_size(&tensor) as u64))),
+        "all" => State::from(Value::Bool(
+            tensor_values_f64(&tensor)?.iter().all(|v| *v != 0.0),
+        )),
+        "any" => State::from(Value::Bool(
+            tensor_values_f64(&tensor)?.iter().any(|v| *v != 0.0),
+        )),
+        "cond" => {
+            let then_tensor = tensor_param(params, "then", values, txn, self_link).await?;
+            let else_tensor = tensor_param(params, "or_else", values, txn, self_link).await?;
+            State::Collection(Collection::Tensor(tensor_cond(
+                &tensor,
+                &then_tensor,
+                &else_tensor,
+            )?))
+        }
+        "max" | "min" | "mean" | "norm" | "product" | "std" | "sum" => {
+            tensor_reduce(&tensor, segments[0].as_str())?
+        }
+        "matmul" => {
+            let right = tensor_param(params, "r", values, txn, self_link).await?;
+            State::Collection(Collection::Tensor(tensor_matmul(&tensor, &right)?))
+        }
+        "add" | "sub" | "mul" | "div" | "and" | "or" | "xor" => {
+            let right = tensor_param(params, "r", values, txn, self_link).await?;
+            State::Collection(Collection::Tensor(tensor_binary(
+                &tensor,
+                &right,
+                segments[0].as_str(),
+            )?))
+        }
+        "not" => State::Collection(Collection::Tensor(tensor_not(&tensor)?)),
+        _ => return Ok(None),
+    };
+
+    Ok(Some(state))
+}
+
+fn tensor_for_id(id_ref: &tc_ir::IdRef, values: &HashMap<Id, State>) -> TCResult<Option<Tensor>> {
+    let Some(state) = values.get(id_ref.as_str()) else {
+        return Err(TCError::not_found(format!(
+            "unknown id ${}",
+            id_ref.as_str()
+        )));
+    };
+
+    match state {
+        State::Collection(Collection::Tensor(tensor)) => Ok(Some(tensor.clone())),
+        _ => Ok(None),
+    }
+}
+
+async fn tensor_param(
+    params: &Map<Scalar>,
+    name: &str,
+    values: &Arc<HashMap<Id, State>>,
+    txn: &crate::txn::TxnHandle,
+    self_link: Option<&Link>,
+) -> TCResult<Tensor> {
+    let id: Id = name
+        .parse()
+        .map_err(|err| TCError::internal(format!("invalid tensor param {name}: {err}")))?;
+    let Some(value) = params.get(&id) else {
+        return Err(TCError::bad_request(format!(
+            "missing tensor parameter {name}"
+        )));
+    };
+    match scalar_to_state(value.clone(), values, txn, self_link).await? {
+        State::Collection(Collection::Tensor(tensor)) => Ok(tensor),
+        other => Err(TCError::bad_request(format!(
+            "expected tensor parameter {name} but found {other:?}"
+        ))),
+    }
+}
+
+fn tensor_dtype(tensor: &Tensor) -> &'static str {
+    match tensor {
+        Tensor::F32(_) => "f32",
+        Tensor::U64(_) => "u64",
+    }
+}
+
+fn tensor_size(tensor: &Tensor) -> usize {
+    tensor.shape().iter().product()
+}
+
+fn tensor_values_f64(tensor: &Tensor) -> TCResult<Vec<f64>> {
+    match tensor {
+        Tensor::F32(_) => Ok(tensor
+            .flattened_f32()
+            .map_err(TCError::bad_request)?
+            .into_iter()
+            .map(f64::from)
+            .collect()),
+        Tensor::U64(_) => Ok(tensor
+            .flattened_u64()
+            .map_err(TCError::bad_request)?
+            .into_iter()
+            .map(|v| v as f64)
+            .collect()),
+    }
+}
+
+fn tensor_from_f64_like(left: &Tensor, shape: Vec<usize>, values: Vec<f64>) -> TCResult<Tensor> {
+    match left {
+        Tensor::U64(_) if values.iter().all(|v| *v >= 0.0 && v.fract() == 0.0) => {
+            Tensor::dense_u64(shape, values.into_iter().map(|v| v as u64).collect())
+                .map_err(TCError::bad_request)
+        }
+        _ => Tensor::dense_f32(shape, values.into_iter().map(|v| v as f32).collect())
+            .map_err(TCError::bad_request),
+    }
+}
+
+fn shape_from_state(state: State) -> TCResult<Vec<usize>> {
+    let items = tuple_state_to_items(state, "tensor shape")?;
+    items
+        .into_iter()
+        .map(|item| match item {
+            State::Scalar(Scalar::Value(Value::Number(n))) => Ok(n.cast_into()),
+            other => Err(TCError::bad_request(format!(
+                "expected tensor shape dimension to be a number but found {other:?}"
+            ))),
+        })
+        .collect()
+}
+
+fn tensor_reshape(tensor: Tensor, shape_state: State) -> TCResult<Tensor> {
+    let shape = shape_from_state(shape_state)?;
+    if shape.iter().product::<usize>() != tensor_size(&tensor) {
+        return Err(TCError::bad_request(
+            "tensor reshape changes size".to_string(),
+        ));
+    }
+    tensor_from_f64_like(&tensor, shape, tensor_values_f64(&tensor)?)
+}
+
+fn tensor_expand_dims(tensor: Tensor, axes_state: State) -> TCResult<Tensor> {
+    let mut shape = tensor.shape().to_vec();
+    if matches!(
+        axes_state,
+        State::None | State::Scalar(Scalar::Value(Value::None))
+    ) {
+        shape.push(1);
+        return tensor_from_f64_like(&tensor, shape, tensor_values_f64(&tensor)?);
+    }
+
+    let axes = shape_from_state(axes_state)?;
+    for axis in axes {
+        if axis > shape.len() {
+            return Err(TCError::bad_request(
+                "expand_dims axis out of bounds".to_string(),
+            ));
+        }
+        shape.insert(axis, 1);
+    }
+    tensor_from_f64_like(&tensor, shape, tensor_values_f64(&tensor)?)
+}
+
+fn tensor_broadcast(tensor: Tensor, shape_state: State) -> TCResult<Tensor> {
+    let shape = shape_from_state(shape_state)?;
+    let old_shape = tensor.shape().to_vec();
+    let old_values = tensor_values_f64(&tensor)?;
+    let old_size = old_values.len();
+    let new_size = shape.iter().product::<usize>();
+
+    if old_size == new_size {
+        return tensor_from_f64_like(&tensor, shape, old_values);
+    }
+    if old_size == 1 {
+        return tensor_from_f64_like(&tensor, shape, vec![old_values[0]; new_size]);
+    }
+    if old_shape == shape {
+        return tensor_from_f64_like(&tensor, shape, old_values);
+    }
+
+    Err(TCError::bad_request(
+        "only scalar or equal-size tensor broadcast is currently supported".to_string(),
+    ))
+}
+
+fn tensor_transpose(tensor: Tensor, permutation_state: State) -> TCResult<Tensor> {
+    let shape = tensor.shape().to_vec();
+    if shape.len() != 2 {
+        return Err(TCError::bad_request(
+            "transpose currently supports 2D tensors".to_string(),
+        ));
+    }
+
+    if !matches!(
+        permutation_state,
+        State::None | State::Scalar(Scalar::Value(Value::None))
+    ) {
+        let permutation = shape_from_state(permutation_state)?;
+        if permutation != [1, 0] {
+            return Err(TCError::bad_request(
+                "transpose currently supports only [1, 0] permutation".to_string(),
+            ));
+        }
+    }
+
+    let rows = shape[0];
+    let cols = shape[1];
+    let values = tensor_values_f64(&tensor)?;
+    let mut out = vec![0.0; values.len()];
+    for row in 0..rows {
+        for col in 0..cols {
+            out[col * rows + row] = values[row * cols + col];
+        }
+    }
+    tensor_from_f64_like(&tensor, vec![cols, rows], out)
+}
+
+fn tensor_reduce(tensor: &Tensor, op: &str) -> TCResult<State> {
+    let values = tensor_values_f64(tensor)?;
+    let value = match op {
+        "max" => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        "min" => values.iter().copied().fold(f64::INFINITY, f64::min),
+        "mean" => values.iter().sum::<f64>() / values.len() as f64,
+        "norm" => values.iter().map(|v| v * v).sum::<f64>().sqrt(),
+        "product" => values.iter().product::<f64>(),
+        "std" => {
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            (values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / values.len() as f64)
+                .sqrt()
+        }
+        "sum" => values.iter().sum::<f64>(),
+        _ => unreachable!("tensor reduce op checked by caller"),
+    };
+    Ok(State::from(Value::Number(Number::from(value))))
+}
+
+fn tensor_binary(left: &Tensor, right: &Tensor, op: &str) -> TCResult<Tensor> {
+    let left_values = tensor_values_f64(left)?;
+    let right_values = tensor_values_f64(right)?;
+    let shape = if left_values.len() == right_values.len() || right_values.len() == 1 {
+        left.shape().to_vec()
+    } else if left_values.len() == 1 {
+        right.shape().to_vec()
+    } else {
+        return Err(TCError::bad_request(
+            "tensor binary op requires equal size or scalar broadcast".to_string(),
+        ));
+    };
+
+    let len = shape.iter().product::<usize>();
+    let out = (0..len)
+        .map(|idx| {
+            let l = left_values[if left_values.len() == 1 { 0 } else { idx }];
+            let r = right_values[if right_values.len() == 1 { 0 } else { idx }];
+            match op {
+                "add" => l + r,
+                "sub" => l - r,
+                "mul" => l * r,
+                "div" => l / r,
+                "and" => f64::from(l != 0.0 && r != 0.0),
+                "or" => f64::from(l != 0.0 || r != 0.0),
+                "xor" => f64::from((l != 0.0) ^ (r != 0.0)),
+                _ => unreachable!("tensor binary op checked by caller"),
+            }
+        })
+        .collect();
+
+    tensor_from_f64_like(left, shape, out)
+}
+
+fn tensor_not(tensor: &Tensor) -> TCResult<Tensor> {
+    let values = tensor_values_f64(tensor)?
+        .into_iter()
+        .map(|v| f64::from(v == 0.0))
+        .collect();
+    tensor_from_f64_like(tensor, tensor.shape().to_vec(), values)
+}
+
+fn tensor_cond(cond: &Tensor, then_tensor: &Tensor, else_tensor: &Tensor) -> TCResult<Tensor> {
+    let cond_values = tensor_values_f64(cond)?;
+    let then_values = tensor_values_f64(then_tensor)?;
+    let else_values = tensor_values_f64(else_tensor)?;
+    if then_values.len() != else_values.len() {
+        return Err(TCError::bad_request(
+            "tensor cond branches must have equal size".to_string(),
+        ));
+    }
+    if cond_values.len() != 1 && cond_values.len() != then_values.len() {
+        return Err(TCError::bad_request(
+            "tensor cond must be scalar or equal size".to_string(),
+        ));
+    }
+
+    let out = (0..then_values.len())
+        .map(|idx| {
+            if cond_values[if cond_values.len() == 1 { 0 } else { idx }] != 0.0 {
+                then_values[idx]
+            } else {
+                else_values[idx]
+            }
+        })
+        .collect();
+    tensor_from_f64_like(then_tensor, then_tensor.shape().to_vec(), out)
+}
+
+fn tensor_matmul(left: &Tensor, right: &Tensor) -> TCResult<Tensor> {
+    let left_shape = left.shape();
+    let right_shape = right.shape();
+    if left_shape.len() != 2 || right_shape.len() != 2 {
+        return Err(TCError::bad_request(
+            "tensor matmul currently supports 2D tensors".to_string(),
+        ));
+    }
+    let rows = left_shape[0];
+    let inner = left_shape[1];
+    if right_shape[0] != inner {
+        return Err(TCError::bad_request(
+            "tensor matmul inner dimensions do not match".to_string(),
+        ));
+    }
+    let cols = right_shape[1];
+    let left_values = tensor_values_f64(left)?;
+    let right_values = tensor_values_f64(right)?;
+    let mut out = vec![0.0; rows * cols];
+    for row in 0..rows {
+        for col in 0..cols {
+            let mut sum = 0.0;
+            for k in 0..inner {
+                sum += left_values[row * inner + k] * right_values[k * cols + col];
+            }
+            out[row * cols + col] = sum;
+        }
+    }
+    tensor_from_f64_like(left, vec![rows, cols], out)
 }
 
 fn scalar_to_value(
@@ -768,7 +1201,7 @@ fn values_to_params_for_opdef(values: &Arc<HashMap<Id, State>>, opdef: &OpDef) -
     let mut params = Map::new();
     for id in opdef_free_ids(opdef) {
         if let Some(value) = values.get(&id) {
-            params.insert(id.clone(), value.clone());
+            params.insert(id, value.clone());
         }
     }
     params

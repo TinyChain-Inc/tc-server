@@ -139,6 +139,7 @@ fn scalar_requires(scalar: &Scalar, deps: &mut HashSet<Id>) {
                 scalar_requires(value, deps);
             }
         }
+        Scalar::Op(opdef) => opdef_requires(opdef, deps),
         _ => {}
     }
 }

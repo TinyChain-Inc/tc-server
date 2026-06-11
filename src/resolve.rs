@@ -16,7 +16,9 @@ impl Resolve for OpRef {
         let values = Arc::new(HashMap::new());
         let scalar = tc_ir::Scalar::Ref(Box::new(TCRef::Op(self.clone())));
 
-        Box::pin(async move { crate::op_executor::resolve_scalar(scalar, &values, &txn, None).await })
+        Box::pin(
+            async move { crate::op_executor::resolve_scalar(scalar, &values, &txn, None).await },
+        )
     }
 }
 
@@ -26,7 +28,9 @@ impl Resolve for TCRef {
         let values = Arc::new(HashMap::new());
         let scalar = tc_ir::Scalar::Ref(Box::new(self.clone()));
 
-        Box::pin(async move { crate::op_executor::resolve_scalar(scalar, &values, &txn, None).await })
+        Box::pin(
+            async move { crate::op_executor::resolve_scalar(scalar, &values, &txn, None).await },
+        )
     }
 }
 
@@ -184,10 +188,7 @@ mod tests {
         )))));
 
         futures::executor::block_on(crate::op_executor::resolve_scalar(
-            scalar,
-            &values,
-            &txn,
-            None,
+            scalar, &values, &txn, None,
         ))
         .expect("resolve ref subject post");
 

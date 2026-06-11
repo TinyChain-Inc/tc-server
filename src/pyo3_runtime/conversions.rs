@@ -61,7 +61,8 @@ fn encode_to_json_value<T>(value: T) -> PyResult<serde_json::Value>
 where
     T: for<'en> destream::IntoStream<'en>,
 {
-    let stream = destream_json::encode(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let stream =
+        destream_json::encode(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
     let bytes = futures::executor::block_on(async move {
         use futures::TryStreamExt;
         stream

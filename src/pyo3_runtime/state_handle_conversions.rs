@@ -1,6 +1,7 @@
 use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyString};
 
 use crate::State;
 
@@ -24,7 +25,35 @@ pub(crate) fn request_body_state(body: Option<PyStateHandle>) -> PyResult<Option
     Python::with_gil(|py| {
         let value = handle.value();
         let any = value.bind(py);
-        extract_state(any).map(Some)
+        if any.is_instance_of::<PyState>() {
+            extract_state(any).map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+pub(crate) fn request_body_raw_bytes(body: Option<PyStateHandle>) -> PyResult<Option<Vec<u8>>> {
+    let handle = match body {
+        Some(handle) => handle,
+        None => return Ok(None),
+    };
+
+    Python::with_gil(|py| {
+        let value = handle.value();
+        let any = value.bind(py);
+        if any.is_instance_of::<PyState>() {
+            return Ok(None);
+        }
+        if let Ok(bytes) = any.downcast::<PyBytes>() {
+            return Ok(Some(bytes.as_bytes().to_vec()));
+        }
+        if let Ok(string) = any.downcast::<PyString>() {
+            return Ok(Some(string.to_str()?.as_bytes().to_vec()));
+        }
+        Err(PyValueError::new_err(
+            "expected tinychain.State, bytes, or string body",
+        ))
     })
 }
 
@@ -46,7 +75,8 @@ pub(crate) fn encode_state_to_bytes(state: State) -> PyResult<Vec<u8>> {
 }
 
 fn encode_state_via_destream(state: State) -> PyResult<Vec<u8>> {
-    let stream = destream_json::encode(state).map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let stream =
+        destream_json::encode(state).map_err(|err| PyValueError::new_err(err.to_string()))?;
     futures::executor::block_on(async move {
         use futures::TryStreamExt;
 
