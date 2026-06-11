@@ -513,6 +513,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decodes_native_state_body_with_txn_context() {
+        let request = http::Request::builder()
+            .method("PUT")
+            .uri("/lib")
+            .body(Body::empty())
+            .expect("request");
+        let mut request = request;
+        let txn = crate::txn::TxnManager::with_host_id("test-host").begin();
+        request.extensions_mut().insert(txn);
+        request.extensions_mut().insert(super::parse::NativeStateBody::new(
+            State::from(Value::from("bar")),
+        ));
+
+        let state = decode_request_body_with_txn::<State>(&request)
+            .await
+            .expect("decode")
+            .expect("some");
+
+        assert!(matches!(
+            state,
+            State::Scalar(tc_ir::Scalar::Value(Value::String(ref s))) if s == "bar"
+        ));
+    }
+
+    #[tokio::test]
     async fn serves_native_library_route() {
         #[derive(Clone)]
         struct HelloHandler;

@@ -5,6 +5,8 @@ use futures::stream;
 use hyper::header::AUTHORIZATION;
 use hyper::{body::to_bytes, header};
 use tc_error::{TCError, TCResult};
+use tc_ir::Scalar;
+use tc_state::State;
 use tc_value::Value;
 use url::form_urlencoded;
 
@@ -86,6 +88,27 @@ pub(crate) struct RequestBody {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone)]
+pub(crate) struct NativeStateBody {
+    state: State,
+}
+
+#[allow(dead_code)]
+impl NativeStateBody {
+    pub(crate) fn new(state: State) -> Self {
+        Self { state }
+    }
+
+    pub(crate) fn clone_state(&self) -> State {
+        self.state.clone()
+    }
+
+    pub(crate) fn is_none(&self) -> bool {
+        self.state.is_none()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 impl RequestBody {
     pub(crate) fn new(bytes: Bytes) -> Self {
         Self { bytes }
@@ -103,8 +126,19 @@ impl RequestBody {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn decode_request_body_with_txn<T>(req: &Request) -> TCResult<Option<T>>
 where
-    T: destream::de::FromStream<Context = Arc<dyn tc_ir::Transaction>>,
+    T: destream::de::FromStream<Context = Arc<dyn tc_ir::Transaction>> + TryFrom<State>,
+    <T as TryFrom<State>>::Error: std::fmt::Display,
 {
+    if let Some(body) = req.extensions().get::<NativeStateBody>() {
+        if body.is_none() {
+            return Ok(None);
+        }
+
+        return T::try_from(body.clone_state())
+            .map(Some)
+            .map_err(|err| TCError::bad_request(err.to_string()));
+    }
+
     let body = match req.extensions().get::<RequestBody>() {
         Some(body) if !body.is_empty() => body.clone_bytes(),
         _ => return Ok(None),
@@ -126,6 +160,17 @@ where
 }
 
 pub(crate) async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> {
+    if let Some(body) = req.extensions().get::<NativeStateBody>() {
+        if body.is_none() {
+            return Ok(None);
+        }
+
+        return match body.clone_state() {
+            State::Scalar(Scalar::Value(value)) => Ok(Some(value)),
+            _ => Err(TCError::bad_request("expected scalar value request body")),
+        };
+    }
+
     match req.extensions().get::<RequestBody>() {
         Some(body) if !body.is_empty() => {
             let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body.clone_bytes())]);

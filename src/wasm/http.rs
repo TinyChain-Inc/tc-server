@@ -104,36 +104,9 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request) -> Respo
             // If the WASM route returns a TinyChain ref envelope (`TCRef` or `OpRef`) as JSON,
             // resolve it within the current transaction and return the resolved state.
             if let Some(r) = try_decode_wasm_ref(&bytes).await {
-                match r {
-                    tc_ir::TCRef::Op(op) => match op.resolve(&txn).await {
-                        Ok(state) => return state_response(state),
-                        Err(err) => return error_response(err),
-                    },
-                    tc_ir::TCRef::Id(_) => {
-                        return error_response(TCError::bad_request(
-                            "cannot resolve TCRef::Id without a scope".to_string(),
-                        ));
-                    }
-                    tc_ir::TCRef::If(_) => {
-                        return error_response(TCError::bad_request(
-                            "cannot resolve TCRef::If without a scope".to_string(),
-                        ));
-                    }
-                    tc_ir::TCRef::Cond(_) => {
-                        return error_response(TCError::bad_request(
-                            "cannot resolve TCRef::Cond without a scope".to_string(),
-                        ));
-                    }
-                    tc_ir::TCRef::While(_) => {
-                        return error_response(TCError::bad_request(
-                            "cannot resolve TCRef::While without a scope".to_string(),
-                        ));
-                    }
-                    tc_ir::TCRef::ForEach(_) => {
-                        return error_response(TCError::bad_request(
-                            "cannot resolve TCRef::ForEach without a scope".to_string(),
-                        ));
-                    }
+                match r.resolve(&txn).await {
+                    Ok(state) => return state_response(state),
+                    Err(err) => return error_response(err),
                 }
             }
 

@@ -11,6 +11,7 @@ This note explains how to stand up a TinyChain-compatible server (or custom adap
   transactions directly.
 - **IR contract:** Route inbound requests into `tc-ir` handlers so the same capability manifests and IR types are exercised regardless of transport.
 - **Transaction + auth surface:** Preserve the `txn_id` lifecycle and capability masks; adapters only translate protocol details and defer begin/commit/rollback to the shared kernel (`Kernel::route_request`).
+- **Scalar value surface:** Treat booleans as first-class scalar values (`Value::Bool`) instead of numeric aliases, and support nested `Map`/`Tuple` value variants in addition to literal `None`/`String`/`Number` and `Link`.
 
 ## Dependency authorization & URI routing
 

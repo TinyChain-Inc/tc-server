@@ -53,6 +53,24 @@ publishers to pull in any adapters or the Wasmtime dependency. Actions:
   hardware-accelerated code paths) behind TinyChain’s transaction/auth surface without shipping
   any transport adapters they do not need.
 
+### PyO3 bridge trait-system migration (in progress)
+
+Goal: keep in-process Python integration scalable and fast by removing centralized per-type
+binding impls and avoiding unnecessary serialization on native request paths.
+
+- Introduce shared conversion traits (`PyExtract`, `PyProject`) and migrate adapter plumbing to
+  compose type-family conversions instead of monolithic per-variant impls.
+- Keep conversion ownership near each type family:
+  - `tc-value` owns value projection/extraction.
+  - `tc-state` owns collection/state family projection/extraction.
+  - `tc-server` composes those traits at adapter boundaries.
+- Add a native dispatch lane for PyO3 in-process calls which passes `State` handles directly
+  through kernel routing. Keep JSON/destream encode/decode only at HTTP/WASM boundaries.
+- Add regression tests proving native PyO3 dispatch avoids encode/decode on request/response
+  bodies while preserving error/status semantics.
+- Add perf gates (latency + allocation) for common in-process operations (scalar get/post,
+  map/tuple payloads, tensor metadata reads) and block regressions beyond defined budgets.
+
 ## 1. Transaction foundation
 
 **Objective:** Every handler runs inside a `Txn` with explicit commit/rollback hooks.

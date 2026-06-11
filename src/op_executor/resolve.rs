@@ -6,7 +6,7 @@ use number_general::Number;
 use pathlink::Link;
 use safecast::CastInto;
 use tc_error::{TCError, TCResult};
-use tc_ir::{CondOp, ForEach, Id, IfRef, Map, OpDef, OpRef, Scalar, Subject, TCRef, While};
+use tc_ir::{Cond, ForEach, Id, Map, OpDef, OpRef, Scalar, Subject, TCRef, While};
 use tc_state::State;
 use tc_value::Value;
 
@@ -16,7 +16,7 @@ use crate::op_plan::opdef_free_ids;
 use super::execute::execute_post_with_self;
 use super::reflect::reflect_link;
 
-pub(super) fn resolve_scalar<'a>(
+pub(crate) fn resolve_scalar<'a>(
     scalar: Scalar,
     values: &'a Arc<HashMap<Id, State>>,
     txn: &'a crate::txn::TxnHandle,
@@ -48,8 +48,7 @@ pub(super) fn resolve_scalar<'a>(
                     .cloned()
                     .ok_or_else(|| TCError::not_found(format!("unknown id ${}", id_ref.as_str()))),
                 TCRef::Op(op) => resolve_opref(op, values, txn, self_link).await,
-                TCRef::If(if_ref) => resolve_if(*if_ref, values, txn, self_link).await,
-                TCRef::Cond(cond_op) => resolve_cond(*cond_op, values, txn, self_link).await,
+                TCRef::Cond(cond) => resolve_cond(*cond, values, txn, self_link).await,
                 TCRef::While(while_ref) => resolve_while(*while_ref, values, txn, self_link).await,
                 TCRef::ForEach(for_each) => {
                     resolve_for_each(*for_each, values, txn, self_link).await
@@ -72,14 +71,14 @@ fn resolve_opref(
         match op {
             OpRef::Get((subject, key)) => match subject {
                 Subject::Link(_) | Subject::Ref(_, _) => {
-                    let link = resolve_subject(subject, self_link.as_ref())?;
+                    let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
                     let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
                     txn.get(link, txn.clone(), key).await
                 }
             },
             OpRef::Put((subject, key, value)) => match subject {
                 Subject::Link(_) | Subject::Ref(_, _) => {
-                    let link = resolve_subject(subject, self_link.as_ref())?;
+                    let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
                     let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
                     let value = scalar_to_state(value, &values, &txn, self_link.as_ref()).await?;
                     txn.put(link, txn.clone(), key, value)
@@ -89,7 +88,7 @@ fn resolve_opref(
             },
             OpRef::Post((subject, params)) => match subject {
                 Subject::Link(_) => {
-                    let link = resolve_subject(subject, self_link.as_ref())?;
+                    let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
                     if let Some(state) = reflect_link(&link, &params, &values)? {
                         return Ok(state);
                     }
@@ -98,8 +97,11 @@ fn resolve_opref(
                 }
                 Subject::Ref(id_ref, suffix) => {
                     if id_ref.as_str() == "self" {
-                        let link =
-                            resolve_subject(Subject::Ref(id_ref, suffix), self_link.as_ref())?;
+                        let link = resolve_subject(
+                            Subject::Ref(id_ref, suffix),
+                            values.as_ref(),
+                            self_link.as_ref(),
+                        )?;
                         let params =
                             resolve_params(params, &values, &txn, self_link.as_ref()).await?;
                         return txn.post(link, txn.clone(), params).await;
@@ -500,17 +502,20 @@ fn resolve_opref(
 
                         Ok(state)
                     } else {
-                        Err(TCError::bad_request(format!(
-                            "unsupported opref subject ${}{}",
-                            id_ref.as_str(),
-                            suffix
-                        )))
+                        let link = resolve_subject(
+                            Subject::Ref(id_ref, suffix),
+                            values.as_ref(),
+                            self_link.as_ref(),
+                        )?;
+                        let params =
+                            resolve_params(params, &values, &txn, self_link.as_ref()).await?;
+                        txn.post(link, txn.clone(), params).await
                     }
                 }
             },
             OpRef::Delete((subject, key)) => match subject {
                 Subject::Link(_) | Subject::Ref(_, _) => {
-                    let link = resolve_subject(subject, self_link.as_ref())?;
+                    let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
                     let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
                     txn.delete(link, txn.clone(), key)
                         .await
@@ -521,20 +526,41 @@ fn resolve_opref(
     })
 }
 
-fn resolve_subject(subject: Subject, self_link: Option<&Link>) -> TCResult<Link> {
+fn resolve_subject(
+    subject: Subject,
+    values: &HashMap<Id, State>,
+    self_link: Option<&Link>,
+) -> TCResult<Link> {
     match subject {
         Subject::Link(link) => Ok(link),
         Subject::Ref(id_ref, suffix) => {
-            if id_ref.as_str() != "self" {
-                return Err(TCError::bad_request(format!(
-                    "unsupported opref subject ${}",
-                    id_ref.as_str()
-                )));
-            }
+            let base = if id_ref.as_str() == "self" {
+                self_link
+                    .ok_or_else(|| TCError::bad_request("OpDef has $self but no scope"))?
+                    .clone()
+            } else {
+                let state = values
+                    .get(id_ref.as_str())
+                    .ok_or_else(|| TCError::not_found(format!("unknown id ${}", id_ref.as_str())))?;
 
-            let base = self_link
-                .ok_or_else(|| TCError::bad_request("OpDef has $self but no scope"))?
-                .clone();
+                match state {
+                    State::Scalar(Scalar::Value(Value::Link(link))) => link.clone(),
+                    State::Scalar(Scalar::Value(Value::String(link))) => {
+                        link.parse().map_err(|err| {
+                            TCError::bad_request(format!(
+                                "expected id ${} to resolve to a valid link, found invalid string: {err}",
+                                id_ref.as_str()
+                            ))
+                        })?
+                    }
+                    other => {
+                        return Err(TCError::bad_request(format!(
+                            "expected id ${} to resolve to a link, found {other:?}",
+                            id_ref.as_str()
+                        )))
+                    }
+                }
+            };
 
             let mut link = base;
             for segment in suffix.as_ref() {
@@ -569,11 +595,8 @@ fn scalar_to_value(
                         TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
                     })?,
                     TCRef::Op(op) => resolve_opref(op, &values, &txn, self_link.as_ref()).await?,
-                    TCRef::If(if_ref) => {
-                        resolve_if(*if_ref, &values, &txn, self_link.as_ref()).await?
-                    }
-                    TCRef::Cond(cond_op) => {
-                        resolve_cond(*cond_op, &values, &txn, self_link.as_ref()).await?
+                    TCRef::Cond(cond) => {
+                        resolve_cond(*cond, &values, &txn, self_link.as_ref()).await?
                     }
                     TCRef::While(while_ref) => {
                         resolve_while(*while_ref, &values, &txn, self_link.as_ref()).await?
@@ -621,10 +644,7 @@ fn scalar_to_state(
                     .cloned()
                     .ok_or_else(|| TCError::not_found(format!("unknown id ${}", id_ref.as_str()))),
                 TCRef::Op(op) => resolve_opref(op, &values, &txn, self_link.as_ref()).await,
-                TCRef::If(if_ref) => resolve_if(*if_ref, &values, &txn, self_link.as_ref()).await,
-                TCRef::Cond(cond_op) => {
-                    resolve_cond(*cond_op, &values, &txn, self_link.as_ref()).await
-                }
+                TCRef::Cond(cond) => resolve_cond(*cond, &values, &txn, self_link.as_ref()).await,
                 TCRef::While(while_ref) => {
                     resolve_while(*while_ref, &values, &txn, self_link.as_ref()).await
                 }
@@ -636,43 +656,29 @@ fn scalar_to_state(
     })
 }
 
-async fn resolve_if(
-    if_ref: IfRef,
-    values: &Arc<HashMap<Id, State>>,
-    txn: &crate::txn::TxnHandle,
-    self_link: Option<&Link>,
-) -> TCResult<State> {
-    let IfRef {
-        cond,
-        then,
-        or_else,
-    } = if_ref;
-    let cond_state = resolve_scalar(Scalar::from(cond), values, txn, self_link).await?;
-    let cond = resolve_bool_state(cond_state, values, txn, self_link).await?;
-    if cond {
-        resolve_scalar(then, values, txn, self_link).await
-    } else {
-        resolve_scalar(or_else, values, txn, self_link).await
-    }
-}
-
 async fn resolve_cond(
-    cond_op: CondOp,
+    cond_ref: Cond,
     values: &Arc<HashMap<Id, State>>,
     txn: &crate::txn::TxnHandle,
     self_link: Option<&Link>,
 ) -> TCResult<State> {
-    let CondOp {
+    let Cond {
         cond,
         then,
         or_else,
-    } = cond_op;
+    } = cond_ref;
 
     let cond_state = resolve_scalar(Scalar::from(cond), values, txn, self_link).await?;
     let cond_value = resolve_bool_state(cond_state, values, txn, self_link).await?;
-    let op_def = if cond_value { then } else { or_else };
-    let params = values_to_params_for_opdef(values, &op_def);
-    execute_post_with_self(txn, op_def, params, self_link.cloned()).await
+    let branch = if cond_value { then } else { or_else };
+
+    match branch {
+        Scalar::Op(op_def) => {
+            let params = values_to_params_for_opdef(values, &op_def);
+            execute_post_with_self(txn, op_def, params, self_link.cloned()).await
+        }
+        scalar => resolve_scalar(scalar, values, txn, self_link).await,
+    }
 }
 
 async fn resolve_while(
@@ -807,9 +813,16 @@ fn string_state_value(state: &State) -> Option<&str> {
 
 fn value_to_render_string(value: Value) -> TCResult<String> {
     match value {
+        Value::Bool(value) => Ok(value.to_string()),
         Value::String(value) => Ok(value),
         Value::Number(value) => Ok(value.to_string()),
         Value::Link(value) => Ok(value.to_string()),
+        Value::Map(_) => Err(TCError::bad_request(
+            "cannot render map as a string parameter".to_string(),
+        )),
+        Value::Tuple(_) => Err(TCError::bad_request(
+            "cannot render tuple as a string parameter".to_string(),
+        )),
         Value::None => Err(TCError::bad_request(
             "cannot render None as a string parameter".to_string(),
         )),
@@ -896,6 +909,9 @@ async fn resolve_bool_state(
         match state {
             State::Scalar(Scalar::Ref(r)) => {
                 state = resolve_scalar(Scalar::Ref(r), values, txn, self_link).await?;
+            }
+            State::Scalar(Scalar::Value(Value::Bool(value))) => {
+                return Ok(value);
             }
             State::Scalar(Scalar::Value(Value::Number(number))) => {
                 return Ok(number.cast_into());

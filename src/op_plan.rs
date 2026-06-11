@@ -114,15 +114,10 @@ fn scalar_requires(scalar: &Scalar, deps: &mut HashSet<Id>) {
             TCRef::Op(op) => {
                 opref_requires(op, deps);
             }
-            TCRef::If(if_ref) => {
-                tcref_requires(&if_ref.cond, deps);
-                scalar_requires(&if_ref.then, deps);
-                scalar_requires(&if_ref.or_else, deps);
-            }
-            TCRef::Cond(cond_op) => {
-                tcref_requires(&cond_op.cond, deps);
-                opdef_requires(&cond_op.then, deps);
-                opdef_requires(&cond_op.or_else, deps);
+            TCRef::Cond(cond) => {
+                tcref_requires(&cond.cond, deps);
+                scalar_requires(&cond.then, deps);
+                scalar_requires(&cond.or_else, deps);
             }
             TCRef::While(while_ref) => {
                 scalar_requires(&while_ref.cond, deps);
@@ -156,15 +151,10 @@ fn tcref_requires(r: &TCRef, deps: &mut HashSet<Id>) {
         TCRef::Op(op) => {
             opref_requires(op, deps);
         }
-        TCRef::If(if_ref) => {
-            tcref_requires(&if_ref.cond, deps);
-            scalar_requires(&if_ref.then, deps);
-            scalar_requires(&if_ref.or_else, deps);
-        }
-        TCRef::Cond(cond_op) => {
-            tcref_requires(&cond_op.cond, deps);
-            opdef_requires(&cond_op.then, deps);
-            opdef_requires(&cond_op.or_else, deps);
+        TCRef::Cond(cond) => {
+            tcref_requires(&cond.cond, deps);
+            scalar_requires(&cond.then, deps);
+            scalar_requires(&cond.or_else, deps);
         }
         TCRef::While(while_ref) => {
             scalar_requires(&while_ref.cond, deps);
