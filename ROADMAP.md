@@ -75,6 +75,15 @@ binding impls and avoiding unnecessary serialization on native request paths.
 
 **Objective:** Every handler runs inside a `Txn` with explicit commit/rollback hooks.
 
+### Outbound egress enforcement boundary (planning requirement)
+
+External HTTP egress must be default-deny at the kernel boundary. Runtime/adapters
+may only permit outbound calls that map to declared dependency policies, with
+third-party API traffic routed through `/service/std/clearinghouse` connector
+paths. This ensures install-time dependency whitelists remain authoritative and
+prevents bespoke adapter/client HTTP code paths from bypassing clearinghouse
+authorization and audit controls.
+
 Design note: This section covers the v1 “cross-service transaction” core (txn workspaces,
 per-resource staging, leader/participant finalize), but re-expressed using the v2 kernel shape.
 The L0/L1 governance `ARCHITECTURE.md` references `txn_lock` at the consensus level; the runtime
