@@ -57,6 +57,9 @@ pub(crate) fn state_response(state: State) -> Response {
                 .expect("state response");
 
             #[cfg(feature = "pyo3")]
+            let mut response = response;
+
+            #[cfg(feature = "pyo3")]
             {
                 response
                     .extensions_mut()

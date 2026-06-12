@@ -83,10 +83,22 @@ impl PyTensor {
         new_py_tensor(py, tensor)
     }
 
+    #[classmethod]
+    pub fn dense_f64(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        shape: Vec<usize>,
+        values: Vec<f64>,
+    ) -> PyResult<Py<PyTensor>> {
+        let tensor = Tensor::dense_f64(shape, values).map_err(PyValueError::new_err)?;
+        new_py_tensor(py, tensor)
+    }
+
     pub fn dtype<'py>(slf: PyRef<'py, Self>) -> PyResult<&'static str> {
         PyTensor::with_tensor(slf, |tensor| {
             Ok(match tensor {
                 Tensor::F32(_) => "f32",
+                Tensor::F64(_) => "f64",
                 Tensor::U64(_) => "u64",
             })
         })
@@ -100,6 +112,11 @@ impl PyTensor {
         PyTensor::with_tensor(slf, |tensor| match tensor {
             Tensor::F32(_) => {
                 let values = tensor.flattened_f32().map_err(PyValueError::new_err)?;
+                let list = PyList::new_bound(py, &values);
+                Ok(list.into_py(py))
+            }
+            Tensor::F64(_) => {
+                let values = tensor.flattened_f64().map_err(PyValueError::new_err)?;
                 let list = PyList::new_bound(py, &values);
                 Ok(list.into_py(py))
             }
