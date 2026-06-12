@@ -704,7 +704,7 @@ async fn resolve_tensor_post(
             )?))
         }
         "not" => State::Collection(Collection::Tensor(tensor_not(&tensor)?)),
-        _ => return Ok(None),
+        _ => unreachable!("unsupported tensor post op segment"),
     };
 
     Ok(Some(state))
@@ -750,6 +750,7 @@ async fn tensor_param(
 fn tensor_dtype(tensor: &Tensor) -> &'static str {
     match tensor {
         Tensor::F32(_) => "f32",
+        Tensor::F64(_) => "f64",
         Tensor::U64(_) => "u64",
     }
 }
@@ -766,6 +767,7 @@ fn tensor_values_f64(tensor: &Tensor) -> TCResult<Vec<f64>> {
             .into_iter()
             .map(f64::from)
             .collect()),
+        Tensor::F64(_) => tensor.flattened_f64().map_err(TCError::bad_request),
         Tensor::U64(_) => Ok(tensor
             .flattened_u64()
             .map_err(TCError::bad_request)?
@@ -777,6 +779,7 @@ fn tensor_values_f64(tensor: &Tensor) -> TCResult<Vec<f64>> {
 
 fn tensor_from_f64_like(left: &Tensor, shape: Vec<usize>, values: Vec<f64>) -> TCResult<Tensor> {
     match left {
+        Tensor::F64(_) => Tensor::dense_f64(shape, values).map_err(TCError::bad_request),
         Tensor::U64(_) if values.iter().all(|v| *v >= 0.0 && v.fract() == 0.0) => {
             Tensor::dense_u64(shape, values.into_iter().map(|v| v as u64).collect())
                 .map_err(TCError::bad_request)
