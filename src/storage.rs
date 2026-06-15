@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::ir::{IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE};
-use freqfs::{Cache, DirEntry as FsDirEntry, DirLock as FsDirLock, FileLoad, FileSave, Name};
+use freqfs::{Cache, FileLoad, FileSave, Name};
 use get_size::GetSize;
 use pathlink::Link;
 use safecast::AsType;
@@ -213,7 +213,10 @@ impl LibraryStore {
 
     pub async fn discover_schemas(&self) -> TCResult<Vec<LibrarySchema>> {
         let mut schemas = Vec::new();
-        discover_schemas(self.root.canonical(), &mut schemas).await?;
+        let txn_id = immediate_txn_id();
+        let discovered = discover_schemas(self.root.clone(), txn_id, &mut schemas).await;
+        self.root.finalize(txn_id).await;
+        discovered?;
         Ok(schemas)
     }
 }
@@ -270,11 +273,22 @@ impl LibraryStore {
     }
 
     pub async fn load_artifact(&self, schema: &LibrarySchema) -> TCResult<Option<Artifact>> {
-        let Some(dir) = self.resolve_canonical_dir().await? else {
+        let txn_id = immediate_txn_id();
+        let loaded = self.load_artifact_at(txn_id, schema).await;
+        self.root.finalize(txn_id).await;
+        loaded
+    }
+
+    async fn load_artifact_at(
+        &self,
+        txn_id: StorageTxnId,
+        schema: &LibrarySchema,
+    ) -> TCResult<Option<Artifact>> {
+        let Some(dir) = self.resolve_canonical_dir(txn_id).await? else {
             return Ok(None);
         };
 
-        if let Some(schema_bytes) = read_canonical_file(&dir, SCHEMA_FILE).await? {
+        if let Some(schema_bytes) = read_canonical_file(&dir, txn_id, SCHEMA_FILE).await? {
             let stored = decode_schema_bytes(&schema_bytes).map_err(TCError::internal)?;
             if stored.id() != schema.id() || stored.version() != schema.version() {
                 return Ok(None);
@@ -283,7 +297,7 @@ impl LibraryStore {
             return Ok(None);
         }
 
-        match read_canonical_file(&dir, WASM_FILE).await? {
+        match read_canonical_file(&dir, txn_id, WASM_FILE).await? {
             Some(wasm_bytes) if !wasm_bytes.is_empty() => {
                 return Ok(Some(Artifact {
                     path: schema.id().to_string(),
@@ -294,7 +308,7 @@ impl LibraryStore {
             _ => {}
         }
 
-        match read_canonical_file(&dir, IR_FILE).await? {
+        match read_canonical_file(&dir, txn_id, IR_FILE).await? {
             Some(ir_bytes) if !ir_bytes.is_empty() => {
                 return Ok(Some(Artifact {
                     path: schema.id().to_string(),
@@ -392,20 +406,15 @@ impl LibraryStore {
         Ok(Some(current))
     }
 
-    async fn resolve_canonical_dir(&self) -> TCResult<Option<FsDirLock<LibraryFile>>> {
-        let mut current = self.root.canonical();
+    async fn resolve_canonical_dir(&self, txn_id: StorageTxnId) -> TCResult<Option<LibraryRoot>> {
+        let mut current = self.root.clone();
 
         for segment in self.segments.iter() {
-            let next = {
-                let guard = current.read().await;
-                guard.get_dir(&segment.to_string()).cloned()
-            };
-
-            let Some(next) = next else {
+            let Some(next) = current.get_dir(txn_id, segment).await.map_err(map_txfs)? else {
                 return Ok(None);
             };
 
-            current = next;
+            current = (*next).clone();
         }
 
         Ok(Some(current))
@@ -442,28 +451,22 @@ pub(crate) async fn load_library_root(root: PathBuf) -> TCResult<LibraryRoot> {
 }
 
 async fn discover_schemas(
-    dir: FsDirLock<LibraryFile>,
+    dir: LibraryRoot,
+    txn_id: StorageTxnId,
     schemas: &mut Vec<LibrarySchema>,
 ) -> TCResult<()> {
     let mut pending = vec![dir];
 
     while let Some(current) = pending.pop() {
-        let entries = {
-            let guard = current.read().await;
-            guard
-                .iter()
-                .map(|(name, entry)| match entry {
-                    FsDirEntry::Dir(subdir) => (name.clone(), FsDirEntry::Dir(subdir.clone())),
-                    FsDirEntry::File(file) => (name.clone(), FsDirEntry::File(file.clone())),
-                })
-                .collect::<Vec<_>>()
-        };
+        let entries = current.iter(txn_id).await.map_err(map_txfs)?;
 
         for (name, entry) in entries {
-            match entry {
-                FsDirEntry::Dir(subdir) if name != txfs::VERSIONS => pending.push(subdir),
-                FsDirEntry::File(file) if name == SCHEMA_FILE => {
-                    let guard = file.read::<LibraryFile>().await.map_err(map_io)?;
+            match &*entry {
+                txfs::DirEntry::Dir(subdir) if name.to_string() != txfs::VERSIONS => {
+                    pending.push(subdir.clone());
+                }
+                txfs::DirEntry::File(file) if name.to_string() == SCHEMA_FILE => {
+                    let guard = file.read::<LibraryFile>(txn_id).await.map_err(map_txfs)?;
                     let schema = decode_schema_bytes(guard.bytes()).map_err(TCError::internal)?;
                     schemas.push(schema);
                 }
@@ -476,19 +479,16 @@ async fn discover_schemas(
 }
 
 async fn read_canonical_file(
-    dir: &FsDirLock<LibraryFile>,
+    dir: &LibraryRoot,
+    txn_id: StorageTxnId,
     name: &str,
 ) -> TCResult<Option<Vec<u8>>> {
-    let file = {
-        let guard = dir.read().await;
-        guard.get_file(name).cloned()
-    };
-
-    let Some(file) = file else {
+    let name = parse_name(name)?;
+    let Some(file) = dir.get_file(txn_id, &name).await.map_err(map_txfs)? else {
         return Ok(None);
     };
 
-    let guard = file.read::<LibraryFile>().await.map_err(map_io)?;
+    let guard = file.read::<LibraryFile>(txn_id).await.map_err(map_txfs)?;
     Ok(Some(guard.bytes().to_vec()))
 }
 
