@@ -48,14 +48,19 @@ where
                 return not_found();
             }
 
-            let relative = &path["/lib".len()..];
-            let normalized = if relative.starts_with('/') {
-                relative
-            } else {
+            let schema_path = library.schema().id().to_string();
+            if !path.starts_with(&schema_path) {
                 return not_found();
             };
+            if path == schema_path {
+                return schema_response(library.schema().clone());
+            }
+            let relative = &path[schema_path.len()..];
+            if !relative.starts_with('/') {
+                return not_found();
+            }
 
-            let segments = match parse_route_path(normalized) {
+            let segments = match parse_route_path(relative) {
                 Ok(segments) => segments,
                 Err(err) => return tc_error_response(err),
             };
