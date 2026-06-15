@@ -104,13 +104,12 @@ mod tests {
         use crate::auth::TokenVerifier;
         use rjwt::Token;
         use tc_ir::Claim;
-        use tc_value::Value;
         use umask::USER_EXEC;
 
         let kernel = Kernel::builder().with_lib_handler(ok_handler()).finish();
 
         let host = pathlink::Link::from_str(crate::uri::HOST_ROOT).expect("host link");
-        let actor_a = rjwt::Actor::new(Value::from("actor-a"));
+        let actor_a = rjwt::Actor::new_falcon512("actor-a".to_string()).expect("generate Falcon-512 actor");
         let resolver =
             crate::auth::KeyringActorResolver::default().with_actor(host.clone(), actor_a.clone());
         let verifier = crate::auth::RjwtTokenVerifier::new(Arc::new(resolver));
@@ -158,7 +157,7 @@ mod tests {
         );
         assert!(result.is_ok());
 
-        let actor_b = rjwt::Actor::new(Value::from("actor-b"));
+        let actor_b = rjwt::Actor::new_falcon512("actor-b".to_string()).expect("generate Falcon-512 actor");
         let resolver_b =
             crate::auth::KeyringActorResolver::default().with_actor(host.clone(), actor_b.clone());
         let verifier_b = crate::auth::RjwtTokenVerifier::new(Arc::new(resolver_b));
@@ -313,7 +312,7 @@ mod tests {
 
         assert!(err.message().contains("participant rollback failed"));
         assert!(
-            kernel.txn_manager().get(&txn_id).is_some(),
+            kernel.txn_manager().pending_ids().contains(&txn_id),
             "failed rollback must keep the transaction available for retry"
         );
     }
@@ -321,16 +320,21 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockGateway {
         calls: Arc<Mutex<Vec<pathlink::Link>>>,
+        bearer_tokens: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl crate::gateway::RpcGateway for MockGateway {
         fn get(
             &self,
             uri: pathlink::Link,
-            _txn: crate::txn::TxnHandle,
+            txn: crate::txn::TxnHandle,
             _key: tc_value::Value,
         ) -> BoxFuture<'static, tc_error::TCResult<tc_state::State>> {
             self.calls.lock().expect("calls lock").push(uri);
+            self.bearer_tokens
+                .lock()
+                .expect("bearer token lock")
+                .push(txn.raw_token().map(str::to_string));
             Box::pin(async move { Ok(tc_state::State::None) })
         }
 
@@ -595,12 +599,140 @@ mod tests {
     }
 
     #[test]
+    fn remote_dependency_rejects_metadata_only_transaction() {
+        let schema = LibrarySchema::new(
+            "/lib/acme/a/1.0.0".parse().expect("schema id"),
+            "1.0.0",
+            vec!["/lib/acme/b/1.0.0".parse().expect("dependency b")],
+        );
+
+        let registry =
+            crate::library::LibraryRegistry::new(None, std::collections::BTreeMap::new());
+        futures::executor::block_on(registry.insert_schema(schema)).expect("insert schema");
+        let module = Arc::new(registry);
+        let handlers = crate::library::LibraryHandlers::without_route(ok_handler(), ok_handler());
+        let gateway = MockGateway::default();
+
+        let kernel = Kernel::builder()
+            .with_library_module(module, handlers)
+            .with_dependency_route("/lib/acme/b/1.0.0", "127.0.0.1:1234".parse().expect("addr"))
+            .with_rpc_gateway(gateway.clone())
+            .finish();
+
+        let op = tc_ir::OpRef::Get((
+            tc_ir::Subject::Link(
+                "http://127.0.0.1:1234/lib/acme/b/1.0.0/echo"
+                    .parse()
+                    .expect("remote link"),
+            ),
+            tc_ir::Scalar::default(),
+        ));
+
+        let txn = kernel.with_resolver(kernel.txn_manager().begin().without_bearer_token());
+        let err = futures::executor::block_on(op.resolve(&txn)).expect_err("expected unauthorized");
+        assert_eq!(err.code(), tc_error::ErrorKind::Unauthorized);
+        assert!(err.message().contains("transaction-chained bearer auth"));
+        assert!(gateway.calls.lock().expect("calls lock").is_empty());
+    }
+
+    #[test]
+    fn remote_dependency_chains_protocol_token_for_owner_token_without_txn_claim() {
+        let schema = LibrarySchema::new(
+            "/lib/acme/a/1.0.0".parse().expect("schema id"),
+            "1.0.0",
+            vec!["/lib/acme/b/1.0.0".parse().expect("dependency b")],
+        );
+
+        let registry =
+            crate::library::LibraryRegistry::new(None, std::collections::BTreeMap::new());
+        futures::executor::block_on(registry.insert_schema(schema)).expect("insert schema");
+        let module = Arc::new(registry);
+        let handlers = crate::library::LibraryHandlers::without_route(ok_handler(), ok_handler());
+        let gateway = MockGateway::default();
+        let user_host = pathlink::Link::from_str(crate::uri::HOST_ROOT).expect("host link");
+        let user_actor =
+            crate::auth::Actor::new_falcon512("owner-a".to_string()).expect("user actor");
+        let user_claim = Claim::new(
+            "/lib/acme/a/1.0.0".parse().expect("user claim"),
+            umask::USER_EXEC,
+        );
+        let user_token = crate::auth::Token::new(
+            user_host.clone(),
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(30),
+            user_actor.id().clone(),
+            user_claim,
+        );
+        let user_token = user_actor
+            .sign_token(user_token)
+            .expect("signed user token")
+            .into_jwt();
+
+        let kernel = Kernel::builder()
+            .with_library_module(module, handlers)
+            .with_dependency_route("/lib/acme/b/1.0.0", "127.0.0.1:1234".parse().expect("addr"))
+            .with_rpc_gateway(gateway.clone())
+            .with_rjwt_keyring_token_verifier(
+                crate::auth::KeyringActorResolver::default().with_actor(user_host, user_actor),
+            )
+            .finish();
+
+        let op = tc_ir::OpRef::Get((
+            tc_ir::Subject::Link(
+                "http://127.0.0.1:1234/lib/acme/b/1.0.0/echo"
+                    .parse()
+                    .expect("remote link"),
+            ),
+            tc_ir::Scalar::default(),
+        ));
+
+        let user_ctx = futures::executor::block_on(kernel.token_verifier().verify(user_token))
+            .expect("verified user token");
+        let txn = kernel.with_resolver(kernel.txn_manager().begin_with_owner(
+            Some(&user_ctx.owner_id),
+            Some(&user_ctx.bearer_token),
+        ));
+        let txn_id = txn.id();
+        futures::executor::block_on(op.resolve(&txn)).expect("remote dependency resolve");
+
+        let outbound_tokens = gateway.bearer_tokens.lock().expect("bearer token lock");
+        let outbound_token = outbound_tokens
+            .last()
+            .and_then(|token| token.as_ref())
+            .expect("outbound bearer token");
+        let verifier = crate::auth::RjwtTokenVerifier::new(Arc::new(
+            crate::auth::KeyringActorResolver::default().with_actor(
+                kernel.txn_manager().protocol_host().clone(),
+                kernel.txn_manager().protocol_actor().as_ref().clone(),
+            ),
+        ));
+        let outbound_ctx =
+            futures::executor::block_on(crate::auth::TokenVerifier::verify(
+                &verifier,
+                outbound_token.clone(),
+            ))
+            .expect("outbound protocol token verifies");
+        assert_eq!(
+            crate::txn::owner_id_from_token(txn_id, &outbound_ctx).expect("txn owner"),
+            format!(
+                "{}::{}",
+                kernel.txn_manager().protocol_host(),
+                kernel.txn_manager().protocol_actor().id()
+            )
+        );
+        assert!(
+            outbound_ctx.claims.iter().any(|(_, _, claim)| claim.link
+                == pathlink::Link::from_str("/lib/acme/b/1.0.0")
+                    .expect("target claim"))
+        );
+    }
+
+    #[test]
     fn resolves_scalar_ref_using_txn_context() {
         use tc_ir::{OpRef, Scalar, Subject, TCRef};
         use tc_state::State;
-        use tc_value::Value;
 
-        type GatewayCall = (Method, pathlink::Link, Option<Value>);
+        type GatewayCall = (Method, pathlink::Link, Option<Value>, bool);
 
         #[derive(Clone)]
         struct RecordingGateway {
@@ -621,13 +753,13 @@ mod tests {
             fn get(
                 &self,
                 uri: pathlink::Link,
-                _txn: crate::txn::TxnHandle,
+                txn: crate::txn::TxnHandle,
                 key: Value,
             ) -> BoxFuture<'static, tc_error::TCResult<State>> {
                 self.calls
                     .lock()
                     .expect("calls lock")
-                    .push((Method::Get, uri, Some(key)));
+                    .push((Method::Get, uri, Some(key), txn.raw_token().is_some()));
 
                 let response = self.responses.lock().expect("responses lock").remove(0);
 
@@ -715,10 +847,14 @@ mod tests {
             Scalar::Ref(Box::new(TCRef::Op(inner_op))),
         ));
 
-        let err = futures::executor::block_on(outer_op.resolve(&txn)).expect_err("expected unauthorized");
-        assert!(err.message().contains("transaction-chained bearer auth"));
+        let state = futures::executor::block_on(outer_op.resolve(&txn)).expect("resolved op");
+        assert!(matches!(
+            state,
+            State::Scalar(Scalar::Value(Value::String(ref value))) if value == "ok"
+        ));
 
         let calls = gateway.calls.lock().expect("calls lock");
-        assert!(calls.is_empty());
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|(_, _, _, has_token)| *has_token));
     }
 }

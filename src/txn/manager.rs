@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 use tc_ir::{Claim, NetworkTime, TxnId};
 use umask::Mode;
 
+use crate::auth::{Actor, SignedToken, Token};
+
 use super::TxnHandle;
 
 #[derive(Clone)]
@@ -18,6 +20,8 @@ pub struct TxnManager {
     inner: Arc<Mutex<Inner>>,
     host_id: Arc<String>,
     ttl: Duration,
+    protocol_host: Link,
+    protocol_actor: Arc<Actor>,
 }
 
 struct Inner {
@@ -57,24 +61,22 @@ impl TxnManager {
     }
 
     pub fn with_host_id(host_id: impl Into<String>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Inner {
-                txns: HashMap::new(),
-                nonce: 0,
-            })),
-            host_id: Arc::new(host_id.into()),
-            ttl: Duration::from_secs(3),
-        }
+        Self::with_host_id_and_ttl(host_id, Duration::from_secs(3))
     }
 
     pub fn with_host_id_and_ttl(host_id: impl Into<String>, ttl: Duration) -> Self {
+        let host_id = host_id.into();
+        let protocol_actor =
+            Actor::new_falcon512(host_id.clone()).expect("generate Falcon-512 transaction actor");
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 txns: HashMap::new(),
                 nonce: 0,
             })),
-            host_id: Arc::new(host_id.into()),
+            host_id: Arc::new(host_id),
             ttl,
+            protocol_host: Link::from_str(crate::uri::HOST_ROOT).expect("host root link"),
+            protocol_actor: Arc::new(protocol_actor),
         }
     }
 
@@ -84,6 +86,20 @@ impl TxnManager {
 
     pub fn set_ttl(&mut self, ttl: Duration) {
         self.ttl = ttl;
+    }
+
+    pub fn protocol_host(&self) -> &Link {
+        &self.protocol_host
+    }
+
+    pub fn protocol_actor(&self) -> &Arc<Actor> {
+        &self.protocol_actor
+    }
+
+    pub fn with_protocol_actor(mut self, host: Link, actor: Actor) -> Self {
+        self.protocol_host = host;
+        self.protocol_actor = Arc::new(actor);
+        self
     }
 
     pub fn begin(&self) -> TxnHandle {
@@ -111,13 +127,25 @@ impl TxnManager {
         let txn_claim = Claim::new(txn_claim, umask::USER_EXEC | umask::USER_WRITE);
         let owner_id = owner_id.map(str::to_string);
         let bearer_token = bearer_token.map(str::to_string);
+        let signed_token = if bearer_token.is_none() {
+            Some(self.sign_protocol_token(txn_claim.clone()))
+        } else {
+            None
+        };
+        let owner_id = owner_id.or_else(|| {
+            signed_token.as_ref().map(|_| {
+                format!(
+                    "{}::{}",
+                    self.protocol_host,
+                    self.protocol_actor.id().clone()
+                )
+            })
+        });
+        let bearer_token =
+            bearer_token.or_else(|| signed_token.as_ref().map(|token| token.clone().into_jwt()));
         let handle_owner = owner_id.clone();
         let handle_bearer = bearer_token.clone();
-        let claims = if bearer_token.is_none() {
-            vec![txn_claim.clone()]
-        } else {
-            Vec::new()
-        };
+        let claims = vec![txn_claim.clone()];
         inner.txns.insert(
             id,
             TxnRecord {
@@ -125,7 +153,7 @@ impl TxnManager {
                 owner_id,
                 bearer_token,
                 claims: claims.clone(),
-                token: None,
+                token: signed_token.map(Arc::new),
             },
         );
         TxnHandle {
@@ -136,7 +164,7 @@ impl TxnManager {
             bearer_token: handle_bearer,
             resolver: None,
             ttl: self.ttl,
-            token: None,
+            token: inner.txns.get(&id).and_then(|record| record.token.clone()),
             auth_context: None,
         }
     }
@@ -150,18 +178,13 @@ impl TxnManager {
         id: &TxnId,
         owner_id: Option<&str>,
     ) -> Result<TxnHandle, TxnError> {
-        let canonical = self.ensure_trace(*id);
         let inner = self.inner.lock();
-        let record = inner
-            .txns
-            .get(&canonical)
-            .cloned()
-            .ok_or(TxnError::NotFound)?;
+        let record = inner.txns.get(id).cloned().ok_or(TxnError::NotFound)?;
         if !owners_match(record.owner_id.as_deref(), owner_id) {
             return Err(TxnError::Unauthorized);
         }
         Ok(TxnHandle {
-            id: canonical,
+            id: *id,
             claim: record.claim,
             claims: record.claims,
             owner_id: record.owner_id,
@@ -174,18 +197,16 @@ impl TxnManager {
     }
 
     pub fn commit(&self, id: TxnId) -> Result<(), TxnError> {
-        let canonical = self.ensure_trace(id);
         let mut inner = self.inner.lock();
-        match inner.txns.remove(&canonical) {
+        match inner.txns.remove(&id) {
             Some(_) => Ok(()),
             None => Err(TxnError::NotFound),
         }
     }
 
     pub fn rollback(&self, id: TxnId) -> Result<(), TxnError> {
-        let canonical = self.ensure_trace(id);
         let mut inner = self.inner.lock();
-        match inner.txns.remove(&canonical) {
+        match inner.txns.remove(&id) {
             Some(_) => Ok(()),
             None => Err(TxnError::NotFound),
         }
@@ -224,9 +245,8 @@ impl TxnManager {
     }
 
     pub fn record_claim(&self, id: &TxnId, claim: Claim) -> Result<(), TxnError> {
-        let canonical = self.ensure_trace(*id);
         let mut inner = self.inner.lock();
-        let record = inner.txns.get_mut(&canonical).ok_or(TxnError::NotFound)?;
+        let record = inner.txns.get_mut(id).ok_or(TxnError::NotFound)?;
         if !record.claims.contains(&claim) {
             record.claims.push(claim);
         }
@@ -238,53 +258,68 @@ impl TxnManager {
         self.inner.lock().txns.keys().copied().collect()
     }
 
-    fn ensure_trace(&self, id: TxnId) -> TxnId {
-        if id.trace_bytes().iter().any(|byte| *byte != 0) {
-            id
-        } else {
-            let trace = compute_trace(&self.host_id, id.timestamp(), id.nonce());
-            TxnId::from_parts(id.timestamp(), id.nonce()).with_trace(trace)
-        }
-    }
-
     fn begin_with_id(
         &self,
         id: TxnId,
         owner_id: Option<&str>,
         bearer_token: Option<&str>,
     ) -> TxnHandle {
-        let canonical = self.ensure_trace(id);
         let claim = default_claim();
-        let txn_claim = Link::from_str(&format!("/txn/{canonical}")).expect("txn claim link");
+        let txn_claim = Link::from_str(&format!("/txn/{id}")).expect("txn claim link");
         let txn_claim = Claim::new(txn_claim, umask::USER_EXEC | umask::USER_WRITE);
         let owner_id = owner_id.map(str::to_string);
         let bearer_token = bearer_token.map(str::to_string);
-        let claims = if bearer_token.is_none() {
-            vec![txn_claim.clone()]
+        let signed_token = if bearer_token.is_none() {
+            Some(self.sign_protocol_token(txn_claim.clone()))
         } else {
-            Vec::new()
+            None
         };
+        let owner_id = owner_id.or_else(|| {
+            signed_token.as_ref().map(|_| {
+                format!(
+                    "{}::{}",
+                    self.protocol_host,
+                    self.protocol_actor.id().clone()
+                )
+            })
+        });
+        let bearer_token =
+            bearer_token.or_else(|| signed_token.as_ref().map(|token| token.clone().into_jwt()));
+        let claims = vec![txn_claim.clone()];
         self.inner.lock().txns.insert(
-            canonical,
+            id,
             TxnRecord {
                 claim: claim.clone(),
                 owner_id: owner_id.clone(),
                 bearer_token: bearer_token.clone(),
                 claims: claims.clone(),
-                token: None,
+                token: signed_token.clone().map(Arc::new),
             },
         );
         TxnHandle {
-            id: canonical,
+            id,
             claim,
             claims,
             owner_id,
             bearer_token,
             resolver: None,
             ttl: self.ttl,
-            token: None,
+            token: signed_token.map(Arc::new),
             auth_context: None,
         }
+    }
+
+    fn sign_protocol_token(&self, claim: Claim) -> SignedToken {
+        let token = Token::new(
+            self.protocol_host.clone(),
+            SystemTime::now(),
+            self.ttl,
+            self.protocol_actor.id().clone(),
+            claim,
+        );
+        self.protocol_actor
+            .sign_token(token)
+            .expect("sign transaction protocol token")
     }
 }
 

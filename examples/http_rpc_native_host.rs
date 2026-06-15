@@ -20,7 +20,14 @@ const B_ROOT: &str = "/lib/example-devco/example/0.1.0";
 const B_HELLO: &str = "/example-devco/example/0.1.0/hello";
 const B_OPDEF: &str = "/example-devco/example/0.1.0/opdef";
 const DEFAULT_ACTOR_ID: &str = "example-admin";
-const DEFAULT_SECRET_KEY_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+fn parse_alg(alg: &str) -> Result<rjwt::AlgKind, String> {
+    match alg.trim().to_ascii_lowercase().as_str() {
+        "falcon512" | "falcon-512" | "fn-dsa-512" => Ok(rjwt::AlgKind::Falcon512),
+        "ed25519" | "eddsa" => Ok(rjwt::AlgKind::Ed25519),
+        other => Err(format!("unsupported signature algorithm: {other}")),
+    }
+}
 
 #[derive(Clone)]
 enum HandlerKind {
@@ -185,7 +192,8 @@ fn ok_handler(_req: Request) -> futures::future::BoxFuture<'static, Response> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut actor_id = DEFAULT_ACTOR_ID.to_string();
-    let mut secret_key_b64 = DEFAULT_SECRET_KEY_B64.to_string();
+    let mut secret_key_b64 = None::<String>;
+    let mut alg = rjwt::AlgKind::Falcon512;
     let bind = env::args()
         .skip(1)
         .fold("127.0.0.1:0".to_string(), |current_bind, arg| {
@@ -195,7 +203,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 actor_id = value.to_string();
                 current_bind
             } else if let Some(value) = arg.strip_prefix("--secret-key-b64=") {
-                secret_key_b64 = value.to_string();
+                secret_key_b64 = Some(value.to_string());
+                current_bind
+            } else if let Some(value) = arg.strip_prefix("--alg=") {
+                alg = parse_alg(value).expect("unsupported --alg");
                 current_bind
             } else {
                 current_bind
@@ -206,12 +217,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind_addr)?;
     let addr = listener.local_addr()?;
     let host_link = Link::from_str(&format!("http://{addr}"))?;
-    let secret_key_bytes = base64::engine::general_purpose::STANDARD.decode(secret_key_b64)?;
-    let secret_key_bytes: [u8; 32] = secret_key_bytes
-        .try_into()
-        .map_err(|_| "invalid --secret-key-b64: expected 32-byte Ed25519 secret key")?;
-    let signing_key = rjwt::SigningKey::from_bytes(&secret_key_bytes);
-    let actor = Actor::with_public_key(Value::from(actor_id), signing_key.verifying_key());
+    let actor = if let Some(secret_key_b64) = secret_key_b64 {
+        let secret_key_bytes = base64::engine::general_purpose::STANDARD.decode(secret_key_b64)?;
+        let signing_key = rjwt::SigningKey::from_bytes(alg, &secret_key_bytes)?;
+        Actor::with_verifying_key(actor_id, signing_key.verifying_key())
+    } else {
+        Actor::new_falcon512(actor_id)?
+    };
     let keyring = KeyringActorResolver::default().with_actor(host_link, actor);
 
     let schema = tc_ir::LibrarySchema::new(Link::from_str(B_ROOT)?, "0.1.0", vec![]);

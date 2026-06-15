@@ -7,7 +7,6 @@ use std::time::Duration;
 use hyper::{Body, StatusCode};
 use pathlink::Link;
 use tc_ir::LibrarySchema;
-use tc_value::Value;
 use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
@@ -327,8 +326,10 @@ async fn start_server_with_secondary_actor(label: &str) -> (RunningServer, Actor
     let handlers = http_library_handlers(&module);
 
     let host = Link::from_str("/host").expect("host link");
-    let actor = Actor::new(Value::from(format!("install-tester-{label}")));
-    let secondary_actor = Actor::new(Value::from(format!("install-attacker-{label}")));
+    let actor =
+        Actor::new_falcon512(format!("install-tester-{label}")).expect("generate Falcon-512 actor");
+    let secondary_actor = Actor::new_falcon512(format!("install-attacker-{label}"))
+        .expect("generate Falcon-512 actor");
     let keyring = KeyringActorResolver::default()
         .with_actor(host.clone(), actor.clone())
         .with_actor(host, secondary_actor.clone());
@@ -336,7 +337,8 @@ async fn start_server_with_secondary_actor(label: &str) -> (RunningServer, Actor
     let replication_issuer = Arc::new(ReplicationIssuer::new(
         Link::from_str("/host").expect("host link"),
         shared_replication_keys(),
-        Actor::new(Value::from(format!("replication:security:{label}"))),
+        Actor::new_falcon512(format!("replication:security:{label}"))
+            .expect("generate Falcon-512 actor"),
         keyring.clone(),
         public_keys.clone(),
     ));
@@ -386,13 +388,15 @@ async fn start_server_with_storage(label: &str, storage_dir: PathBuf) -> Running
     let handlers = http_library_handlers(&module);
 
     let host = Link::from_str("/host").expect("host link");
-    let actor = Actor::new(Value::from(format!("install-tester-{label}")));
+    let actor =
+        Actor::new_falcon512(format!("install-tester-{label}")).expect("generate Falcon-512 actor");
     let keyring = KeyringActorResolver::default().with_actor(host, actor.clone());
     let public_keys = PublicKeyStore::default();
     let replication_issuer = Arc::new(ReplicationIssuer::new(
         Link::from_str("/host").expect("host link"),
         shared_replication_keys(),
-        Actor::new(Value::from(format!("replication:security:{label}"))),
+        Actor::new_falcon512(format!("replication:security:{label}"))
+            .expect("generate Falcon-512 actor"),
         keyring.clone(),
         public_keys.clone(),
     ));

@@ -155,6 +155,22 @@ TLS for any non-local deployment and rotate PSKs regularly. Treat the library
 export path as high-value and keep it gated behind private networks or explicit
 allowlists.
 
+## Auth Tokens and Trusted Installers
+
+TinyChain v0.17 uses `rjwt` for recursive bearer tokens. New server-generated
+actors and Python-minted install/runtime tokens use Falcon-512 by default. The
+verifier still accepts legacy Ed25519 RJWT credentials so existing installers can
+be rotated without downtime.
+
+Trusted installer entries continue to use `host`, `actor_id`, `public_key_b64`,
+and `allowed_lib_prefixes`. The public key bytes are parsed by `rjwt`, not by
+TinyChain-specific key-length logic, so the same field can carry Falcon-512 keys
+for new credentials or Ed25519 keys during the migration window.
+
+Do not implement JWT parsing or signature handling in server adapters. HTTP,
+PyO3, replication, and WASM route context all flow through the kernel
+`TokenVerifier`.
+
 ## Native `Library` example
 
 `NativeLibrary` lets you publish in-process handlers without crossing the WASM

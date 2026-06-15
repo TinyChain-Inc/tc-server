@@ -10,7 +10,6 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyType};
 use tc_ir::{Claim, OpRef, Scalar, Subject};
-use tc_value::Value;
 use umask;
 
 use crate::{
@@ -34,6 +33,16 @@ use super::wire::{
     http_request_from_py_with_body, parse_path_and_txn_id, py_bearer_token, py_error_response,
     py_request_from_http, py_response_from_http, py_response_to_http,
 };
+
+fn parse_rjwt_alg(alg: &str) -> PyResult<rjwt::AlgKind> {
+    match alg.trim().to_ascii_lowercase().as_str() {
+        "falcon512" | "falcon-512" | "fn-dsa-512" => Ok(rjwt::AlgKind::Falcon512),
+        "ed25519" | "eddsa" => Ok(rjwt::AlgKind::Ed25519),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported signature algorithm: {other}"
+        ))),
+    }
+}
 
 pub(crate) fn python_kernel_builder_with_config(
     lib: Py<PyAny>,
@@ -320,16 +329,38 @@ impl KernelHandle {
             let token_host: String = token.getattr("host")?.extract()?;
             let actor_id: String = token.getattr("actor_id")?.extract()?;
             let public_key_b64: String = token.getattr("public_key_b64")?.extract()?;
+            let alg: String = token
+                .getattr("alg")
+                .ok()
+                .and_then(|value| value.extract::<String>().ok())
+                .unwrap_or_else(|| "falcon512".to_string());
+            let secret_key_b64: Option<String> = token
+                .getattr("secret_key_b64")
+                .ok()
+                .and_then(|value| value.extract::<String>().ok())
+                .filter(|value| !value.trim().is_empty());
             let host = Link::from_str(&token_host)
                 .map_err(|_| PyValueError::new_err("invalid token host"))?;
             let key_bytes = STANDARD
                 .decode(public_key_b64.as_bytes())
                 .map_err(|_| PyValueError::new_err("invalid public key base64"))?;
-            let verifying_key = rjwt::VerifyingKey::try_from(key_bytes.as_slice())
+            let verifying_key = crate::auth::verifying_key_from_bytes(key_bytes.as_slice())
                 .map_err(|_| PyValueError::new_err("invalid public key"))?;
-            let actor = crate::auth::Actor::with_public_key(Value::from(actor_id), verifying_key);
-            let keyring = crate::auth::KeyringActorResolver::default().with_actor(host, actor);
+            let actor = crate::auth::Actor::with_verifying_key(actor_id.clone(), verifying_key);
+            let keyring =
+                crate::auth::KeyringActorResolver::default().with_actor(host.clone(), actor);
             builder = builder.with_rjwt_keyring_token_verifier(keyring);
+
+            if let Some(secret_key_b64) = secret_key_b64 {
+                let key_bytes = STANDARD
+                    .decode(secret_key_b64.as_bytes())
+                    .map_err(|_| PyValueError::new_err("invalid secret key base64"))?;
+                let alg = parse_rjwt_alg(&alg)?;
+                let signing_key = rjwt::SigningKey::from_bytes(alg, key_bytes.as_slice())
+                    .map_err(|_| PyValueError::new_err("invalid secret key"))?;
+                let actor = crate::auth::Actor::with_signing_key(actor_id, signing_key);
+                builder = builder.with_protocol_actor(host, actor);
+            }
         }
 
         Ok(Self::from_kernel(builder.finish(), config))

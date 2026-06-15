@@ -6,7 +6,6 @@ use std::time::Duration;
 use pathlink::Link;
 use serde_json::json;
 use tc_ir::LibrarySchema;
-use tc_value::Value;
 use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
@@ -125,7 +124,8 @@ async fn start_server(
     let issuer = Arc::new(ReplicationIssuer::new(
         Link::from_str("/host").expect("host"),
         keys,
-        Actor::new(Value::from("replication:psk:test")),
+        Actor::new_falcon512("replication:psk:test".to_string())
+            .expect("generate Falcon-512 actor"),
         keyring.clone(),
         public_keys.clone(),
     ));

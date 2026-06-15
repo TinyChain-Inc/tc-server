@@ -209,7 +209,7 @@ async fn issues_replication_token() {
     let issuer = Arc::new(ReplicationIssuer::new(
         host,
         keys.clone(),
-        Actor::new(tc_value::Value::String("replication:test".to_string())),
+        Actor::new_falcon512("replication:test".to_string()).expect("generate Falcon-512 actor"),
         keyring,
         public_keys,
     ));
@@ -246,7 +246,7 @@ async fn cluster_membership_list_requires_post_and_cluster_root_path() {
     let issuer = Arc::new(ReplicationIssuer::new(
         host,
         keys.clone(),
-        Actor::new(tc_value::Value::String("replication:test".to_string())),
+        Actor::new_falcon512("replication:test".to_string()).expect("generate Falcon-512 actor"),
         keyring,
         public_keys,
     ));
@@ -300,7 +300,7 @@ async fn kernel_routes_cluster_membership_under_lib_prefix() {
     let issuer = Arc::new(ReplicationIssuer::new(
         host,
         keys.clone(),
-        Actor::new(tc_value::Value::String("replication:test".to_string())),
+        Actor::new_falcon512("replication:test".to_string()).expect("generate Falcon-512 actor"),
         KeyringActorResolver::default(),
         PublicKeyStore::default(),
     ));

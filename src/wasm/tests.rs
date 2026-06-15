@@ -57,6 +57,14 @@ mod http_tests {
         ValType,
     };
 
+    fn fresh_txn_id(nonce: u16) -> TxnId {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        TxnId::from_parts(NetworkTime::from_nanos(now), nonce).with_trace([nonce as u8; 32])
+    }
+
     #[derive(Clone, Default)]
     struct TestTokenVerifier;
 
@@ -464,7 +472,7 @@ mod http_tests {
             })
         };
 
-        let txn_id = TxnId::from_parts(NetworkTime::from_nanos(9), 1);
+        let txn_id = fresh_txn_id(9);
         let begin_request = ::http::Request::builder()
             .method("GET")
             .uri(format!("http://{a_addr}{a_root}?txn_id={txn_id}"))

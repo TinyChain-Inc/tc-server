@@ -9,6 +9,7 @@ mod tests {
     use hyper::Body;
     use pathlink::Link;
     use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
     use tc_error::TCError;
     use tc_error::TCResult;
     use tc_ir::{LibrarySchema, NetworkTime, TxnId};
@@ -65,6 +66,14 @@ mod tests {
             .finish()
     }
 
+    fn fresh_txn_id(nonce: u16) -> TxnId {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        TxnId::from_parts(NetworkTime::from_nanos(now), nonce).with_trace([nonce as u8; 32])
+    }
+
     #[derive(Clone)]
     struct TestTokenVerifier;
 
@@ -114,7 +123,7 @@ mod tests {
         let txn_manager = kernel.txn_manager().clone();
         let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
-        let txn_id_value = TxnId::from_parts(NetworkTime::from_nanos(1), 1);
+        let txn_id_value = fresh_txn_id(1);
         let request = http::Request::builder()
             .method("GET")
             .uri(format!("/lib?txn_id={txn_id_value}"))
@@ -188,7 +197,7 @@ mod tests {
         let kernel = kernel_with_lib_handler();
         let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
-        let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1);
+        let txn_id = fresh_txn_id(1);
         let begin = http::Request::builder()
             .method("GET")
             .uri(format!("/lib?txn_id={txn_id}"))
@@ -242,7 +251,7 @@ mod tests {
         let txn_manager = kernel.txn_manager().clone();
         let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
-        let txn_id_value = TxnId::from_parts(NetworkTime::from_nanos(2), 1);
+        let txn_id_value = fresh_txn_id(2);
         let begin = http::Request::builder()
             .method("GET")
             .uri(format!("/lib?txn_id={txn_id_value}"))
@@ -300,7 +309,7 @@ mod tests {
         let txn_manager = kernel.txn_manager().clone();
         let mut service = KernelService::new(kernel, crate::KernelLimits::default());
 
-        let txn_id_value = TxnId::from_parts(NetworkTime::from_nanos(3), 1);
+        let txn_id_value = fresh_txn_id(3);
         let begin = http::Request::builder()
             .method("GET")
             .uri(format!("/lib?txn_id={txn_id_value}"))
@@ -345,7 +354,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(txn_manager.pending_ids().is_empty());
 
-        let txn_id_value = TxnId::from_parts(NetworkTime::from_nanos(4), 1);
+        let txn_id_value = fresh_txn_id(4);
         let begin = http::Request::builder()
             .method("GET")
             .uri(format!("/service?txn_id={txn_id_value}"))
@@ -486,6 +495,153 @@ mod tests {
         ));
 
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn anonymous_transaction_reaches_remote_dependency_with_signed_same_id_token() {
+        use crate::auth::RjwtTokenVerifier;
+        use tc_ir::OpRef;
+
+        let leader_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("leader bind");
+        let leader_addr = leader_listener.local_addr().expect("leader addr");
+        let leader_origin = Link::from_str(&format!("http://{leader_addr}")).expect("leader origin");
+        let leader_actor = crate::auth::Actor::new_falcon512("leader-host".to_string())
+            .expect("leader actor");
+        let leader_keys = crate::auth::PublicKeyStore::default();
+        leader_keys.insert_actor(&leader_actor);
+
+        let remote_seen_txn = Arc::new(Mutex::new(None::<TxnId>));
+        let remote_seen_principal = Arc::new(Mutex::new(None::<String>));
+        let remote_seen_claim = Arc::new(Mutex::new(false));
+
+        let remote_schema = LibrarySchema::new(
+            Link::from_str("/lib/acme/remote/1.0.0").expect("remote schema"),
+            "1.0.0",
+            vec![],
+        );
+        let remote_module = crate::library::http::build_http_library_module(remote_schema, None)
+            .await
+            .expect("remote module");
+        let remote_seen_txn_handler = remote_seen_txn.clone();
+        let remote_seen_principal_handler = remote_seen_principal.clone();
+        let remote_seen_claim_handler = remote_seen_claim.clone();
+        let remote_handlers = crate::library::LibraryHandlers::with_route(
+            ok_handler(),
+            ok_handler(),
+            move |req: Request| {
+                let remote_seen_txn = remote_seen_txn_handler.clone();
+                let remote_seen_principal = remote_seen_principal_handler.clone();
+                let remote_seen_claim = remote_seen_claim_handler.clone();
+                async move {
+                    let txn = req
+                        .extensions()
+                        .get::<TxnHandle>()
+                        .cloned()
+                        .expect("remote txn handle");
+                    let auth = txn.auth_context().expect("remote auth context");
+                    let txn_claim = Link::from_str(&format!("/txn/{}", txn.id()))
+                        .expect("txn claim link");
+                    let has_matching_claim =
+                        auth.claims.iter().any(|entry| entry.claim.link == txn_claim);
+
+                    *remote_seen_txn.lock().expect("txn lock") = Some(txn.id());
+                    *remote_seen_principal.lock().expect("principal lock") =
+                        Some(auth.principal.clone());
+                    *remote_seen_claim.lock().expect("claim lock") = has_matching_claim;
+
+                    state_response(State::from(Value::from("remote-ok")))
+                }
+                .boxed()
+            },
+        );
+
+        let verifier_txn = crate::txn::TxnManager::with_host_id("remote-verifier").begin();
+        let verifier_gateway: std::sync::Arc<dyn crate::gateway::RpcGateway> =
+            std::sync::Arc::new(crate::http_client::HttpRpcGateway::new());
+        let remote_verifier = RjwtTokenVerifier::new(std::sync::Arc::new(
+            crate::auth::RpcActorResolver::new(verifier_gateway, verifier_txn),
+        ));
+        let remote_kernel = Kernel::builder()
+            .with_host_id("remote-host")
+            .with_library_module(remote_module, remote_handlers)
+            .with_http_rpc_gateway()
+            .with_token_verifier(remote_verifier)
+            .with_service_handler(ok_handler())
+            .with_kernel_handler(ok_handler())
+            .with_health_handler(ok_handler())
+            .finish();
+        let remote_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let remote_server = hyper::Server::from_tcp(remote_listener)
+            .expect("remote server")
+            .serve(tower::make::Shared::new(KernelService::new(
+                remote_kernel,
+                crate::KernelLimits::default(),
+            )));
+        let remote_task = tokio::spawn(async move { remote_server.await.expect("remote server") });
+
+        let leader_schema = LibrarySchema::new(
+            Link::from_str("/lib/acme/leader/1.0.0").expect("leader schema"),
+            "1.0.0",
+            vec![Link::from_str("/lib/acme/remote/1.0.0").expect("remote dependency")],
+        );
+        let leader_module = crate::library::http::build_http_library_module(leader_schema, None)
+            .await
+            .expect("leader module");
+        let leader_handlers =
+            crate::library::http::http_library_handlers(&leader_module);
+        let leader_kernel = Kernel::builder()
+            .with_host_id("leader-host")
+            .with_protocol_actor(leader_origin.clone(), leader_actor)
+            .with_library_module(leader_module, leader_handlers)
+            .with_dependency_route("/lib/acme/remote/1.0.0", remote_addr)
+            .with_http_rpc_gateway()
+            .with_service_handler(ok_handler())
+            .with_kernel_handler(super::host_handler_with_public_keys(leader_keys))
+            .with_health_handler(ok_handler())
+            .finish();
+        let leader_txn = leader_kernel.with_resolver(leader_kernel.txn_manager().begin());
+        let leader_txn_id = leader_txn.id();
+        let leader_server = hyper::Server::from_tcp(leader_listener)
+            .expect("leader server")
+            .serve(tower::make::Shared::new(KernelService::new(
+                leader_kernel.clone(),
+                crate::KernelLimits::default(),
+            )));
+        let leader_task = tokio::spawn(async move { leader_server.await.expect("leader server") });
+        tokio::task::yield_now().await;
+
+        let op = OpRef::Get((
+            tc_ir::Subject::Link(
+                Link::from_str("/lib/acme/remote/1.0.0/hello").expect("remote op"),
+            ),
+            tc_ir::Scalar::default(),
+        ));
+        let response = op.resolve(&leader_txn).await.expect("remote resolve");
+        assert!(matches!(
+            response,
+            State::Scalar(tc_ir::Scalar::Value(Value::String(ref value))) if value == "remote-ok"
+        ));
+        assert_eq!(
+            *remote_seen_txn.lock().expect("txn lock"),
+            Some(leader_txn_id),
+            "remote participant must use the exact leader transaction ID"
+        );
+        let expected_principal = format!("{leader_origin}::leader-host");
+        assert_eq!(
+            remote_seen_principal
+                .lock()
+                .expect("principal lock")
+                .as_deref(),
+            Some(expected_principal.as_str())
+        );
+        assert!(
+            *remote_seen_claim.lock().expect("claim lock"),
+            "remote auth context must include a /txn claim for the exact active transaction"
+        );
+
+        leader_task.abort();
+        remote_task.abort();
     }
 
     #[tokio::test]
@@ -631,10 +787,9 @@ mod tests {
         use rjwt::Token;
         use std::net::TcpListener;
         use tc_ir::{Claim, NetworkTime, TxnId};
-        use tc_value::Value;
         use umask::USER_EXEC;
 
-        let actor = rjwt::Actor::new(Value::from("actor-a"));
+        let actor = rjwt::Actor::new_falcon512("actor-a".to_string()).expect("generate Falcon-512 actor");
         let keys = crate::auth::PublicKeyStore::default();
         keys.insert_actor(&actor);
 

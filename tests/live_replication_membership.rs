@@ -7,7 +7,6 @@ use std::time::Duration;
 use hyper::{Body, Client, Request, StatusCode};
 use pathlink::Link;
 use tc_ir::{Claim, LibrarySchema, NetworkTime, TxnId};
-use tc_value::Value;
 use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore, Token};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
@@ -69,7 +68,8 @@ async fn discover_library_paths_lists_installed_libraries() {
 
 #[tokio::test]
 async fn live_replicated_install_retry_finalizes_after_peer_recovers() {
-    let actor = Actor::new(Value::from("live-replication-installer"));
+    let actor = Actor::new_falcon512("live-replication-installer".to_string())
+        .expect("generate Falcon-512 actor");
     let peer_a = start_replicating_server(
         "retry-peer-a",
         actor.clone(),
@@ -137,7 +137,8 @@ async fn live_replicated_install_retry_finalizes_after_peer_recovers() {
 
 #[tokio::test]
 async fn live_replicated_install_prepare_fails_when_peer_unavailable() {
-    let actor = Actor::new(Value::from("live-replication-installer"));
+    let actor = Actor::new_falcon512("live-replication-installer".to_string())
+        .expect("generate Falcon-512 actor");
     let peer_a = start_replicating_server(
         "prepare-peer-a",
         actor.clone(),
@@ -306,14 +307,16 @@ async fn start_server_with_listener(
     let handlers = http_library_handlers(&module);
 
     let host = Link::from_str("/host").expect("host link");
-    let actor = Actor::new(Value::from(format!("installer-{label}")));
+    let actor =
+        Actor::new_falcon512(format!("installer-{label}")).expect("generate Falcon-512 actor");
     let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
     let public_keys = PublicKeyStore::default();
     let keys = shared_replication_keys();
     let issuer = Arc::new(ReplicationIssuer::new(
         host,
         keys.clone(),
-        Actor::new(Value::from(format!("replication:live:{label}"))),
+        Actor::new_falcon512(format!("replication:live:{label}"))
+            .expect("generate Falcon-512 actor"),
         keyring.clone(),
         public_keys.clone(),
     ));
@@ -377,7 +380,8 @@ async fn start_replicating_server_with_listener(
     let issuer = Arc::new(ReplicationIssuer::new(
         host,
         keys.clone(),
-        Actor::new(Value::from(format!("replication:live:{label}"))),
+        Actor::new_falcon512(format!("replication:live:{label}"))
+            .expect("generate Falcon-512 actor"),
         keyring.clone(),
         public_keys.clone(),
     ));

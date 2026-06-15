@@ -38,6 +38,7 @@ impl Resolve for TCRef {
 mod tests {
     use super::*;
     use futures::FutureExt;
+    use number_general::Number;
     use std::sync::{Arc, Mutex};
     use tc_ir::{Cond, Map, Scalar, Subject};
     use tc_state::State;
@@ -131,7 +132,7 @@ mod tests {
     fn tcref_cond_uses_shared_resolver_path() {
         let gateway = MockGateway::default();
         *gateway.get_response.lock().expect("get response") =
-            State::Scalar(Scalar::Value(Value::Bool(true)));
+            State::Scalar(Scalar::Value(Value::Number(Number::Bool(true.into()))));
         let cond_ref = TCRef::Op(OpRef::Get((
             Subject::Link("/lib/acme/foo/1.0.0".parse().expect("link")),
             Scalar::Value(Value::None),
