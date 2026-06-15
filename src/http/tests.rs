@@ -761,7 +761,7 @@ mod tests {
 
         let mut request = http::Request::builder()
             .method("GET")
-            .uri("/lib/hello")
+            .uri("/lib/native/hello")
             .body(Body::empty())
             .expect("request");
         request.extensions_mut().insert(txn);
