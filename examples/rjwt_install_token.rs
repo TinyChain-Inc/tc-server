@@ -7,9 +7,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use base64::engine::general_purpose::STANDARD;
     use base64::engine::general_purpose::STANDARD_NO_PAD;
     use pathlink::Link;
-    use rjwt::SigningKey;
+    use rjwt::{AlgKind, SigningKey};
     use tc_ir::Claim;
-    use tc_value::Value;
     use umask::{USER_EXEC, USER_WRITE};
 
     use tinychain::auth::{Actor, Token};
@@ -19,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut libs: Vec<String> = Vec::new();
     let mut txn_id: Option<String> = None;
     let mut secret_key_b64: Option<String> = None;
+    let mut alg = AlgKind::Falcon512;
     let mut ttl_secs: u64 = 3600;
 
     let mut args = env::args().skip(1);
@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--txn-id" => txn_id = args.next(),
             "--secret-key-b64" => secret_key_b64 = args.next(),
+            "--alg" => alg = parse_alg(args.next().ok_or("missing --alg value")?.as_str())?,
             "--ttl-secs" => {
                 ttl_secs = args.next().ok_or("missing --ttl-secs value")?.parse()?;
             }
@@ -58,21 +59,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         claims.push(Claim::new(Link::from_str(lib)?, USER_WRITE));
     }
 
-    let signing_key = if let Some(secret_key_b64) = secret_key_b64 {
+    let signing_key = if let Some(secret_key_b64) = secret_key_b64.as_ref() {
         let key_bytes = STANDARD
             .decode(secret_key_b64.trim())
             .or_else(|_| STANDARD_NO_PAD.decode(secret_key_b64.trim()))?;
-        let key_bytes: [u8; 32] = key_bytes
-            .try_into()
-            .map_err(|_| "invalid --secret-key-b64: expected 32-byte Ed25519 secret key")?;
-        SigningKey::from_bytes(&key_bytes)
+        SigningKey::from_bytes(alg, &key_bytes)?
     } else {
-        use aes_gcm_siv::aead::OsRng;
-        SigningKey::generate(&mut OsRng)
+        SigningKey::generate_falcon512()?
     };
+    let secret_key_b64 = secret_key_b64.unwrap_or_else(|| STANDARD.encode(signing_key.to_bytes()));
 
-    let secret_key_b64 = STANDARD.encode(signing_key.to_bytes());
-    let actor = Actor::with_keypair(Value::from(actor_id.clone()), signing_key);
+    let actor = Actor::with_signing_key(actor_id.clone(), signing_key);
 
     let token = Token::new(
         host.clone(),
@@ -93,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         signed = actor.consume_and_sign(signed, host.clone(), txn_claim, SystemTime::now())?;
     }
 
-    let public_key_b64 = STANDARD.encode(actor.public_key().to_bytes());
+    let public_key_b64 = STANDARD.encode(actor.verifying_key().to_bytes());
 
     println!("host: {host}");
     for claim in &claims {
@@ -107,9 +104,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn parse_alg(alg: &str) -> Result<rjwt::AlgKind, Box<dyn std::error::Error>> {
+    match alg.trim().to_ascii_lowercase().as_str() {
+        "falcon512" | "falcon-512" | "fn-dsa-512" => Ok(rjwt::AlgKind::Falcon512),
+        "ed25519" | "eddsa" => Ok(rjwt::AlgKind::Ed25519),
+        other => Err(format!("unsupported signature algorithm: {other}").into()),
+    }
+}
+
 fn print_usage() {
     eprintln!(
-        "Usage: rjwt_install_token --host <http(s)://host[:port]> --actor <id> --lib <path> [--lib <path> ...] [--txn-id <id>] [--secret-key-b64 <b64>] [--ttl-secs <n>]\n\
+        "Usage: rjwt_install_token --host <http(s)://host[:port]> --actor <id> --lib <path> [--lib <path> ...] [--txn-id <id>] [--secret-key-b64 <b64>] [--alg falcon512|ed25519] [--ttl-secs <n>]\n\
          Example:\n\
           cargo run --example rjwt_install_token -- \\\n\
              --host http://127.0.0.1:8702 --actor example-admin \\\n\

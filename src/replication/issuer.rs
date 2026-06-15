@@ -5,7 +5,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use tc_error::TCError;
 use tc_ir::Claim;
-use tc_value::Value;
 use umask::USER_READ;
 
 use crate::auth::{Actor, KeyringActorResolver, PublicKeyStore, SignedToken, Token};
@@ -54,12 +53,12 @@ impl ReplicationIssuer {
         keyring: KeyringActorResolver,
         public_keys: PublicKeyStore,
     ) -> Self {
-        let signer_public = signer.public_key();
+        let signer_public = signer.verifying_key();
         let signer_id = signer.id().clone();
         public_keys.insert_actor(&signer);
         let keyring = keyring.with_actor(
             host.clone(),
-            Actor::with_public_key(signer_id, signer_public),
+            Actor::with_verifying_key(signer_id, signer_public),
         );
 
         Self {
@@ -84,16 +83,9 @@ impl ReplicationIssuer {
     }
 
     pub fn self_identity(&self, peer: String) -> tc_error::TCResult<PeerIdentity> {
-        let actor_id = match self.signer.id() {
-            Value::String(id) => id.clone(),
-            other => {
-                return Err(TCError::internal(format!(
-                    "replication signer actor_id must be a string, got {other:?}"
-                )));
-            }
-        };
+        let actor_id = self.signer.id().clone();
 
-        let public_key_b64 = BASE64.encode(self.signer.public_key().to_bytes());
+        let public_key_b64 = BASE64.encode(self.signer.verifying_key().to_bytes());
         Ok(PeerIdentity {
             peer,
             actor_id,
@@ -110,10 +102,10 @@ impl ReplicationIssuer {
         let key_bytes = BASE64
             .decode(identity.public_key_b64.trim())
             .map_err(|err| TCError::bad_request(format!("invalid peer public_key_b64: {err}")))?;
-        let verifying_key = rjwt::VerifyingKey::try_from(key_bytes.as_slice())
+        let verifying_key = crate::auth::verifying_key_from_bytes(key_bytes.as_slice())
             .map_err(|err| TCError::bad_request(format!("invalid peer public key bytes: {err}")))?;
 
-        let actor = Actor::with_public_key(Value::String(actor_id.to_string()), verifying_key);
+        let actor = Actor::with_verifying_key(actor_id.to_string(), verifying_key);
         self.public_keys.insert_actor(&actor);
         let _ = self.keyring.clone().with_actor(self.host.clone(), actor);
         Ok(())

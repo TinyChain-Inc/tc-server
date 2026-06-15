@@ -27,6 +27,113 @@ enum OutboundTarget {
 }
 
 impl KernelTxnResolver {
+    async fn remote_bearer_token(
+        &self,
+        method: Method,
+        target: &str,
+        txn: &crate::txn::TxnHandle,
+    ) -> tc_error::TCResult<String> {
+        let token = txn.raw_token().ok_or_else(|| {
+            tc_error::TCError::unauthorized(
+                "cross-host dependency call requires transaction-chained bearer auth",
+            )
+        })?;
+
+        let ctx = self
+            .token_verifier
+            .verify(token.to_string())
+            .await
+            .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
+
+        if let Ok(owner_id) = crate::txn::owner_id_from_token(txn.id(), &ctx) {
+            if self.txn_manager.get(&txn.id()).is_some() {
+                match self.txn_manager.interpret_request(
+                    Some(txn.id()),
+                    Some(&owner_id),
+                    Some(&ctx.bearer_token),
+                ) {
+                    Ok(crate::txn::TxnFlow::Begin(handle))
+                    | Ok(crate::txn::TxnFlow::Use(handle)) => self.txn_server.touch(handle.id()),
+                    Err(crate::txn::TxnError::NotFound) => {
+                        return Err(tc_error::TCError::bad_request("unknown transaction id"));
+                    }
+                    Err(crate::txn::TxnError::Unauthorized) => {
+                        return Err(tc_error::TCError::unauthorized(
+                            "unauthorized transaction owner",
+                        ));
+                    }
+                };
+            }
+
+            let claim = token_claim_for_target(method, target);
+            let ctx = match claim {
+                Some(claim) => {
+                    if self.txn_manager.get(&txn.id()).is_some() {
+                        let _ = self.txn_manager.record_claim(&txn.id(), claim.clone());
+                    }
+                    if txn.has_signed_token() {
+                        let updated = txn
+                            .grant(
+                                self.txn_manager.protocol_actor(),
+                                self.txn_manager.protocol_host().clone(),
+                                claim.link,
+                                claim.mask,
+                            )
+                            .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
+                        return updated.raw_token().map(str::to_string).ok_or_else(|| {
+                            tc_error::TCError::unauthorized("invalid bearer token")
+                        });
+                    }
+                    self.token_verifier
+                        .grant(ctx, claim)
+                        .await
+                        .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?
+                }
+                None => ctx,
+            };
+
+            Ok(ctx.bearer_token)
+        } else {
+            if crate::txn::has_txn_claim(&ctx) {
+                return Err(tc_error::TCError::unauthorized("invalid bearer token"));
+            }
+
+            if txn.owner_id() != Some(ctx.owner_id.as_str()) {
+                return Err(tc_error::TCError::unauthorized(
+                    "cross-host dependency call requires exact transaction claim",
+                ));
+            }
+
+            let txn_claim = pathlink::Link::from_str(&format!("/txn/{}", txn.id()))
+                .map_err(|_| tc_error::TCError::unauthorized("invalid transaction id"))?;
+            let mut updated = txn
+                .grant(
+                    self.txn_manager.protocol_actor(),
+                    self.txn_manager.protocol_host().clone(),
+                    txn_claim,
+                    umask::USER_EXEC | umask::USER_WRITE,
+                )
+                .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
+
+            if let Some(claim) = token_claim_for_target(method, target) {
+                let _ = self.txn_manager.record_claim(&txn.id(), claim.clone());
+                updated = updated
+                    .grant(
+                        self.txn_manager.protocol_actor(),
+                        self.txn_manager.protocol_host().clone(),
+                        claim.link,
+                        claim.mask,
+                    )
+                    .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
+            }
+
+            updated
+                .raw_token()
+                .map(str::to_string)
+                .ok_or_else(|| tc_error::TCError::unauthorized("invalid bearer token"))
+        }
+    }
+
     async fn local_call(
         &self,
         method: http::Method,
@@ -149,89 +256,6 @@ impl KernelTxnResolver {
         let registry = self.library_registry.clone().ok_or_else(|| {
             tc_error::TCError::unauthorized("no library manifest loaded (egress is default-deny)")
         })?;
-        let bearer_token = match txn.raw_token() {
-            Some(token) => {
-                let ctx = self
-                    .token_verifier
-                    .verify(token.to_string())
-                    .await
-                    .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
-
-                // Some runtimes authenticate route entry with a signed token which does not
-                // include a `/txn/<id>` claim. In that case, continue owner-pinned transaction
-                // flow using the token owner identity, but skip claim chaining.
-                if let Ok(owner_id) = crate::txn::owner_id_from_token(txn.id(), &ctx) {
-                    if self.txn_manager.get(&txn.id()).is_some() {
-                        match self.txn_manager.interpret_request(
-                            Some(txn.id()),
-                            Some(&owner_id),
-                            Some(&ctx.bearer_token),
-                        ) {
-                            Ok(crate::txn::TxnFlow::Begin(handle))
-                            | Ok(crate::txn::TxnFlow::Use(handle)) => {
-                                self.txn_server.touch(handle.id())
-                            }
-                            Err(crate::txn::TxnError::NotFound) => {
-                                return Err(tc_error::TCError::bad_request(
-                                    "unknown transaction id",
-                                ));
-                            }
-                            Err(crate::txn::TxnError::Unauthorized) => {
-                                return Err(tc_error::TCError::unauthorized(
-                                    "unauthorized transaction owner",
-                                ));
-                            }
-                        };
-                    }
-
-                    let claim = token_claim_for_target(method, &target_str);
-                    let ctx = match claim {
-                        Some(claim) => {
-                            if self.txn_manager.get(&txn.id()).is_some() {
-                                let _ = self.txn_manager.record_claim(&txn.id(), claim.clone());
-                            }
-                            self.token_verifier.grant(ctx, claim).await.map_err(|_| {
-                                tc_error::TCError::unauthorized("invalid bearer token")
-                            })?
-                        }
-                        None => ctx,
-                    };
-
-                    Some(ctx.bearer_token)
-                } else {
-                    if crate::txn::has_txn_claim(&ctx) {
-                        return Err(tc_error::TCError::unauthorized("invalid bearer token"));
-                    }
-
-                    if self.txn_manager.get(&txn.id()).is_some() {
-                        match self.txn_manager.interpret_request(
-                            Some(txn.id()),
-                            Some(&ctx.owner_id),
-                            Some(&ctx.bearer_token),
-                        ) {
-                            Ok(crate::txn::TxnFlow::Begin(handle))
-                            | Ok(crate::txn::TxnFlow::Use(handle)) => {
-                                self.txn_server.touch(handle.id())
-                            }
-                            Err(crate::txn::TxnError::NotFound) => {
-                                return Err(tc_error::TCError::bad_request(
-                                    "unknown transaction id",
-                                ));
-                            }
-                            Err(crate::txn::TxnError::Unauthorized) => {
-                                return Err(tc_error::TCError::unauthorized(
-                                    "unauthorized transaction owner",
-                                ));
-                            }
-                        };
-                    }
-
-                    Some(ctx.bearer_token)
-                }
-            }
-            None => None,
-        };
-
         let schema = registry.schema_for_txn(txn)?;
         let target_uri: http::Uri = target_str
             .parse()
@@ -279,15 +303,12 @@ impl KernelTxnResolver {
             OutboundTarget::Remote(resolved)
         };
 
-        if matches!(resolved, OutboundTarget::Remote(_)) && bearer_token.is_none() {
-            return Err(tc_error::TCError::unauthorized(
-                "cross-host dependency call requires transaction-chained bearer auth",
-            ));
-        }
-
-        let outbound_txn = match bearer_token {
-            Some(token) => txn.with_bearer_token(token),
-            None => txn.clone(),
+        let outbound_txn = match resolved {
+            OutboundTarget::Remote(_) => {
+                let token = self.remote_bearer_token(method, &target_str, txn).await?;
+                txn.with_bearer_token(token)
+            }
+            OutboundTarget::Local(_) => txn.clone(),
         };
         Ok((resolved, outbound_txn))
     }

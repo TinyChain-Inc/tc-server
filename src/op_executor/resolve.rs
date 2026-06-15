@@ -673,12 +673,12 @@ async fn resolve_tensor_post(
                 .collect(),
         )),
         "size" => State::from(Value::Number(Number::from(tensor_size(&tensor) as u64))),
-        "all" => State::from(Value::Bool(
-            tensor_values_f64(&tensor)?.iter().all(|v| *v != 0.0),
-        )),
-        "any" => State::from(Value::Bool(
-            tensor_values_f64(&tensor)?.iter().any(|v| *v != 0.0),
-        )),
+        "all" => State::from(Value::Number(Number::Bool(
+            tensor_values_f64(&tensor)?.iter().all(|v| *v != 0.0).into(),
+        ))),
+        "any" => State::from(Value::Number(Number::Bool(
+            tensor_values_f64(&tensor)?.iter().any(|v| *v != 0.0).into(),
+        ))),
         "cond" => {
             let then_tensor = tensor_param(params, "then", values, txn, self_link).await?;
             let else_tensor = tensor_param(params, "or_else", values, txn, self_link).await?;
@@ -1249,7 +1249,6 @@ fn string_state_value(state: &State) -> Option<&str> {
 
 fn value_to_render_string(value: Value) -> TCResult<String> {
     match value {
-        Value::Bool(value) => Ok(value.to_string()),
         Value::String(value) => Ok(value),
         Value::Number(value) => Ok(value.to_string()),
         Value::Link(value) => Ok(value.to_string()),
@@ -1345,9 +1344,6 @@ async fn resolve_bool_state(
         match state {
             State::Scalar(Scalar::Ref(r)) => {
                 state = resolve_scalar(Scalar::Ref(r), values, txn, self_link).await?;
-            }
-            State::Scalar(Scalar::Value(Value::Bool(value))) => {
-                return Ok(value);
             }
             State::Scalar(Scalar::Value(Value::Number(number))) => {
                 return Ok(number.cast_into());

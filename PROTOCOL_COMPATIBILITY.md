@@ -11,7 +11,7 @@ This note explains how to stand up a TinyChain-compatible server (or custom adap
   transactions directly.
 - **IR contract:** Route inbound requests into `tc-ir` handlers so the same capability manifests and IR types are exercised regardless of transport.
 - **Transaction + auth surface:** Preserve the `txn_id` lifecycle and capability masks; adapters only translate protocol details and defer begin/commit/rollback to the shared kernel (`Kernel::route_request`).
-- **Scalar value surface:** Treat booleans as first-class scalar values (`Value::Bool`) instead of numeric aliases, and support nested `Map`/`Tuple` value variants in addition to literal `None`/`String`/`Number` and `Link`.
+- **Scalar value surface:** Treat booleans as `Number::Bool` within `Value::Number`, and support nested `Map`/`Tuple` value variants in addition to literal `None`/`String`/`Number` and `Link`.
 
 ## Dependency authorization & URI routing
 
@@ -79,7 +79,7 @@ touches additional components.
   - in-process via an in-memory keyring resolver (`KeyringActorResolver`);
   - over HTTP (with `http-client`) via `RpcActorResolver`, which fetches actor public keys from the
     issuer host using `GET /host/public_key?key=<actor-id>` (response body is a JSON string
-    containing base64-encoded Ed25519 public key bytes).
+    containing base64-encoded rjwt public key bytes (Falcon-512 by default, Ed25519 accepted during credential rotation)).
 - **Op references (partial).** The workspace includes a v1-shaped `tc_ir::OpRef` plus a minimal
   executor (`tc_server::resolve`) which can run `TCRef::Op` via the transaction-bound RPC gateway.
   Encoding `OpRef` parameters into the on-the-wire scalar format is still in progress.

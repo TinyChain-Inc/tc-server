@@ -9,7 +9,6 @@ use std::{
 use pathlink::Link;
 use tc_error::TCError;
 use tc_ir::{Claim, NetworkTime, Transaction, TxnHeader, TxnId};
-use tc_value::Value;
 use umask::Mode;
 
 use crate::auth::{Actor, SignedToken, Token};
@@ -112,6 +111,10 @@ impl TxnHandle {
         self.bearer_token.as_deref()
     }
 
+    pub(crate) fn has_signed_token(&self) -> bool {
+        self.token.is_some()
+    }
+
     pub(crate) fn authorization_header(&self) -> Option<String> {
         self.bearer_token
             .as_ref()
@@ -125,6 +128,20 @@ impl TxnHandle {
             claims: self.claims.clone(),
             owner_id: self.owner_id.clone(),
             bearer_token: Some(bearer_token),
+            resolver: self.resolver.clone(),
+            ttl: self.ttl,
+            token: self.token.clone(),
+            auth_context: self.auth_context.clone(),
+        }
+    }
+
+    pub(crate) fn without_bearer_token(&self) -> Self {
+        Self {
+            id: self.id,
+            claim: self.claim.clone(),
+            claims: self.claims.clone(),
+            owner_id: self.owner_id.clone(),
+            bearer_token: None,
             resolver: self.resolver.clone(),
             ttl: self.ttl,
             token: self.token.clone(),
@@ -233,8 +250,8 @@ impl TxnHandle {
         let txn_link = Link::from_str(&format!("/txn/{}", self.id))
             .map_err(|err| TCError::bad_request(err.to_string()))?;
 
-        let mut owner: Option<(&Link, &Value)> = None;
-        let mut lock: Option<(&Link, &Value)> = None;
+        let mut owner: Option<(&Link, &String)> = None;
+        let mut lock: Option<(&Link, &String)> = None;
         let mut canonical_claim: Option<Claim> = None;
 
         for (index, (host, actor_id, claim)) in token.claims().iter().enumerate() {

@@ -12,7 +12,6 @@ use futures::FutureExt;
 use hyper::{Body, Request, Response, StatusCode};
 use serde::Deserialize;
 use tc_error::{TCError, TCResult};
-use tc_value::Value;
 
 use pathlink::Link;
 use tinychain::auth::{
@@ -321,13 +320,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &public_keys,
         &trusted_installers,
     )?;
-    let local_host_actor = tinychain::auth::Actor::new(Value::from(config.host_id.clone()));
+    let local_host_actor = tinychain::auth::Actor::new_falcon512(config.host_id.clone())
+        .expect("generate Falcon-512 actor");
     public_keys.insert_actor(&local_host_actor);
-    let keyring = keyring.with_actor(host.clone(), local_host_actor);
+    let keyring = keyring.with_actor(host.clone(), local_host_actor.clone());
 
     let keys = parse_psk_keys(&config.psk_keys)?;
     let replication_actor_id = format!("replication:{}", config.host_id);
-    let replication_actor = Actor::new(Value::from(replication_actor_id.clone()));
+    let replication_actor =
+        Actor::new_falcon512(replication_actor_id.clone()).expect("generate Falcon-512 actor");
     let issuer = Arc::new(ReplicationIssuer::new(
         host,
         keys.clone(),
@@ -398,6 +399,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let finalize_hook = live_replicating_finalize_hook(registry.clone());
 
             builder
+                .with_protocol_actor(
+                    Link::from_str("/host").expect("host link"),
+                    local_host_actor,
+                )
                 .with_kernel_handler(host_handler)
                 .with_lib_put_handler(live_put)
                 .with_txn_finalize_hook(finalize_hook)
@@ -626,14 +631,13 @@ fn bootstrap_trusted_installers(
                 TCError::bad_request(format!("invalid installer public_key_b64: {err}"))
             })?;
 
-        let verifying_key = rjwt::VerifyingKey::try_from(key_bytes.as_slice()).map_err(|err| {
-            TCError::bad_request(format!("invalid installer public key bytes: {err}"))
-        })?;
+        let verifying_key = tinychain::auth::verifying_key_from_bytes(key_bytes.as_slice())
+            .map_err(|err| {
+                TCError::bad_request(format!("invalid installer public key bytes: {err}"))
+            })?;
 
-        let actor = tinychain::auth::Actor::with_public_key(
-            Value::from(actor_id.to_string()),
-            verifying_key,
-        );
+        let actor =
+            tinychain::auth::Actor::with_verifying_key(actor_id.to_string(), verifying_key.clone());
 
         keyring = keyring.with_actor(host, actor);
         public_keys.insert(actor_id.to_string(), verifying_key);
@@ -843,7 +847,8 @@ mod tests {
     #[tokio::test]
     async fn trusted_installer_verifier_still_enforces_claim_policy_for_signed_tokens() {
         let host = Link::from_str("http://127.0.0.1:8702").expect("host");
-        let actor = Actor::new(Value::from("trusted-installer"));
+        let actor = Actor::new_falcon512("trusted-installer".to_string())
+            .expect("generate Falcon-512 actor");
         let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
 
         let policy = TrustedInstallerPolicy::from_installers(
@@ -851,7 +856,7 @@ mod tests {
                 host: host.to_string(),
                 actor_id: "trusted-installer".to_string(),
                 public_key_b64: base64::engine::general_purpose::STANDARD
-                    .encode(actor.public_key().to_bytes()),
+                    .encode(actor.verifying_key().to_bytes()),
                 allowed_lib_prefixes: vec!["/lib/example-devco".to_string()],
             }],
             "/lib/example-devco",
@@ -906,7 +911,8 @@ mod tests {
     #[tokio::test]
     async fn trusted_installer_policy_rejects_unconfigured_external_actor() {
         let host = Link::from_str("http://127.0.0.1:8702").expect("host");
-        let actor = Actor::new(Value::from("external-installer"));
+        let actor = Actor::new_falcon512("external-installer".to_string())
+            .expect("generate Falcon-512 actor");
         let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
         let policy =
             TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
@@ -940,7 +946,8 @@ mod tests {
     #[tokio::test]
     async fn trusted_installer_policy_allows_host_replication_actor() {
         let host = Link::from_str("/host").expect("host");
-        let actor = Actor::new(Value::from("replication:node-a"));
+        let actor = Actor::new_falcon512("replication:node-a".to_string())
+            .expect("generate Falcon-512 actor");
         let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
         let policy =
             TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
@@ -971,7 +978,8 @@ mod tests {
     #[tokio::test]
     async fn trusted_installer_policy_allows_known_peer_replication_actor() {
         let host = Link::from_str("/host").expect("host");
-        let actor = Actor::new(Value::from("replication:node-b"));
+        let actor = Actor::new_falcon512("replication:node-b".to_string())
+            .expect("generate Falcon-512 actor");
         let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
         let policy =
             TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
@@ -980,7 +988,7 @@ mod tests {
             peer: "http://10.0.0.2:8702".to_string(),
             actor_id: "replication:node-b".to_string(),
             public_key_b64: base64::engine::general_purpose::STANDARD
-                .encode(actor.public_key().to_bytes()),
+                .encode(actor.verifying_key().to_bytes()),
         });
         let verifier = TrustedInstallerTokenVerifier::new(
             RjwtTokenVerifier::new(Arc::new(keyring)),
@@ -1009,7 +1017,8 @@ mod tests {
     #[tokio::test]
     async fn trusted_installer_policy_rejects_host_replication_outside_cluster_root() {
         let host = Link::from_str("/host").expect("host");
-        let actor = Actor::new(Value::from("replication:node-a"));
+        let actor = Actor::new_falcon512("replication:node-a".to_string())
+            .expect("generate Falcon-512 actor");
         let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
         let policy =
             TrustedInstallerPolicy::from_installers(&[], "/lib/example-devco").expect("policy");
