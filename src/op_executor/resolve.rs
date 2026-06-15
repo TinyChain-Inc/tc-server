@@ -1249,6 +1249,7 @@ fn string_state_value(state: &State) -> Option<&str> {
 
 fn value_to_render_string(value: Value) -> TCResult<String> {
     match value {
+        Value::Bool(value) => Ok(value.to_string()),
         Value::String(value) => Ok(value),
         Value::Number(value) => Ok(value.to_string()),
         Value::Link(value) => Ok(value.to_string()),
@@ -1347,6 +1348,9 @@ async fn resolve_bool_state(
             }
             State::Scalar(Scalar::Value(Value::Number(number))) => {
                 return Ok(number.cast_into());
+            }
+            State::Scalar(Scalar::Value(Value::Bool(value))) => {
+                return Ok(value);
             }
             State::Scalar(Scalar::Value(Value::None)) | State::None => {
                 return Err(TCError::bad_request(

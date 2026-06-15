@@ -687,6 +687,7 @@ fn unwrap_map_state(state: State) -> TCResult<tc_ir::Map<State>> {
 
 fn parse_listing_bool(value: State) -> Option<bool> {
     match value {
+        State::Scalar(tc_ir::Scalar::Value(Value::Bool(value))) => Some(value),
         State::Scalar(tc_ir::Scalar::Value(Value::Number(Number::Bool(value)))) => {
             Some(bool::from(value))
         }
