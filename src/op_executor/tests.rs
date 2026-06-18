@@ -186,3 +186,110 @@ async fn executes_tensor_view_and_reduction_refs() {
         other => panic!("unexpected result {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn executes_tensor_slice_ref() {
+    let form = vec![(
+        "sliced".parse().expect("Id"),
+        Scalar::Ref(Box::new(TCRef::Op(OpRef::Get((
+            Subject::Ref("$x".parse().expect("IdRef"), Default::default()),
+            Scalar::Tuple(vec![Scalar::Tuple(vec![
+                Scalar::Value(Value::Number(Number::from(1_u64))),
+                Scalar::Value(Value::Number(Number::from(4_u64))),
+            ])]),
+        ))))),
+    )];
+    let op = OpDef::Post(form);
+
+    let mut params = Map::new();
+    params.insert(
+        "x".parse().expect("Id"),
+        State::Collection(Collection::Tensor(
+            Tensor::dense_u64(vec![5], vec![10, 20, 30, 40, 50]).expect("tensor"),
+        )),
+    );
+
+    let txn = crate::txn::TxnManager::with_host_id("test-host").begin();
+    let result = execute_post(&txn, op, params).await.expect("exec");
+
+    match result {
+        State::Collection(Collection::Tensor(tensor)) => {
+            assert_eq!(tensor.shape(), &[3]);
+            assert_eq!(tensor.flattened_u64().expect("values"), vec![20, 30, 40]);
+        }
+        other => panic!("unexpected result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn executes_tensor_cast_ref() {
+    let form = vec![(
+        "casted".parse().expect("Id"),
+        Scalar::Ref(Box::new(TCRef::Op(OpRef::Get((
+            Subject::Ref("$x".parse().expect("IdRef"), "cast".parse().expect("Path")),
+            Scalar::Value(Value::String("u64".to_string())),
+        ))))),
+    )];
+    let op = OpDef::Post(form);
+
+    let mut params = Map::new();
+    params.insert(
+        "x".parse().expect("Id"),
+        State::Collection(Collection::Tensor(
+            Tensor::dense_f64(vec![3], vec![1.0, 2.0, 3.0]).expect("tensor"),
+        )),
+    );
+
+    let txn = crate::txn::TxnManager::with_host_id("test-host").begin();
+    let result = execute_post(&txn, op, params).await.expect("exec");
+
+    match result {
+        State::Collection(Collection::Tensor(tensor)) => {
+            assert_eq!(tensor.dtype_tag(), "u64");
+            assert_eq!(tensor.flattened_u64().expect("values"), vec![1, 2, 3]);
+        }
+        other => panic!("unexpected result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn executes_tensor_reduction_axes_keepdims_ref() {
+    let form = vec![(
+        "reduced".parse().expect("Id"),
+        Scalar::Ref(Box::new(TCRef::Op(OpRef::Post((
+            Subject::Ref("$x".parse().expect("IdRef"), "sum".parse().expect("Path")),
+            {
+                let mut params = Map::new();
+                params.insert(
+                    "axes".parse().expect("Id"),
+                    Scalar::Tuple(vec![Scalar::Value(Value::Number(Number::from(1_u64)))]),
+                );
+                params.insert(
+                    "keepdims".parse().expect("Id"),
+                    Scalar::Value(Value::Number(Number::from(true))),
+                );
+                params
+            },
+        ))))),
+    )];
+    let op = OpDef::Post(form);
+
+    let mut params = Map::new();
+    params.insert(
+        "x".parse().expect("Id"),
+        State::Collection(Collection::Tensor(
+            Tensor::dense_f64(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).expect("tensor"),
+        )),
+    );
+
+    let txn = crate::txn::TxnManager::with_host_id("test-host").begin();
+    let result = execute_post(&txn, op, params).await.expect("exec");
+
+    match result {
+        State::Collection(Collection::Tensor(tensor)) => {
+            assert_eq!(tensor.shape(), &[2, 1]);
+            assert_eq!(tensor.flattened_f64().expect("values"), vec![3.0, 7.0]);
+        }
+        other => panic!("unexpected result {other:?}"),
+    }
+}

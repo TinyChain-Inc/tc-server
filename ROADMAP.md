@@ -35,6 +35,27 @@ empty, then delegate to `Kernel::route_request`, which decides whether to begin,
 or roll back. Keeping this logic centralized is critical—moving begin/commit heuristics into a
 protocol adapter or public client would bypass shared tests and risks future regressions.
 
+## Tensor routing ownership boundary (planned)
+
+Goal: align with v1 ownership by consuming canonical Tensor route semantics
+from `tc-collection` (the home of the transactional Tensor type), not from
+`tc-state`.
+
+- Keep `tc-server` as a thin dispatcher/orchestrator for Tensor operations.
+- During migration, allow `tc-state` Tensor facade usage only as transitional
+  compatibility scaffolding.
+- Move authoritative Tensor operation semantics (`dtype`, `shape`, `size`,
+  `reshape`, `broadcast`, `expand_dims`, `transpose`, `slice`, math/reductions)
+  behind `tc-collection` interfaces.
+- Remove duplicated/parallel Tensor behavior in `tc-server` once the
+  `tc-collection` route contract is in place.
+- Acceptance criteria:
+  - `tc-server` Tensor resolver paths call one canonical `tc-collection`
+    interface for route semantics.
+  - parity tests demonstrate no behavior regressions across HTTP/PyO3 adapters.
+  - `tc-state` Tensor routing dependency is deprecated and then removed from
+    canonical host routing paths.
+
 ### Minimal publisher kit (in progress)
 
 Goal: expose the router and transaction primitives directly from `tc-server` without forcing
