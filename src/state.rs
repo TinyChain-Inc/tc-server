@@ -4,12 +4,15 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::{FutureExt, stream};
 use number_general::Number;
-use tc_ir::{Id, Map, Scalar};
+use tc_error::{ErrorKind, TCError};
+use tc_ir::{Id, Map, OpDef, Scalar};
 use tc_state::State;
 use tc_value::Value;
 use url::form_urlencoded;
 
+use crate::op_executor::execute_post_with_self;
 use crate::reflect;
+use crate::txn::TxnHandle;
 use crate::{Body, KernelHandler, Request, Response, StatusCode, header};
 
 pub fn state_handler() -> Arc<dyn KernelHandler> {
@@ -31,6 +34,12 @@ async fn dispatch(req: Request) -> Response {
         return match *req.method() {
             hyper::Method::POST => number_gt(req).await,
             hyper::Method::GET => number_gt_get(req).await,
+            _ => method_not_allowed(),
+        };
+    }
+    if req.uri().path() == "/state/scalar/op/post" {
+        return match *req.method() {
+            hyper::Method::POST => opdef_post(req).await,
             _ => method_not_allowed(),
         };
     }
@@ -283,6 +292,46 @@ fn parse_number_param(raw: &str) -> Result<Number, Response> {
         Value::Number(number) => Ok(number),
         _ => Err(bad_request_response("expected number parameter")),
     }
+}
+
+async fn opdef_post(req: Request) -> Response {
+    let txn = match req.extensions().get::<TxnHandle>().cloned() {
+        Some(txn) => txn,
+        None => return internal_error_response("missing transaction handle"),
+    };
+
+    let body = match req.extensions().get::<crate::http::RequestBody>() {
+        Some(body) if !body.is_empty() => body.clone_bytes(),
+        _ => return bad_request_response("missing request body"),
+    };
+
+    let decoded_stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body)]);
+    let opdef: OpDef = match destream_json::try_decode((), decoded_stream).await {
+        Ok(opdef) => opdef,
+        Err(err) => return bad_request_response(&format!("invalid request body: {err}")),
+    };
+
+    if !matches!(opdef, OpDef::Post(_)) {
+        return bad_request_response("expected OpDef::Post form body");
+    }
+
+    match execute_post_with_self(&txn, opdef, Map::new(), None).await {
+        Ok(state) => state_response(state),
+        Err(err) => tc_error_to_response(err),
+    }
+}
+
+fn tc_error_to_response(err: TCError) -> Response {
+    let status = match err.code() {
+        ErrorKind::BadGateway | ErrorKind::BadRequest => StatusCode::BAD_REQUEST,
+        ErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    http::Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from(err.message().to_string()))
+        .expect("tc error response")
 }
 
 fn method_not_allowed() -> Response {

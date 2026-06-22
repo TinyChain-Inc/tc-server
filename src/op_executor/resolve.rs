@@ -10,8 +10,11 @@ use tc_ir::{Cond, ForEach, Id, Map, NativeClass, OpDef, OpRef, Scalar, Subject, 
 use tc_state::{AxisRange, Collection, Range, State, Tensor, TensorReduceResult, TensorType};
 use tc_value::Value;
 
+use super::broadcast_reduce::broadcast_reduce_sum;
 use super::execute::execute_post_with_self;
 use super::reflect::reflect_link;
+use super::tensor_add::broadcast_add;
+use super::tensor_dtype::tensor_op_result;
 use crate::gateway::RpcGateway;
 use crate::op_plan::opdef_free_ids;
 
@@ -100,6 +103,10 @@ fn resolve_opref(
             OpRef::Put((subject, key, value)) => match subject {
                 Subject::Link(_) | Subject::Ref(_, _) => {
                     let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
+                    if matches!(key, Scalar::Tuple(_)) && link == TensorType.path().to_string() {
+                        let tensor = parse_tensor_literal_put(key, value)?;
+                        return Ok(State::Collection(Collection::Tensor(tensor)));
+                    }
                     let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
                     let value = scalar_to_state(value, &values, &txn, self_link.as_ref()).await?;
                     txn.put(link, txn.clone(), key, value)
@@ -715,13 +722,27 @@ async fn resolve_tensor_post(
                 TensorReduceResult::Tensor(tensor) => State::Collection(Collection::Tensor(tensor)),
             }
         }
+        "broadcast_reduce" => {
+            let target_shape =
+                tensor_shape_param(params, "target_shape", values, txn, self_link).await?;
+            State::Collection(Collection::Tensor(tensor_op_result(broadcast_reduce_sum(
+                &tensor,
+                &target_shape,
+            ))?))
+        }
         "matmul" => {
             let right = tensor_param(params, "r", values, txn, self_link).await?;
             State::Collection(Collection::Tensor(
                 tensor.matmul(&right).map_err(TCError::bad_request)?,
             ))
         }
-        "add" | "sub" | "mul" | "div" | "and" | "or" | "xor" => {
+        "add" => {
+            let right = tensor_param(params, "r", values, txn, self_link).await?;
+            State::Collection(Collection::Tensor(tensor_op_result(broadcast_add(
+                &tensor, &right,
+            ))?))
+        }
+        "sub" | "mul" | "div" | "and" | "or" | "xor" => {
             let right = tensor_param(params, "r", values, txn, self_link).await?;
             State::Collection(Collection::Tensor(
                 tensor
@@ -828,6 +849,18 @@ async fn tensor_keepdims_param(
 
     let state = scalar_to_state(value.clone(), values, txn, self_link).await?;
     bool_from_state(state, "tensor keepdims")
+}
+
+async fn tensor_shape_param(
+    params: &Map<Scalar>,
+    name: &str,
+    values: &Arc<HashMap<Id, State>>,
+    txn: &crate::txn::TxnHandle,
+    self_link: Option<&Link>,
+) -> TCResult<Vec<usize>> {
+    let value = required_scalar_param(params, name, "tensor shape")?;
+    let state = scalar_to_state(value.clone(), values, txn, self_link).await?;
+    shape_from_state(state)
 }
 
 fn scalar_param<'a>(

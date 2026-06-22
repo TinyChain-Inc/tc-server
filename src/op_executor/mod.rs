@@ -1,7 +1,10 @@
+mod broadcast_reduce;
 mod execute;
 mod executor;
 mod reflect;
 mod resolve;
+mod tensor_add;
+mod tensor_dtype;
 
 #[cfg(test)]
 mod tests;
