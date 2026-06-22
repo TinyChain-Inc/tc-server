@@ -1,3 +1,5 @@
+use umask::Mode;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::env;
     use std::str::FromStr;
@@ -20,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut secret_key_b64: Option<String> = None;
     let mut alg = AlgKind::Falcon512;
     let mut ttl_secs: u64 = 3600;
+    let mut mode = USER_WRITE;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -39,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--ttl-secs" => {
                 ttl_secs = args.next().ok_or("missing --ttl-secs value")?.parse()?;
             }
+            "--mode" => mode = parse_mode(args.next().ok_or("missing --mode value")?.as_str())?,
             "--help" | "-h" => {
                 print_usage();
                 return Ok(());
@@ -56,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = Link::from_str(&host)?;
     let mut claims = Vec::new();
     for lib in &libs {
-        claims.push(Claim::new(Link::from_str(lib)?, USER_WRITE));
+        claims.push(Claim::new(Link::from_str(lib)?, mode));
     }
 
     let signing_key = if let Some(secret_key_b64) = secret_key_b64.as_ref() {
@@ -114,10 +118,18 @@ fn parse_alg(alg: &str) -> Result<rjwt::AlgKind, Box<dyn std::error::Error>> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: rjwt_install_token --host <http(s)://host[:port]> --actor <id> --lib <path> [--lib <path> ...] [--txn-id <id>] [--secret-key-b64 <b64>] [--alg falcon512|ed25519] [--ttl-secs <n>]\n\
+        "Usage: rjwt_install_token --host <http(s)://host[:port]> --actor <id> --lib <path> [--lib <path> ...] [--txn-id <id>] [--secret-key-b64 <b64>] [--alg falcon512|ed25519] [--ttl-secs <n>] [--mode <octal>]\n\
          Example:\n\
           cargo run --example rjwt_install_token -- \\\n\
              --host http://127.0.0.1:8702 --actor example-admin \\\n\
              --lib /lib/example-devco/a/0.1.0 --lib /lib/example-devco/example/0.1.0\n"
     );
+}
+
+fn parse_mode(mode: &str) -> Result<Mode, Box<dyn std::error::Error>> {
+    let digits = mode.trim().strip_prefix("0o").unwrap_or(mode.trim());
+    if digits.is_empty() || !digits.chars().all(|c| ('0'..='7').contains(&c)) {
+        return Err(format!("invalid octal mode: {mode}").into());
+    }
+    Ok(Mode::from(u32::from_str_radix(digits, 8)?))
 }
