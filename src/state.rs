@@ -39,7 +39,7 @@ async fn dispatch(req: Request) -> Response {
     }
     if req.uri().path() == "/state/scalar/op/post" {
         return match *req.method() {
-            hyper::Method::POST => opdef_post(req).await,
+            hyper::Method::POST => execute_opdef_post_form(req).await,
             _ => method_not_allowed(),
         };
     }
@@ -294,7 +294,7 @@ fn parse_number_param(raw: &str) -> Result<Number, Response> {
     }
 }
 
-async fn opdef_post(req: Request) -> Response {
+async fn execute_opdef_post_form(req: Request) -> Response {
     let txn = match req.extensions().get::<TxnHandle>().cloned() {
         Some(txn) => txn,
         None => return internal_error_response("missing transaction handle"),
@@ -315,6 +315,8 @@ async fn opdef_post(req: Request) -> Response {
         return bad_request_response("expected OpDef::Post form body");
     }
 
+    // Execute constrained TinyChain OpDef IR under the active transaction.
+    // This route does not evaluate arbitrary user code or serialized graphs.
     match execute_post_with_self(&txn, opdef, Map::new(), None).await {
         Ok(state) => state_response(state),
         Err(err) => tc_error_to_response(err),

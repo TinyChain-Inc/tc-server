@@ -427,28 +427,26 @@ fn broadcast_reduce_sums_leading_and_singleton_axes() {
 
 #[tokio::test]
 async fn opdef_post_broadcast_reduce_via_form() {
-    let form = vec![
-        (
-            "result".parse().expect("Id"),
-            Scalar::Ref(Box::new(TCRef::Op(OpRef::Post((
-                Subject::Ref(
-                    "$x".parse().expect("IdRef"),
-                    "broadcast_reduce".parse().expect("Path"),
-                ),
-                {
-                    let mut params = Map::new();
-                    params.insert(
-                        "target_shape".parse().expect("Id"),
-                        Scalar::Tuple(vec![
-                            Scalar::Value(Value::Number(Number::from(1_u64))),
-                            Scalar::Value(Value::Number(Number::from(3_u64))),
-                        ]),
-                    );
-                    params
-                },
-            ))))),
-        ),
-    ];
+    let form = vec![(
+        "result".parse().expect("Id"),
+        Scalar::Ref(Box::new(TCRef::Op(OpRef::Post((
+            Subject::Ref(
+                "$x".parse().expect("IdRef"),
+                "broadcast_reduce".parse().expect("Path"),
+            ),
+            {
+                let mut params = Map::new();
+                params.insert(
+                    "target_shape".parse().expect("Id"),
+                    Scalar::Tuple(vec![
+                        Scalar::Value(Value::Number(Number::from(1_u64))),
+                        Scalar::Value(Value::Number(Number::from(3_u64))),
+                    ]),
+                );
+                params
+            },
+        ))))),
+    )];
     let op = OpDef::Post(form);
 
     let mut params = Map::new();
