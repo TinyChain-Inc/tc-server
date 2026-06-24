@@ -29,6 +29,7 @@ pub fn http_ir_route_handler_from_bytes(
     use bytes::Bytes;
     use futures::FutureExt;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use tc_ir::{Map, OpDef, OpRef, Scalar, Subject, parse_route_path};
     use tc_state::State;
     use tc_value::Value;
@@ -242,7 +243,7 @@ pub fn http_ir_route_handler_from_bytes(
                             .map(|()| State::None)
                         }
                         OpDef::Post(_) if method == HttpMethod::POST => {
-                            let params = match decode_scalar_map_body(&req).await {
+                            let params = match decode_state_map_body(&req).await {
                                 Ok(Some(params)) => params,
                                 Ok(None) => Map::new(),
                                 Err(err) => return tc_error_response(err),
@@ -386,7 +387,7 @@ pub fn http_ir_route_handler_from_bytes(
             .map_err(|err| TCError::bad_request(err.to_string()))
     }
 
-    async fn decode_scalar_map_body(req: &Request) -> TCResult<Option<Map<State>>> {
+    async fn decode_state_map_body(req: &Request) -> TCResult<Option<Map<State>>> {
         if let Some(body) = req.extensions().get::<NativeStateBody>() {
             let state = body.clone_state();
             if state.is_none() {
@@ -428,6 +429,13 @@ pub fn http_ir_route_handler_from_bytes(
             ));
         };
 
+        let txn = req
+            .extensions()
+            .get::<TxnHandle>()
+            .cloned()
+            .ok_or_else(|| TCError::internal("missing transaction handle for request body"))?;
+        let context: Arc<dyn tc_ir::Transaction> = Arc::new(txn);
+
         let mut out = Map::new();
         for (key, value) in map {
             let id: Id = key
@@ -437,13 +445,9 @@ pub fn http_ir_route_handler_from_bytes(
                 serde_json::to_vec(&value).map_err(|err| TCError::bad_request(err.to_string()))?;
             let stream =
                 futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
-            let scalar: Scalar = destream_json::try_decode((), stream)
+            let state: State = destream_json::try_decode(Arc::clone(&context), stream)
                 .await
                 .map_err(|err| TCError::bad_request(err.to_string()))?;
-            let state = match scalar {
-                Scalar::Value(value) => State::from(value),
-                other => State::Scalar(other),
-            };
             out.insert(id, state);
         }
 
