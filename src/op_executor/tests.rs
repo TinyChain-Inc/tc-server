@@ -1,4 +1,5 @@
 use super::*;
+use super::tensor_matmul::batched_matmul;
 use number_general::Number;
 use tc_ir::{Cond, Map, OpDef, OpRef, Scalar, Subject, TCRef};
 use tc_state::{Collection, NativeClass, State, Tensor, TensorType};
@@ -114,13 +115,13 @@ async fn executes_tensor_metadata_and_matmul_refs() {
     params.insert(
         "x".parse().expect("Id"),
         State::Collection(Collection::Tensor(
-            Tensor::dense_u64(vec![2, 2], vec![1, 2, 3, 4]).expect("left tensor"),
+            Tensor::dense_f64(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).expect("left tensor"),
         )),
     );
     params.insert(
         "y".parse().expect("Id"),
         State::Collection(Collection::Tensor(
-            Tensor::dense_u64(vec![2, 2], vec![5, 6, 7, 8]).expect("right tensor"),
+            Tensor::dense_f64(vec![2, 2], vec![5.0, 6.0, 7.0, 8.0]).expect("right tensor"),
         )),
     );
 
@@ -131,8 +132,8 @@ async fn executes_tensor_metadata_and_matmul_refs() {
         State::Collection(Collection::Tensor(tensor)) => {
             assert_eq!(tensor.shape(), &[2, 2]);
             assert_eq!(
-                tensor.flattened_u64().expect("u64 values"),
-                vec![19, 22, 43, 50]
+                tensor.flattened_f64().expect("f64 values"),
+                vec![19.0, 22.0, 43.0, 50.0]
             );
         }
         other => panic!("unexpected result {other:?}"),
@@ -511,4 +512,129 @@ async fn opdef_post_add_via_form() {
         }
         other => panic!("unexpected result {other:?}"),
     }
+}
+
+#[test]
+fn batched_matmul_rank2_square() {
+    let left = Tensor::dense_f64(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).expect("left");
+    let right = Tensor::dense_f64(vec![2, 2], vec![5.0, 6.0, 7.0, 8.0]).expect("right");
+    let result = batched_matmul(&left, &right).expect("matmul");
+    assert_eq!(result.shape(), &[2, 2]);
+    assert_eq!(
+        result.flattened_f64().expect("values"),
+        vec![19.0, 22.0, 43.0, 50.0]
+    );
+}
+
+#[test]
+fn batched_matmul_rank2_non_square() {
+    // A: 2×3, B: 3×2 → C: 2×2
+    let left =
+        Tensor::dense_f64(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("left");
+    let right =
+        Tensor::dense_f64(vec![3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).expect("right");
+    let result = batched_matmul(&left, &right).expect("matmul");
+    assert_eq!(result.shape(), &[2, 2]);
+    // C[0,0]=1*7+2*9+3*11=58, C[0,1]=1*8+2*10+3*12=64
+    // C[1,0]=4*7+5*9+6*11=139, C[1,1]=4*8+5*10+6*12=154
+    assert_eq!(
+        result.flattened_f64().expect("values"),
+        vec![58.0, 64.0, 139.0, 154.0]
+    );
+}
+
+#[test]
+fn batched_matmul_rank4_batched() {
+    // A: [2, 1, 2, 2], B: [2, 1, 2, 2]
+    let mat = vec![1.0_f64, 2.0, 3.0, 4.0];
+    let left = Tensor::dense_f64(
+        vec![2, 1, 2, 2],
+        mat.iter().chain(mat.iter()).copied().collect(),
+    )
+    .expect("left");
+    let right = Tensor::dense_f64(
+        vec![2, 1, 2, 2],
+        mat.iter().chain(mat.iter()).copied().collect(),
+    )
+    .expect("right");
+    let result = batched_matmul(&left, &right).expect("matmul");
+    assert_eq!(result.shape(), &[2, 1, 2, 2]);
+    // [1,2;3,4] * [1,2;3,4] = [7,10;15,22] for both batches
+    let expected = vec![7.0, 10.0, 15.0, 22.0, 7.0, 10.0, 15.0, 22.0];
+    assert_eq!(result.flattened_f64().expect("values"), expected);
+}
+
+#[test]
+fn batched_matmul_batch_broadcast() {
+    // A: [2, 1, 2, 2] — 2 outer batches, 1 inner (broadcast)
+    // B: [1, 3, 2, 2] — 1 outer (broadcast), 3 inner batches
+    // result: [2, 3, 2, 2]
+    // A batches: [[1,0;0,1], [2,0;0,2]] (identity and 2×identity)
+    let a_vals = vec![
+        1.0_f64, 0.0, 0.0, 1.0, // batch (0,0): identity
+        2.0, 0.0, 0.0, 2.0, // batch (1,0): 2*identity
+    ];
+    // B batches: [[1,2;3,4], [5,6;7,8], [9,10;11,12]]
+    let b_vals = vec![
+        1.0_f64, 2.0, 3.0, 4.0, // batch (0,0)
+        5.0, 6.0, 7.0, 8.0, // batch (0,1)
+        9.0, 10.0, 11.0, 12.0, // batch (0,2)
+    ];
+    let left = Tensor::dense_f64(vec![2, 1, 2, 2], a_vals).expect("left");
+    let right = Tensor::dense_f64(vec![1, 3, 2, 2], b_vals).expect("right");
+    let result = batched_matmul(&left, &right).expect("matmul");
+    assert_eq!(result.shape(), &[2, 3, 2, 2]);
+    // Row 0 (outer=0, inner=0,1,2): I@B[0], I@B[1], I@B[2] → same as B batches
+    // Row 1 (outer=1, inner=0,1,2): 2I@B[0], 2I@B[1], 2I@B[2]
+    let expected = vec![
+        1.0, 2.0, 3.0, 4.0, // (0,0)
+        5.0, 6.0, 7.0, 8.0, // (0,1)
+        9.0, 10.0, 11.0, 12.0, // (0,2)
+        2.0, 4.0, 6.0, 8.0, // (1,0)
+        10.0, 12.0, 14.0, 16.0, // (1,1)
+        18.0, 20.0, 22.0, 24.0, // (1,2)
+    ];
+    assert_eq!(result.flattened_f64().expect("values"), expected);
+}
+
+#[test]
+fn batched_matmul_rejects_incompatible_inner_dims() {
+    // A: [2, 3], B: [4, 5] — A.shape[-1]=3, B.shape[-2]=4 mismatch
+    let left = Tensor::dense_f64(vec![2, 3], vec![1.0; 6]).expect("left");
+    let right = Tensor::dense_f64(vec![4, 5], vec![1.0; 20]).expect("right");
+    let err = batched_matmul(&left, &right).expect_err("shape mismatch");
+    assert!(
+        err.to_string()
+            .contains("TensorOpError::MatmulShapeMismatch"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn batched_matmul_rejects_incompatible_batch_dims() {
+    // A: [2, 2, 3], B: [3, 3, 4] — batch [2] vs [3] incompatible
+    let left = Tensor::dense_f64(vec![2, 2, 3], vec![1.0; 12]).expect("left");
+    let right = Tensor::dense_f64(vec![3, 3, 4], vec![1.0; 36]).expect("right");
+    let err = batched_matmul(&left, &right).expect_err("batch mismatch");
+    assert!(
+        err.to_string()
+            .contains("TensorOpError::BroadcastShapeMismatch"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn batched_matmul_rejects_rank_below_2() {
+    let vec1d = Tensor::dense_f64(vec![3], vec![1.0, 2.0, 3.0]).expect("1d");
+    let mat2d = Tensor::dense_f64(vec![3, 2], vec![1.0; 6]).expect("2d");
+    let err = batched_matmul(&vec1d, &mat2d).expect_err("rank error");
+    assert!(
+        err.to_string().contains("TensorOpError::InvalidRank"),
+        "unexpected error: {err}"
+    );
+    let err2 = batched_matmul(&mat2d, &vec1d).expect_err("rank error right");
+    assert!(
+        err2.to_string().contains("TensorOpError::InvalidRank"),
+        "unexpected error: {err2}"
+    );
 }

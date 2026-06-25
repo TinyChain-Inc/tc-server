@@ -15,6 +15,7 @@ use super::execute::execute_post_with_self;
 use super::reflect::reflect_link;
 use super::tensor_add::broadcast_add;
 use super::tensor_dtype::tensor_op_result;
+use super::tensor_matmul::batched_matmul;
 use crate::gateway::RpcGateway;
 use crate::op_plan::opdef_free_ids;
 
@@ -732,9 +733,9 @@ async fn resolve_tensor_post(
         }
         "matmul" => {
             let right = tensor_param(params, "r", values, txn, self_link).await?;
-            State::Collection(Collection::Tensor(
-                tensor.matmul(&right).map_err(TCError::bad_request)?,
-            ))
+            State::Collection(Collection::Tensor(tensor_op_result(batched_matmul(
+                &tensor, &right,
+            ))?))
         }
         "add" => {
             let right = tensor_param(params, "r", values, txn, self_link).await?;

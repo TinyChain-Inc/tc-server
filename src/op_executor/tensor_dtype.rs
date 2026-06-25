@@ -24,6 +24,17 @@ pub(crate) enum TensorOpError {
         input: Vec<usize>,
         target: Vec<usize>,
     },
+    InvalidRank {
+        rank: usize,
+    },
+    MatmulShapeMismatch {
+        a_inner: usize,
+        b_inner: usize,
+    },
+    BroadcastShapeMismatch {
+        batch_a: Vec<usize>,
+        batch_b: Vec<usize>,
+    },
 }
 
 impl TensorOpError {
@@ -63,6 +74,24 @@ impl fmt::Display for TensorOpError {
                 write!(
                     f,
                     "TensorOpError::InvalidBroadcastReduce: input shape {input:?} cannot reduce to target shape {target:?}"
+                )
+            }
+            Self::InvalidRank { rank } => {
+                write!(
+                    f,
+                    "TensorOpError::InvalidRank: matmul requires rank >= 2 but got rank {rank}"
+                )
+            }
+            Self::MatmulShapeMismatch { a_inner, b_inner } => {
+                write!(
+                    f,
+                    "TensorOpError::MatmulShapeMismatch: A inner dim {a_inner} != B inner dim {b_inner}"
+                )
+            }
+            Self::BroadcastShapeMismatch { batch_a, batch_b } => {
+                write!(
+                    f,
+                    "TensorOpError::BroadcastShapeMismatch: batch dims {batch_a:?} and {batch_b:?} are not broadcast-compatible"
                 )
             }
         }
