@@ -34,7 +34,6 @@ async fn dispatch(req: Request) -> Response {
             _ => method_not_allowed(),
         };
     }
-
     not_found()
 }
 
