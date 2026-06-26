@@ -16,6 +16,7 @@ use super::reflect::reflect_link;
 use super::tensor_add::broadcast_add;
 use super::tensor_dtype::tensor_op_result;
 use super::tensor_matmul::batched_matmul;
+use super::tensor_transpose::tensor_transpose;
 use crate::gateway::RpcGateway;
 use crate::op_plan::opdef_free_ids;
 
@@ -663,11 +664,8 @@ async fn resolve_tensor_get(
         }
         "transpose" => {
             let permutation = scalar_to_state(key, values, txn, self_link).await?;
-            let permutation = optional_shape_from_state(permutation)?;
-
-            tensor
-                .transpose(permutation)
-                .map_err(TCError::bad_request)?
+            let permutation = shape_from_state(permutation)?;
+            tensor_op_result(tensor_transpose(&tensor, &permutation))?
         }
         _ => return Ok(None),
     };
@@ -735,6 +733,13 @@ async fn resolve_tensor_post(
             let right = tensor_param(params, "r", values, txn, self_link).await?;
             State::Collection(Collection::Tensor(tensor_op_result(batched_matmul(
                 &tensor, &right,
+            ))?))
+        }
+        "transpose" => {
+            let permutation = tensor_shape_param(params, "perm", values, txn, self_link).await?;
+            State::Collection(Collection::Tensor(tensor_op_result(tensor_transpose(
+                &tensor,
+                &permutation,
             ))?))
         }
         "add" => {
