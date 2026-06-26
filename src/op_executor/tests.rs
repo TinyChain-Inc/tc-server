@@ -1,5 +1,6 @@
-use super::*;
 use super::tensor_matmul::batched_matmul;
+use super::tensor_transpose::{tensor_transpose, transpose_output_shape};
+use super::*;
 use number_general::Number;
 use tc_ir::{Cond, Map, OpDef, OpRef, Scalar, Subject, TCRef};
 use tc_state::{Collection, NativeClass, State, Tensor, TensorType};
@@ -529,8 +530,7 @@ fn batched_matmul_rank2_square() {
 #[test]
 fn batched_matmul_rank2_non_square() {
     // A: 2×3, B: 3×2 → C: 2×2
-    let left =
-        Tensor::dense_f64(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("left");
+    let left = Tensor::dense_f64(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("left");
     let right =
         Tensor::dense_f64(vec![3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).expect("right");
     let result = batched_matmul(&left, &right).expect("matmul");
@@ -637,4 +637,172 @@ fn batched_matmul_rejects_rank_below_2() {
         err2.to_string().contains("TensorOpError::InvalidRank"),
         "unexpected error: {err2}"
     );
+}
+
+#[test]
+fn tensor_transpose_permutates_2d_tensor() {
+    let tensor = Tensor::dense_f64(vec![2, 3], vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).expect("tensor");
+
+    let result = tensor_transpose(&tensor, &[1, 0]).expect("transpose");
+
+    assert_eq!(result.shape(), &[3, 2]);
+    assert_eq!(
+        result.flattened_f64().expect("values"),
+        vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]
+    );
+}
+
+#[test]
+fn tensor_transpose_permutates_rank4_tensor() {
+    let tensor = Tensor::dense_f64(
+        vec![2, 3, 2, 2],
+        (0..24).map(|value| value as f64).collect(),
+    )
+    .expect("tensor");
+
+    let result = tensor_transpose(&tensor, &[1, 0, 3, 2]).expect("transpose");
+
+    assert_eq!(result.shape(), &[3, 2, 2, 2]);
+    assert_eq!(
+        result.flattened_f64().expect("values"),
+        vec![
+            0.0, 2.0, 1.0, 3.0, 12.0, 14.0, 13.0, 15.0, 4.0, 6.0, 5.0, 7.0, 16.0, 18.0, 17.0, 19.0,
+            8.0, 10.0, 9.0, 11.0, 20.0, 22.0, 21.0, 23.0,
+        ]
+    );
+}
+
+#[test]
+fn tensor_transpose_identity_preserves_shape_values_and_dtype() {
+    let tensor = Tensor::dense_f32(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).expect("tensor");
+
+    let result = tensor_transpose(&tensor, &[0, 1]).expect("transpose");
+
+    assert_eq!(result.dtype_tag(), "f32");
+    assert_eq!(result.shape(), &[2, 2]);
+    assert_eq!(
+        result.flattened_f32().expect("values"),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+}
+
+#[test]
+fn tensor_transpose_computes_output_shape() {
+    let shape = transpose_output_shape(&[2, 3, 4], &[2, 0, 1]).expect("shape");
+
+    assert_eq!(shape, vec![4, 2, 3]);
+}
+
+#[test]
+fn tensor_transpose_rejects_invalid_permutations() {
+    let tensor = Tensor::dense_f64(vec![2, 3], vec![1.0; 6]).expect("tensor");
+
+    for permutation in [vec![0], vec![0, 0], vec![0, 2]] {
+        let err = tensor_transpose(&tensor, &permutation).expect_err("invalid permutation");
+        assert!(
+            err.to_string()
+                .contains("TensorOpError::InvalidPermutation"),
+            "unexpected error for {permutation:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn tensor_transpose_rejects_non_float_dtype() {
+    let tensor = Tensor::dense_u64(vec![2, 2], vec![1, 2, 3, 4]).expect("tensor");
+
+    let err = tensor_transpose(&tensor, &[1, 0]).expect_err("dtype rejected");
+
+    assert!(
+        err.to_string().contains("TensorOpError::DtypeNotSupported"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn opdef_get_transpose_via_form() {
+    let form = vec![(
+        "result".parse().expect("Id"),
+        Scalar::Ref(Box::new(TCRef::Op(OpRef::Get((
+            Subject::Ref(
+                "$x".parse().expect("IdRef"),
+                "transpose".parse().expect("Path"),
+            ),
+            Scalar::Tuple(vec![
+                Scalar::Value(Value::Number(Number::from(1_u64))),
+                Scalar::Value(Value::Number(Number::from(0_u64))),
+            ]),
+        ))))),
+    )];
+    let op = OpDef::Post(form);
+
+    let mut params = Map::new();
+    params.insert(
+        "x".parse().expect("Id"),
+        State::Collection(Collection::Tensor(
+            Tensor::dense_f32(vec![2, 3], vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).expect("x"),
+        )),
+    );
+
+    let txn = crate::txn::TxnManager::with_host_id("test-host").begin();
+    let result = execute_post(&txn, op, params).await.expect("exec");
+
+    match result {
+        State::Collection(Collection::Tensor(tensor)) => {
+            assert_eq!(tensor.dtype_tag(), "f32");
+            assert_eq!(tensor.shape(), &[3, 2]);
+            assert_eq!(
+                tensor.flattened_f32().expect("values"),
+                vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]
+            );
+        }
+        other => panic!("unexpected result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn opdef_post_transpose_via_form() {
+    let form = vec![(
+        "result".parse().expect("Id"),
+        Scalar::Ref(Box::new(TCRef::Op(OpRef::Post((
+            Subject::Ref(
+                "$x".parse().expect("IdRef"),
+                "transpose".parse().expect("Path"),
+            ),
+            {
+                let mut params = Map::new();
+                params.insert(
+                    "perm".parse().expect("Id"),
+                    Scalar::Tuple(vec![
+                        Scalar::Value(Value::Number(Number::from(1_u64))),
+                        Scalar::Value(Value::Number(Number::from(0_u64))),
+                    ]),
+                );
+                params
+            },
+        ))))),
+    )];
+    let op = OpDef::Post(form);
+
+    let mut params = Map::new();
+    params.insert(
+        "x".parse().expect("Id"),
+        State::Collection(Collection::Tensor(
+            Tensor::dense_f64(vec![2, 3], vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).expect("x"),
+        )),
+    );
+
+    let txn = crate::txn::TxnManager::with_host_id("test-host").begin();
+    let result = execute_post(&txn, op, params).await.expect("exec");
+
+    match result {
+        State::Collection(Collection::Tensor(tensor)) => {
+            assert_eq!(tensor.shape(), &[3, 2]);
+            assert_eq!(
+                tensor.flattened_f64().expect("values"),
+                vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]
+            );
+        }
+        other => panic!("unexpected result {other:?}"),
+    }
 }

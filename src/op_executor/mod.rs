@@ -6,6 +6,7 @@ mod resolve;
 mod tensor_add;
 mod tensor_dtype;
 mod tensor_matmul;
+mod tensor_transpose;
 
 #[cfg(test)]
 mod tests;

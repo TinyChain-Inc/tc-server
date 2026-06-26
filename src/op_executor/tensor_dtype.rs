@@ -35,6 +35,11 @@ pub(crate) enum TensorOpError {
         batch_a: Vec<usize>,
         batch_b: Vec<usize>,
     },
+    InvalidPermutation {
+        rank: usize,
+        permutation: Vec<usize>,
+        reason: String,
+    },
 }
 
 impl TensorOpError {
@@ -92,6 +97,16 @@ impl fmt::Display for TensorOpError {
                 write!(
                     f,
                     "TensorOpError::BroadcastShapeMismatch: batch dims {batch_a:?} and {batch_b:?} are not broadcast-compatible"
+                )
+            }
+            Self::InvalidPermutation {
+                rank,
+                permutation,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "TensorOpError::InvalidPermutation: permutation {permutation:?} is invalid for rank {rank}: {reason}"
                 )
             }
         }
