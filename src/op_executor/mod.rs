@@ -5,6 +5,7 @@ mod reflect;
 mod resolve;
 mod tensor_add;
 mod tensor_dtype;
+mod tensor_matmul;
 
 #[cfg(test)]
 mod tests;
