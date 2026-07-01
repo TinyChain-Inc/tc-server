@@ -546,7 +546,7 @@ fn batched_matmul_rank2_non_square() {
 #[test]
 fn batched_matmul_rank4_batched() {
     // A: [2, 1, 2, 2], B: [2, 1, 2, 2]
-    let mat = vec![1.0_f64, 2.0, 3.0, 4.0];
+    let mat = [1.0_f64, 2.0, 3.0, 4.0];
     let left = Tensor::dense_f64(
         vec![2, 1, 2, 2],
         mat.iter().chain(mat.iter()).copied().collect(),
