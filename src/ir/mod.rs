@@ -434,7 +434,12 @@ pub fn http_ir_route_handler_from_bytes(
             .get::<TxnHandle>()
             .cloned()
             .ok_or_else(|| TCError::internal("missing transaction handle for request body"))?;
-        let context: Arc<dyn tc_ir::Transaction> = Arc::new(txn);
+        let txn_context: Arc<dyn tc_ir::Transaction> = Arc::new(txn);
+        let mut state_context = tc_state::state_context(Arc::clone(&txn_context));
+        if let Some(roots) = req.extensions().get::<crate::http::BTreeDecodeRoots>() {
+            state_context =
+                state_context.with_btree_roots(roots.persistent_dir(), roots.txn_root());
+        }
 
         let mut out = Map::new();
         for (key, value) in map {
@@ -445,7 +450,7 @@ pub fn http_ir_route_handler_from_bytes(
                 serde_json::to_vec(&value).map_err(|err| TCError::bad_request(err.to_string()))?;
             let stream =
                 futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
-            let state: State = destream_json::try_decode(Arc::clone(&context), stream)
+            let state: State = destream_json::try_decode(state_context.clone(), stream)
                 .await
                 .map_err(|err| TCError::bad_request(err.to_string()))?;
             out.insert(id, state);
