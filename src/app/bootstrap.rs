@@ -21,15 +21,19 @@ struct BootstrapStepOutcome {
     replication: ReplicationReport,
 }
 
+pub(crate) struct BootstrapContext<'a> {
+    pub(crate) registry: &'a Arc<tinychain::library::LibraryRegistry>,
+    pub(crate) membership: &'a PeerMembership,
+    pub(crate) seed_peers: &'a [String],
+    pub(crate) keys: &'a [aes_gcm_siv::Key<Aes256GcmSiv>],
+    pub(crate) routes: &'a PeerRoutes,
+    pub(crate) replicate: bool,
+    pub(crate) self_peer: Option<String>,
+    pub(crate) issuer: &'a ReplicationIssuer,
+}
+
 pub(crate) async fn run_bootstrap_with_retries(
-    registry: &Arc<tinychain::library::LibraryRegistry>,
-    membership: &PeerMembership,
-    seed_peers: &[String],
-    keys: &[aes_gcm_siv::Key<Aes256GcmSiv>],
-    routes: &PeerRoutes,
-    replicate: bool,
-    self_peer: Option<String>,
-    issuer: &ReplicationIssuer,
+    context: BootstrapContext<'_>,
     max_attempts: u8,
     retry_delay: Duration,
 ) -> BootstrapOutcome {
@@ -47,14 +51,7 @@ pub(crate) async fn run_bootstrap_with_retries(
     for attempt in 1..=max_attempts {
         let previous_unresolved = unresolved_paths.as_ref().map(HashSet::len);
         let step = run_bootstrap_step(
-            registry,
-            membership,
-            seed_peers,
-            keys,
-            routes,
-            replicate,
-            self_peer.clone(),
-            issuer,
+            &context,
             unresolved_paths.as_ref(),
         )
         .await;
@@ -104,20 +101,13 @@ pub(crate) async fn run_bootstrap_with_retries(
 }
 
 async fn run_bootstrap_step(
-    registry: &Arc<tinychain::library::LibraryRegistry>,
-    membership: &PeerMembership,
-    seed_peers: &[String],
-    keys: &[aes_gcm_siv::Key<Aes256GcmSiv>],
-    routes: &PeerRoutes,
-    replicate: bool,
-    self_peer: Option<String>,
-    issuer: &ReplicationIssuer,
+    context: &BootstrapContext<'_>,
     target_paths: Option<&HashSet<String>>,
 ) -> BootstrapStepOutcome {
     let mut hard_failure = false;
-    let mut peers = membership.snapshot_active_peers();
+    let mut peers = context.membership.snapshot_active_peers();
     let mut seen = peers.iter().cloned().collect::<HashSet<_>>();
-    for peer in seed_peers {
+    for peer in context.seed_peers {
         if seen.insert(peer.clone()) {
             peers.push(peer.clone());
         }
@@ -125,8 +115,14 @@ async fn run_bootstrap_step(
 
     peers.sort();
 
-    let replication = if replicate && !peers.is_empty() {
-        let report = replicate_from_peers_targeted(registry, &peers, keys, target_paths).await;
+    let replication = if context.replicate && !peers.is_empty() {
+        let report = replicate_from_peers_targeted(
+            context.registry,
+            &peers,
+            context.keys,
+            target_paths,
+        )
+        .await;
         hard_failure |= report.has_hard_failures();
 
         if !report.is_clean() {
@@ -138,11 +134,18 @@ async fn run_bootstrap_step(
         ReplicationReport::default()
     };
 
-    if let Some(self_peer) = self_peer {
-        match issuer.self_identity(self_peer) {
+    if let Some(self_peer) = context.self_peer.clone() {
+        match context.issuer.self_identity(self_peer) {
             Ok(identity) => {
                 let report =
-                    announce_self_to_cluster(membership, &identity, routes, keys, issuer).await;
+                    announce_self_to_cluster(
+                        context.membership,
+                        &identity,
+                        context.routes,
+                        context.keys,
+                        context.issuer,
+                    )
+                    .await;
 
                 if !report.failed.is_empty() {
                     eprintln!("cluster join completed with partial failures: {report:?}");

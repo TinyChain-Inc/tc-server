@@ -24,7 +24,7 @@ mod discovery;
 mod handlers;
 mod trusted_installers;
 
-use bootstrap::run_bootstrap_with_retries;
+use bootstrap::{BootstrapContext, run_bootstrap_with_retries};
 use config::{BootstrapReadinessMode, Config};
 #[cfg(feature = "mdns")]
 use discovery::{advertise_ip, advertise_mdns, discover_mdns_peers};
@@ -169,15 +169,19 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_readiness_mode = config.bootstrap_readiness;
     let bootstrap_ready_signal = Arc::clone(&bootstrap_ready);
     tokio::spawn(async move {
+        let bootstrap_context = BootstrapContext {
+            registry: &bootstrap_registry,
+            membership: &bootstrap_membership,
+            seed_peers: &bootstrap_peers,
+            keys: &bootstrap_keys,
+            routes: &bootstrap_routes,
+            replicate: bootstrap_replicate,
+            self_peer: bootstrap_self_peer,
+            issuer: &bootstrap_issuer,
+        };
+
         let outcome = run_bootstrap_with_retries(
-            &bootstrap_registry,
-            &bootstrap_membership,
-            &bootstrap_peers,
-            &bootstrap_keys,
-            &bootstrap_routes,
-            bootstrap_replicate,
-            bootstrap_self_peer,
-            &bootstrap_issuer,
+            bootstrap_context,
             bootstrap_max_attempts,
             bootstrap_retry_delay,
         )

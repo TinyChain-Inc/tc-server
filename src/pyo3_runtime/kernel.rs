@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::{Path, PathBuf}, sync::Arc};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -46,7 +46,7 @@ fn parse_rjwt_alg(alg: &str) -> PyResult<rjwt::AlgKind> {
     }
 }
 
-fn btree_decode_roots(data_dir: &PathBuf) -> PyResult<crate::http::BTreeDecodeRoots> {
+fn btree_decode_roots(data_dir: &Path) -> PyResult<crate::http::BTreeDecodeRoots> {
     let root = data_dir
         .join("state")
         .join("collection")
