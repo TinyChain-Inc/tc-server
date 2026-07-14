@@ -57,6 +57,27 @@ pub use issuer::{ReplicationIssuer, parse_psk_keys, parse_psk_list};
 pub use membership::{PeerDescriptor, PeerIdentity, PeerMembership};
 pub use peers::peer_membership_handler;
 
+pub fn is_supported_replicated_path(path: &str) -> bool {
+    path.starts_with("/lib/") || path.starts_with("/service/")
+}
+
+pub fn normalize_replicated_prefix(prefix: &str) -> TCResult<String> {
+    let trimmed = prefix.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(TCError::bad_request(
+            "trusted installer prefix must not be empty",
+        ));
+    }
+
+    if !is_supported_replicated_path(trimmed) {
+        return Err(TCError::bad_request(format!(
+            "trusted installer prefix must start with /lib/ or /service/: {trimmed}"
+        )));
+    }
+
+    Ok(trimmed.to_string())
+}
+
 pub fn is_peer_membership_path(path: &str) -> bool {
     path.ends_with(PEERS_PATH_SUFFIX)
         || path.ends_with(PEERS_JOIN_PATH_SUFFIX)
@@ -112,15 +133,15 @@ impl PeerRoutes {
 
 fn normalize_cluster_root(value: &str) -> TCResult<String> {
     let root = value.trim().trim_end_matches('/');
-    if !root.starts_with("/lib/") {
+    if !root.starts_with("/lib/") && !root.starts_with("/service/") {
         return Err(TCError::bad_request(format!(
-            "invalid cluster root {root}: expected /lib/<publisher>"
+            "invalid cluster root {root}: expected /lib/<publisher> or /service/<publisher>"
         )));
     }
 
-    if root == "/lib" || root == "/lib/" {
+    if root == "/lib" || root == "/lib/" || root == "/service" || root == "/service/" {
         return Err(TCError::bad_request(
-            "invalid cluster root /lib: expected /lib/<publisher>",
+            "invalid cluster root: expected /lib/<publisher> or /service/<publisher>",
         ));
     }
 
@@ -139,6 +160,10 @@ pub struct ReplicationReport {
     pub unavailable: Vec<String>,
     pub skipped: Vec<String>,
     pub failed: Vec<String>,
+    discovered_paths: HashSet<String>,
+    installed_paths: HashSet<String>,
+    skipped_paths: HashSet<String>,
+    failed_paths: HashSet<String>,
 }
 
 impl ReplicationReport {
@@ -148,6 +173,7 @@ impl ReplicationReport {
 
     fn record_installed(&mut self, peer: &str, path: &str) {
         self.installed.push(format!("{peer} {path}"));
+        self.installed_paths.insert(path.to_string());
     }
 
     fn record_unavailable(&mut self, peer: &str, err: impl std::fmt::Display) {
@@ -156,10 +182,39 @@ impl ReplicationReport {
 
     fn record_skipped(&mut self, peer: &str, path: &str) {
         self.skipped.push(format!("{peer} {path}"));
+        self.skipped_paths.insert(path.to_string());
     }
 
     fn record_failed(&mut self, peer: &str, path: &str, err: impl std::fmt::Display) {
         self.failed.push(format!("{peer} {path}: {err}"));
+        self.failed_paths.insert(path.to_string());
+    }
+
+    fn record_discovered_path(&mut self, path: &str) {
+        self.discovered_paths.insert(path.to_string());
+    }
+
+    pub fn discovered_paths(&self) -> HashSet<String> {
+        self.discovered_paths.clone()
+    }
+
+    pub fn resolved_paths(&self) -> HashSet<String> {
+        self.installed_paths
+            .union(&self.skipped_paths)
+            .cloned()
+            .collect()
+    }
+
+    pub fn failed_paths(&self) -> HashSet<String> {
+        self.failed_paths.clone()
+    }
+
+    pub fn has_hard_failures(&self) -> bool {
+        !self.failed_paths.is_empty()
+    }
+
+    pub fn made_install_progress(&self) -> bool {
+        !self.installed_paths.is_empty()
     }
 }
 
@@ -171,18 +226,21 @@ pub struct ClusterJoinReport {
     pub discovered: Vec<String>,
 }
 
-pub async fn replicate_from_peers(
+pub async fn replicate_from_peers_targeted(
     registry: &Arc<LibraryRegistry>,
     peers: &[String],
     keys: &[Key<Aes256GcmSiv>],
+    target_paths: Option<&HashSet<String>>,
 ) -> ReplicationReport {
-    replicate_from_peers_with_gateway(registry, peers, keys, &HttpClusterGateway).await
+    replicate_from_peers_with_gateway(registry, peers, keys, target_paths, &HttpClusterGateway)
+        .await
 }
 
 pub async fn replicate_from_peers_with_gateway<G>(
     registry: &Arc<LibraryRegistry>,
     peers: &[String],
     keys: &[Key<Aes256GcmSiv>],
+    target_paths: Option<&HashSet<String>>,
     gateway: &G,
 ) -> ReplicationReport
 where
@@ -200,6 +258,12 @@ where
         };
 
         for path in library_paths {
+            report.record_discovered_path(&path);
+
+            if target_paths.is_some_and(|targets| !targets.is_empty() && !targets.contains(&path)) {
+                continue;
+            }
+
             let token = match gateway.request_replication_token(peer, &path, keys).await {
                 Ok(token) => token,
                 Err(err) => {

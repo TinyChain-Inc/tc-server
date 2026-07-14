@@ -290,6 +290,25 @@ async fn cluster_membership_list_requires_post_and_cluster_root_path() {
     assert!(parsed.get("replicas").is_some());
 }
 
+#[test]
+fn peer_routes_accept_service_cluster_root() {
+    let routes = PeerRoutes::new("/service/example-devco").expect("routes");
+
+    assert_eq!(routes.peers_path(), "/service/example-devco/_cluster/peers");
+    assert_eq!(
+        routes.join_path(),
+        "/service/example-devco/_cluster/peers/join"
+    );
+    assert_eq!(
+        routes.leave_path(),
+        "/service/example-devco/_cluster/peers/leave"
+    );
+    assert_eq!(
+        routes.heartbeat_path(),
+        "/service/example-devco/_cluster/peers/heartbeat"
+    );
+}
+
 #[tokio::test]
 async fn kernel_routes_cluster_membership_under_lib_prefix() {
     let host = pathlink::Link::from_str("/host").expect("host");

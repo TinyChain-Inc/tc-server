@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -106,11 +106,6 @@ impl PeerMembership {
             .write()
             .expect("peer membership write")
             .remove(peer);
-    }
-
-    pub fn retain_discovered_peers(&self, discovered: &HashSet<String>) {
-        let mut peers = self.peers.write().expect("peer membership write");
-        peers.retain(|peer, _| discovered.contains(peer));
     }
 
     pub fn snapshot_active_peers(&self) -> Vec<String> {

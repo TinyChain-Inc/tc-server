@@ -611,7 +611,7 @@ async fn decode_state_body(body: hyper::body::Bytes) -> TCResult<State> {
     }
 
     let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(body.clone())]);
-    destream_json::try_decode(null_transaction(), stream)
+    destream_json::try_decode(tc_state::state_context(null_transaction()), stream)
         .await
         .map_err(|err| TCError::bad_request(err.to_string()))
 }
@@ -707,13 +707,13 @@ mod tests {
     use futures::stream;
     use number_general::Number;
     use tc_state::State;
-    use tc_state::null_transaction;
+    use tc_state::{null_transaction, state_context};
 
     fn decode_state(json: &str) -> State {
         futures::executor::block_on(async {
             let bytes = hyper::body::Bytes::from(json.as_bytes().to_vec());
             let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(bytes)]);
-            destream_json::try_decode(null_transaction(), stream)
+            destream_json::try_decode(state_context(null_transaction()), stream)
                 .await
                 .expect("decode")
         })
