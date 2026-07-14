@@ -35,6 +35,10 @@ Keep the following rules in mind whenever you extend the server:
   `/service` route. The Python client ships stubs purely for documentation and
   IDE support; the real work always flows through the shared kernel so HTTP,
   PyO3, WebSocket, and future adapters observe identical behavior.
+* **Wire-format ownership stays at adapters.** `tc-server` transport layers may
+  encode/decode JSON (and future TBON/binary formats), but `tc-state`,
+  `tc-collection`, `tc-ir`, and `tc-value` runtime semantics must remain
+  format-neutral. Keep format-specific helper modules inside adapter boundaries.
 * **Single Op compiler.** All `OpDef` compilation (DAG planning/topological
   scheduling) must go through the shared host-side entrypoint (`op_plan`); do
   not reimplement this logic in adapters, installers, or runtime registries.

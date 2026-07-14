@@ -75,10 +75,8 @@ pub(crate) fn batched_matmul(left: &Tensor, right: &Tensor) -> Result<Tensor, Te
     result_shape.push(b_cols);
 
     match left.dtype_tag() {
-        "f32" => {
-            Tensor::dense_f32(result_shape, out.into_iter().map(|v| v as f32).collect())
-                .map_err(|_| TensorOpError::MatmulShapeMismatch { a_inner, b_inner })
-        }
+        "f32" => Tensor::dense_f32(result_shape, out.into_iter().map(|v| v as f32).collect())
+            .map_err(|_| TensorOpError::MatmulShapeMismatch { a_inner, b_inner }),
         _ => Tensor::dense_f64(result_shape, out)
             .map_err(|_| TensorOpError::MatmulShapeMismatch { a_inner, b_inner }),
     }
@@ -137,7 +135,11 @@ fn broadcast_batch_offset(flat_idx: usize, out_batch: &[usize], src_batch: &[usi
     for i in (0..src_rank).rev() {
         let out_axis = out_rank - src_rank + i;
         let src_dim = src_batch[i];
-        let src_idx = if src_dim == 1 { 0 } else { out_indices[out_axis] };
+        let src_idx = if src_dim == 1 {
+            0
+        } else {
+            out_indices[out_axis]
+        };
         src_flat += src_idx * src_stride;
         src_stride *= src_dim;
     }
