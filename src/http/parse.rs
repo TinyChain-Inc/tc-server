@@ -4,6 +4,7 @@ use bytes::Bytes;
 use futures::stream;
 use hyper::header::AUTHORIZATION;
 use hyper::{body::to_bytes, header};
+use tc_collection::btree::PersistentFile;
 use tc_error::{TCError, TCResult};
 use tc_ir::Scalar;
 use tc_state::State;
@@ -93,6 +94,33 @@ pub(crate) struct NativeStateBody {
     state: State,
 }
 
+#[derive(Clone)]
+pub(crate) struct BTreeDecodeRoots {
+    persistent_dir: freqfs::DirLock<PersistentFile>,
+    txn_root: freqfs::DirLock<PersistentFile>,
+}
+
+impl BTreeDecodeRoots {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        persistent_dir: freqfs::DirLock<PersistentFile>,
+        txn_root: freqfs::DirLock<PersistentFile>,
+    ) -> Self {
+        Self {
+            persistent_dir,
+            txn_root,
+        }
+    }
+
+    pub(crate) fn persistent_dir(&self) -> freqfs::DirLock<PersistentFile> {
+        self.persistent_dir.clone()
+    }
+
+    pub(crate) fn txn_root(&self) -> freqfs::DirLock<PersistentFile> {
+        self.txn_root.clone()
+    }
+}
+
 #[allow(dead_code)]
 impl NativeStateBody {
     pub(crate) fn new(state: State) -> Self {
@@ -126,7 +154,8 @@ impl RequestBody {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn decode_request_body_with_txn<T>(req: &Request) -> TCResult<Option<T>>
 where
-    T: destream::de::FromStream<Context = Arc<dyn tc_ir::Transaction>> + TryFrom<State>,
+    T: destream::de::FromStream + TryFrom<State>,
+    T::Context: From<Arc<dyn tc_ir::Transaction>>,
     <T as TryFrom<State>>::Error: std::fmt::Display,
 {
     if let Some(body) = req.extensions().get::<NativeStateBody>() {
@@ -153,7 +182,7 @@ where
     let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body)]);
 
     let context: Arc<dyn tc_ir::Transaction> = Arc::new(txn);
-    destream_json::try_decode(context, stream)
+    destream_json::try_decode(context.into(), stream)
         .await
         .map(Some)
         .map_err(|err| TCError::bad_request(err.to_string()))

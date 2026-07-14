@@ -4,7 +4,7 @@ use pathlink::Link;
 use std::sync::Arc;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Map, TxnId};
-use tc_state::State;
+use tc_state::{State, state_context};
 use tc_value::Value;
 use url::form_urlencoded;
 
@@ -280,7 +280,7 @@ async fn decode_state_body(body: Bytes, txn: &crate::txn::TxnHandle) -> TCResult
 
     let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body)]);
     let context: Arc<dyn tc_ir::Transaction> = Arc::new(txn.clone());
-    destream_json::try_decode(context, stream)
+    destream_json::try_decode(state_context(context), stream)
         .await
         .map_err(|err| TCError::bad_request(err.to_string()))
 }

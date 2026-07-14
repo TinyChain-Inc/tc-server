@@ -24,7 +24,7 @@ pub use server::HttpServer;
 #[allow(unused_imports)]
 pub(crate) use codec::{NativeStateResponse, decode_state_bytes, state_response};
 #[allow(unused_imports)]
-pub(crate) use parse::NativeStateBody;
+pub(crate) use parse::{BTreeDecodeRoots, NativeStateBody};
 pub(crate) use parse::{RequestBody, decode_request_body_with_txn};
 #[cfg(test)]
 pub(crate) use server::KernelService;

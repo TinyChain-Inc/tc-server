@@ -217,11 +217,11 @@ mod tests {
     use std::str::FromStr;
     use tc_ir::LibrarySchema;
     use tc_ir::Scalar;
-    use tc_state::{State, null_transaction};
+    use tc_state::{State, null_transaction, state_context};
 
     async fn decode_state(bytes: Vec<u8>) -> State {
         let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(bytes.into())]);
-        destream_json::try_decode(null_transaction(), stream)
+        destream_json::try_decode(state_context(null_transaction()), stream)
             .await
             .expect("state decode")
     }

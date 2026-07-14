@@ -3,7 +3,7 @@ use std::{io, sync::Arc};
 use bytes::Bytes;
 use futures::{TryStreamExt, stream};
 use tc_error::{TCError, TCResult};
-use tc_state::State;
+use tc_state::{State, state_context};
 
 use super::{Body, Response, StatusCode, header};
 
@@ -16,7 +16,7 @@ pub(crate) async fn decode_state_bytes(
     }
 
     let stream = stream::iter(vec![Ok::<Bytes, io::Error>(body)]);
-    destream_json::try_decode(txn, stream)
+    destream_json::try_decode(state_context(txn), stream)
         .await
         .map_err(|err| TCError::bad_request(err.to_string()))
 }
