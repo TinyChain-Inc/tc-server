@@ -3,12 +3,14 @@ use std::{path::PathBuf, sync::Arc};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
+use freqfs::Cache;
 use futures::FutureExt;
 use pathlink::Link;
 use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyType};
+use tc_collection::btree::PersistentFile;
 use tc_ir::{Claim, OpRef, Scalar, Subject};
 use umask;
 
@@ -22,7 +24,7 @@ use crate::{
     txn::{TxnError, TxnManager},
 };
 
-use super::state::{PyState, PyTensor};
+use super::state::{PyBTree, PyState, PyTensor};
 use super::state_handle_conversions::{
     encode_state_to_bytes, py_state_handle_from_state, request_body_raw_bytes, request_body_state,
 };
@@ -42,6 +44,27 @@ fn parse_rjwt_alg(alg: &str) -> PyResult<rjwt::AlgKind> {
             "unsupported signature algorithm: {other}"
         ))),
     }
+}
+
+fn btree_decode_roots(data_dir: &PathBuf) -> PyResult<crate::http::BTreeDecodeRoots> {
+    let root = data_dir
+        .join("state")
+        .join("collection")
+        .join("btree_decode");
+    std::fs::create_dir_all(root.join("persistent"))
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    std::fs::create_dir_all(root.join("txn"))
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+    let cache = Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
+    let persistent = Arc::clone(&cache)
+        .load(root.join("persistent"))
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let txn = Arc::clone(&cache)
+        .load(root.join("txn"))
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+    Ok(crate::http::BTreeDecodeRoots::new(persistent, txn))
 }
 
 pub(crate) fn python_kernel_builder_with_config(
@@ -495,6 +518,11 @@ impl KernelHandle {
         let inbound_txn_id = txn_id;
         let mut minted_txn: Option<crate::txn::TxnHandle> = None;
         let mut request = http_request_from_py_with_body(&request, body_bytes.clone())?;
+        if let Some(data_dir) = self.config.data_dir.as_ref() {
+            let _enter = self.runtime.enter();
+            let decode_roots = btree_decode_roots(data_dir)?;
+            request.extensions_mut().insert(decode_roots);
+        }
         match native_state {
             Some(state) if !state.is_none() => {
                 request
@@ -637,6 +665,7 @@ pub fn register_python_api(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<KernelHandle>()?;
     module.add_class::<PyStateHandle>()?;
     module.add_class::<PyState>()?;
+    module.add_class::<PyBTree>()?;
     module.add_class::<PyTensor>()?;
     module.add_class::<PyKernelRequest>()?;
     module.add_class::<PyKernelResponse>()?;

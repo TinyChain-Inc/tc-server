@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 use tc_ir::{Map, Scalar};
 use tc_value::Value;
 
+use super::state_json::encode_state_json_bytes;
 use crate::State;
 
 pub(super) fn state_to_json_string(state: &State) -> PyResult<String> {
@@ -20,8 +21,22 @@ fn state_to_json_value(state: &State) -> PyResult<serde_json::Value> {
             .map(state_to_json_value)
             .collect::<PyResult<Vec<_>>>()
             .map(serde_json::Value::Array),
-        State::Collection(_) => encode_to_json_value(state.clone()),
+        State::Collection(_) => encode_collection_state_json(state.clone()),
     }
+}
+
+fn encode_collection_state_json(state: State) -> PyResult<serde_json::Value> {
+    let bytes = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async move {
+            encode_state_json_bytes(state)
+                .await
+                .map_err(PyValueError::new_err)
+        })?;
+
+    serde_json::from_slice(&bytes).map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 fn scalar_to_json_value(scalar: &Scalar) -> PyResult<serde_json::Value> {

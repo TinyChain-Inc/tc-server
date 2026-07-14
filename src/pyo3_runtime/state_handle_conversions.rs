@@ -6,6 +6,7 @@ use pyo3::types::{PyBytes, PyString};
 use crate::State;
 
 use super::state::PyState;
+use super::state_json::encode_state_json_bytes;
 use super::types::PyStateHandle;
 
 pub(crate) fn py_state_handle_from_state(state: State) -> PyResult<PyStateHandle> {
@@ -70,22 +71,18 @@ pub(crate) fn encode_state_to_bytes(state: State) -> PyResult<Vec<u8>> {
     if state.is_none() {
         Ok(Vec::new())
     } else {
-        encode_state_via_destream(state)
+        encode_state_via_tc_state(state)
     }
 }
 
-fn encode_state_via_destream(state: State) -> PyResult<Vec<u8>> {
-    let stream =
-        destream_json::encode(state).map_err(|err| PyValueError::new_err(err.to_string()))?;
-    futures::executor::block_on(async move {
-        use futures::TryStreamExt;
-
-        stream
-            .map_err(|err| PyValueError::new_err(err.to_string()))
-            .try_fold(Vec::new(), |mut acc, chunk| async move {
-                acc.extend_from_slice(&chunk);
-                Ok(acc)
-            })
-            .await
-    })
+fn encode_state_via_tc_state(state: State) -> PyResult<Vec<u8>> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async move {
+            encode_state_json_bytes(state)
+                .await
+                .map_err(PyValueError::new_err)
+        })
 }
