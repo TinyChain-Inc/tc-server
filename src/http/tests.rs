@@ -121,7 +121,7 @@ mod tests {
     async fn txn_begin_and_commit() {
         let kernel = kernel_with_lib_handler();
         let txn_manager = kernel.txn_manager().clone();
-        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default(), None);
 
         let txn_id_value = fresh_txn_id(1);
         let request = http::Request::builder()
@@ -177,7 +177,7 @@ mod tests {
             .with_health_handler(ok_handler())
             .finish();
 
-        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default(), None);
 
         let begin = http::Request::builder()
             .method("GET")
@@ -195,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_request_with_mismatched_owner_token() {
         let kernel = kernel_with_lib_handler();
-        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default(), None);
 
         let txn_id = fresh_txn_id(1);
         let begin = http::Request::builder()
@@ -222,7 +222,7 @@ mod tests {
     #[tokio::test]
     async fn returns_authenticated_route_context_from_host_endpoint() {
         let kernel = kernel_with_host_auth_context();
-        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default(), None);
 
         let request = http::Request::builder()
             .method("GET")
@@ -249,7 +249,7 @@ mod tests {
     async fn finalize_is_root_only() {
         let kernel = kernel_with_ok_routing();
         let txn_manager = kernel.txn_manager().clone();
-        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default(), None);
 
         let txn_id_value = fresh_txn_id(2);
         let begin = http::Request::builder()
@@ -307,7 +307,7 @@ mod tests {
     async fn finalize_root_parsing_for_component_paths() {
         let kernel = kernel_with_ok_routing();
         let txn_manager = kernel.txn_manager().clone();
-        let mut service = KernelService::new(kernel, crate::KernelLimits::default());
+        let mut service = KernelService::new(kernel, crate::KernelLimits::default(), None);
 
         let txn_id_value = fresh_txn_id(3);
         let begin = http::Request::builder()
@@ -453,6 +453,7 @@ mod tests {
             .serve(tower::make::Shared::new(KernelService::new(
                 server_kernel,
                 crate::KernelLimits::default(),
+                None,
             )));
 
         let server_task = tokio::spawn(async move { server.await.expect("server") });
@@ -577,6 +578,7 @@ mod tests {
             .serve(tower::make::Shared::new(KernelService::new(
                 remote_kernel,
                 crate::KernelLimits::default(),
+                None,
             )));
         let remote_task = tokio::spawn(async move { remote_server.await.expect("remote server") });
 
@@ -607,6 +609,7 @@ mod tests {
             .serve(tower::make::Shared::new(KernelService::new(
                 leader_kernel.clone(),
                 crate::KernelLimits::default(),
+                None,
             )));
         let leader_task = tokio::spawn(async move { leader_server.await.expect("leader server") });
         tokio::task::yield_now().await;

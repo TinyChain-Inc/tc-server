@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     net::{SocketAddr, TcpListener},
+    path::Path,
     task::{Context, Poll},
 };
 
@@ -9,7 +10,9 @@ use tower::Service;
 
 use crate::{Kernel, KernelDispatch, Method};
 
-use super::parse::{TxnParseError, parse_bearer_token, parse_body, parse_txn_id};
+use super::parse::{
+    BTreeDecodeRoots, TxnParseError, parse_bearer_token, parse_body, parse_txn_id,
+};
 use super::response::{
     bad_request_response, handle_finalize_result, method_not_allowed, not_found,
 };
@@ -18,6 +21,7 @@ use super::{Body, Request, Response, StatusCode};
 pub struct HttpServer {
     pub(super) kernel: Kernel,
     pub(super) limits: crate::KernelLimits,
+    pub(super) btree_decode_roots: Option<BTreeDecodeRoots>,
 }
 
 impl HttpServer {
@@ -25,6 +29,7 @@ impl HttpServer {
         Self {
             kernel,
             limits: crate::KernelLimits::default(),
+            btree_decode_roots: None,
         }
     }
 
@@ -35,17 +40,32 @@ impl HttpServer {
                 max_request_bytes_unauth,
                 ..crate::KernelLimits::default()
             },
+            btree_decode_roots: None,
         }
     }
 
+    pub(crate) fn with_btree_decode_roots(mut self, roots: BTreeDecodeRoots) -> Self {
+        self.btree_decode_roots = Some(roots);
+        self
+    }
+
+    pub fn with_btree_decode_roots_from_data_dir(
+        mut self,
+        data_dir: &Path,
+    ) -> tc_error::TCResult<Self> {
+        let roots = super::parse::load_btree_decode_roots(data_dir)?;
+        self = self.with_btree_decode_roots(roots);
+        Ok(self)
+    }
+
     pub async fn serve(self, addr: SocketAddr) -> hyper::Result<()> {
-        let service = KernelService::new(self.kernel, self.limits);
+        let service = KernelService::new(self.kernel, self.limits, self.btree_decode_roots);
         let make_service = tower::make::Shared::new(service);
         hyper::Server::bind(&addr).serve(make_service).await
     }
 
     pub async fn serve_listener(self, listener: TcpListener) -> hyper::Result<()> {
-        let service = KernelService::new(self.kernel, self.limits);
+        let service = KernelService::new(self.kernel, self.limits, self.btree_decode_roots);
         let make_service = tower::make::Shared::new(service);
         hyper::Server::from_tcp(listener)?.serve(make_service).await
     }
@@ -54,7 +74,7 @@ impl HttpServer {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let service = KernelService::new(self.kernel, self.limits);
+        let service = KernelService::new(self.kernel, self.limits, self.btree_decode_roots);
         let make_service = tower::make::Shared::new(service);
         hyper::Server::bind(&addr)
             .serve(make_service)
@@ -70,7 +90,7 @@ impl HttpServer {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let service = KernelService::new(self.kernel, self.limits);
+        let service = KernelService::new(self.kernel, self.limits, self.btree_decode_roots);
         let make_service = tower::make::Shared::new(service);
         hyper::Server::from_tcp(listener)?
             .serve(make_service)
@@ -83,11 +103,20 @@ impl HttpServer {
 pub(crate) struct KernelService {
     kernel: Kernel,
     limits: crate::KernelLimits,
+    btree_decode_roots: Option<BTreeDecodeRoots>,
 }
 
 impl KernelService {
-    pub(crate) fn new(kernel: Kernel, limits: crate::KernelLimits) -> Self {
-        Self { kernel, limits }
+    pub(crate) fn new(
+        kernel: Kernel,
+        limits: crate::KernelLimits,
+        btree_decode_roots: Option<BTreeDecodeRoots>,
+    ) -> Self {
+        Self {
+            kernel,
+            limits,
+            btree_decode_roots,
+        }
     }
 }
 
@@ -106,6 +135,7 @@ impl Service<Request> for KernelService {
         let path = uri.path().to_owned();
         let kernel = self.kernel.clone();
         let max_request_bytes_unauth = self.limits.max_request_bytes_unauth;
+        let btree_decode_roots = self.btree_decode_roots.clone();
 
         Box::pin(async move {
             let method = match to_kernel_method(&method) {
@@ -117,6 +147,11 @@ impl Service<Request> for KernelService {
                 Ok(pair) => pair,
                 Err(resp) => return Ok(resp),
             };
+
+            let mut req = req;
+            if let Some(roots) = btree_decode_roots {
+                req.extensions_mut().insert(roots);
+            }
 
             let txn_id = match parse_txn_id(&req) {
                 Ok(ctx) => ctx,

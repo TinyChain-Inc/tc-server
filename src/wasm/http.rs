@@ -65,6 +65,10 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request) -> Respo
         Some(txn) => txn,
         None => return error_response(TCError::internal("missing transaction handle")),
     };
+    let btree_roots = req
+        .extensions()
+        .get::<crate::http::BTreeDecodeRoots>()
+        .cloned();
 
     let body = match hyper::body::to_bytes(req.into_body()).await {
         Ok(bytes) => bytes.to_vec(),
@@ -110,8 +114,17 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request) -> Respo
                 }
             }
 
-            let txn_context: Arc<dyn tc_ir::Transaction> = Arc::new(txn);
-            match crate::http::decode_state_bytes(Bytes::from(bytes), txn_context).await {
+            let txn_context: Arc<dyn tc_ir::Transaction> = Arc::new(txn.clone());
+            let state_context = if let Some(roots) = btree_roots {
+                tc_state::state_context(txn_context)
+                    .with_btree_roots(roots.persistent_dir(), roots.txn_root())
+            } else {
+                tc_state::state_context(txn_context)
+            };
+
+            match crate::http::decode_state_bytes_with_context(Bytes::from(bytes), state_context)
+                .await
+            {
                 Ok(state) => crate::http::state_response(state),
                 Err(err) => error_response(err),
             }

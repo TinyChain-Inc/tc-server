@@ -1,22 +1,22 @@
-use std::{io, sync::Arc};
+use std::io;
 
 use bytes::Bytes;
 use futures::{TryStreamExt, stream};
 use tc_error::{TCError, TCResult};
-use tc_state::{State, state_context};
+use tc_state::State;
 
 use super::{Body, Response, StatusCode, header};
 
-pub(crate) async fn decode_state_bytes(
+pub(crate) async fn decode_state_bytes_with_context(
     body: Bytes,
-    txn: Arc<dyn tc_ir::Transaction>,
+    context: tc_state::StateContext,
 ) -> TCResult<State> {
     if body.is_empty() || body.iter().all(|b| b.is_ascii_whitespace()) {
         return Ok(State::None);
     }
 
     let stream = stream::iter(vec![Ok::<Bytes, io::Error>(body)]);
-    destream_json::try_decode(state_context(txn), stream)
+    destream_json::try_decode(context, stream)
         .await
         .map_err(|err| TCError::bad_request(err.to_string()))
 }

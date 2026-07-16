@@ -250,7 +250,8 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let server = HttpServer::new_with_limits(kernel, config.max_request_bytes);
+    let mut server = HttpServer::new_with_limits(kernel, config.max_request_bytes);
+    server = server.with_btree_decode_roots_from_data_dir(&config.data_dir)?;
     server.serve(bind).await?;
     Ok(())
 }

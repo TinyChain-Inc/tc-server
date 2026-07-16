@@ -3,14 +3,12 @@ use std::{path::{Path, PathBuf}, sync::Arc};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
-use freqfs::Cache;
 use futures::FutureExt;
 use pathlink::Link;
 use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyType};
-use tc_collection::btree::PersistentFile;
 use tc_ir::{Claim, OpRef, Scalar, Subject};
 use umask;
 
@@ -47,24 +45,7 @@ fn parse_rjwt_alg(alg: &str) -> PyResult<rjwt::AlgKind> {
 }
 
 fn btree_decode_roots(data_dir: &Path) -> PyResult<crate::http::BTreeDecodeRoots> {
-    let root = data_dir
-        .join("state")
-        .join("collection")
-        .join("btree_decode");
-    std::fs::create_dir_all(root.join("persistent"))
-        .map_err(|err| PyValueError::new_err(err.to_string()))?;
-    std::fs::create_dir_all(root.join("txn"))
-        .map_err(|err| PyValueError::new_err(err.to_string()))?;
-
-    let cache = Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
-    let persistent = Arc::clone(&cache)
-        .load(root.join("persistent"))
-        .map_err(|err| PyValueError::new_err(err.to_string()))?;
-    let txn = Arc::clone(&cache)
-        .load(root.join("txn"))
-        .map_err(|err| PyValueError::new_err(err.to_string()))?;
-
-    Ok(crate::http::BTreeDecodeRoots::new(persistent, txn))
+    crate::http::load_btree_decode_roots(data_dir).map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 pub(crate) fn python_kernel_builder_with_config(
