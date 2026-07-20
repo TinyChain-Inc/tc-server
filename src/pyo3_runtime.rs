@@ -4,6 +4,7 @@ mod conversions;
 mod kernel;
 mod state;
 mod state_handle_conversions;
+mod state_json;
 mod types;
 mod wire;
 

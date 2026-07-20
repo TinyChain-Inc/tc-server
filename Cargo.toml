@@ -11,13 +11,14 @@ bytes = "1"
 futures = "0.3"
 pathlink = { path = "../deps/pathlink", features = ["serialize"] }
 tc-ir = { path = "../tc-ir" }
-tc-error = "0.13"
+tc-error = { path = "../tc-error" }
 tc-value = { path = "../tc-value", features = ["serialize"] }
 tc-state = { path = "../tc-state" }
+tc-collection = { path = "../tc-collection" }
 umask = "2.1"
 parking_lot = "0.12"
 url = "2"
-destream = "0.10"
+destream = { path = "../deps/destream", version = "0.10" }
 async-trait = "0.1"
 wasmtime = { version = "15", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -26,18 +27,19 @@ base64 = "0.22"
 getrandom = "0.2"
 sha2 = "0.10"
 rjwt = { package = "rjwt", path = "../deps/rjwt/rjwt-core" }
-freqfs = "0.12.0"
-txfs = "0.5.2"
+freqfs = { path = "../deps/freqfs", version = "0.13" }
+txfs = { path = "../deps/txfs", version = "0.5.2" }
 mdns-sd = { version = "0.11", optional = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 aes-gcm-siv = "0.11"
 hex = "0.4"
 safecast = "0.2"
-number-general = "0.14"
+number-general = { path = "../deps/number-general", version = "0.14" }
 get-size = "0.1"
 
 [dependencies.destream_json]
 version = "0.15"
+path = "../deps/destream_json"
 default-features = false
 optional = true
 

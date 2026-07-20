@@ -487,9 +487,12 @@ pub(super) async fn decode_host_state_response(
             return Ok(tc_state::State::None);
         }
         let stream = stream::iter(vec![Ok::<bytes::Bytes, std::io::Error>(body)]);
-        return destream_json::try_decode(tc_state::null_transaction(), stream)
-            .await
-            .map_err(|err| tc_error::TCError::bad_request(err.to_string()));
+        return destream_json::try_decode(
+            tc_state::state_context(tc_state::null_transaction()),
+            stream,
+        )
+        .await
+        .map_err(|err| tc_error::TCError::bad_request(err.to_string()));
     }
 
     let message = if body.is_empty() {

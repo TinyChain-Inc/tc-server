@@ -1,26 +1,19 @@
-use std::{
-    cmp::Ordering,
-    fmt,
-    hash::{Hash, Hasher},
-    io,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
-    },
-};
+use std::{io, path::PathBuf, str::FromStr, sync::Arc};
 
 use crate::ir::{IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE};
-use freqfs::{Cache, FileLoad, FileSave, Name};
-use get_size::GetSize;
+use freqfs::Cache;
 use pathlink::Link;
-use safecast::AsType;
 use serde::{Deserialize, Serialize};
 use tc_error::{TCError, TCResult};
 use tc_ir::{LibrarySchema, NetworkTime, TxnId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use txfs::{Dir as TxDir, Id as TxName};
+
+mod file;
+mod txn_key;
+
+pub(crate) use file::LibraryFile;
+pub(crate) use txn_key::StorageTxnKey;
+use txn_key::immediate_txn_id;
 
 const LIB_ROOT: &str = "lib";
 const SCHEMA_FILE: &str = "schema.json";
@@ -28,8 +21,8 @@ const WASM_FILE: &str = "library.wasm";
 const IR_FILE: &str = "library.ir.json";
 const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_CACHE_HANDLES: usize = 1024;
-const BOOTSTRAP_TXN: StorageTxnId = StorageTxnId(TxnId::from_parts(NetworkTime::from_nanos(1), 0));
-static IMMEDIATE_TXN_NONCE: AtomicU64 = AtomicU64::new(1);
+const BOOTSTRAP_TXN: StorageTxnKey =
+    StorageTxnKey(TxnId::from_parts(NetworkTime::from_nanos(1), 0));
 
 #[derive(Clone, Debug)]
 pub struct Artifact {
@@ -44,147 +37,7 @@ pub struct LibraryStore {
     segments: Arc<Vec<TxName>>,
 }
 
-pub(crate) type LibraryRoot = TxDir<StorageTxnId, LibraryFile>;
-
-#[derive(Clone)]
-pub(crate) enum LibraryFile {
-    Bytes(Vec<u8>),
-}
-
-impl LibraryFile {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Self::Bytes(bytes) => bytes,
-        }
-    }
-}
-
-impl AsType<LibraryFile> for LibraryFile {
-    fn as_type(&self) -> Option<&LibraryFile> {
-        Some(self)
-    }
-
-    fn as_type_mut(&mut self) -> Option<&mut LibraryFile> {
-        Some(self)
-    }
-
-    fn into_type(self) -> Option<LibraryFile> {
-        Some(self)
-    }
-}
-
-impl GetSize for LibraryFile {
-    fn get_size(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) => bytes.len(),
-        }
-    }
-}
-
-impl FileLoad for LibraryFile {
-    async fn load(
-        _path: &Path,
-        mut file: tokio::fs::File,
-        _metadata: std::fs::Metadata,
-    ) -> io::Result<Self> {
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).await?;
-        Ok(Self::Bytes(bytes))
-    }
-}
-
-impl FileSave for LibraryFile {
-    async fn save(&self, file: &mut tokio::fs::File) -> io::Result<u64> {
-        let bytes = self.bytes();
-        file.write_all(bytes).await?;
-        Ok(bytes.len() as u64)
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct StorageTxnId(TxnId);
-
-impl From<TxnId> for StorageTxnId {
-    fn from(txn_id: TxnId) -> Self {
-        Self(txn_id)
-    }
-}
-
-impl fmt::Display for StorageTxnId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl PartialEq for StorageTxnId {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.timestamp() == other.0.timestamp() && self.0.nonce() == other.0.nonce()
-    }
-}
-
-impl Eq for StorageTxnId {}
-
-impl Hash for StorageTxnId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.timestamp().hash(state);
-        self.0.nonce().hash(state);
-    }
-}
-
-impl PartialOrd for StorageTxnId {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for StorageTxnId {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .timestamp()
-            .cmp(&other.0.timestamp())
-            .then_with(|| self.0.nonce().cmp(&other.0.nonce()))
-    }
-}
-
-impl FromStr for StorageTxnId {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        TxnId::from_str(s).map(Self)
-    }
-}
-
-impl Name for StorageTxnId {
-    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
-        let key: StorageTxnId = key.parse().ok()?;
-        PartialOrd::partial_cmp(self, &key)
-    }
-}
-
-impl PartialEq<str> for StorageTxnId {
-    fn eq(&self, other: &str) -> bool {
-        StorageTxnId::from_str(other).is_ok_and(|other| self == &other)
-    }
-}
-
-impl PartialOrd<str> for StorageTxnId {
-    fn partial_cmp(&self, other: &str) -> Option<Ordering> {
-        let other: StorageTxnId = other.parse().ok()?;
-        PartialOrd::partial_cmp(self, &other)
-    }
-}
-
-fn immediate_txn_id() -> StorageTxnId {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(2);
-    let nonce = IMMEDIATE_TXN_NONCE.fetch_add(1, AtomicOrdering::Relaxed) as u16;
-    StorageTxnId(TxnId::from_parts(
-        NetworkTime::from_nanos(nanos.max(2)),
-        nonce,
-    ))
-}
+pub(crate) type LibraryRoot = TxDir<StorageTxnKey, LibraryFile>;
 
 impl LibraryStore {
     pub async fn open(root: PathBuf) -> TCResult<Self> {
@@ -281,7 +134,7 @@ impl LibraryStore {
 
     async fn load_artifact_at(
         &self,
-        txn_id: StorageTxnId,
+        txn_id: StorageTxnKey,
         schema: &LibrarySchema,
     ) -> TCResult<Option<Artifact>> {
         let Some(dir) = self.resolve_canonical_dir(txn_id).await? else {
@@ -324,7 +177,7 @@ impl LibraryStore {
 
     async fn persist_schema_at(
         &self,
-        txn_id: StorageTxnId,
+        txn_id: StorageTxnKey,
         schema: &LibrarySchema,
     ) -> TCResult<()> {
         let bytes = encode_schema(schema).map_err(map_io_str)?;
@@ -334,7 +187,7 @@ impl LibraryStore {
 
     async fn persist_artifact_at(
         &self,
-        txn_id: StorageTxnId,
+        txn_id: StorageTxnKey,
         schema: &LibrarySchema,
         artifact: &Artifact,
     ) -> TCResult<()> {
@@ -357,7 +210,7 @@ impl LibraryStore {
 
     async fn persist_wasm_library(
         &self,
-        txn_id: StorageTxnId,
+        txn_id: StorageTxnKey,
         schema: &LibrarySchema,
         wasm: &[u8],
     ) -> TCResult<()> {
@@ -368,7 +221,7 @@ impl LibraryStore {
 
     async fn persist_ir_library(
         &self,
-        txn_id: StorageTxnId,
+        txn_id: StorageTxnKey,
         schema: &LibrarySchema,
         bytes: &[u8],
     ) -> TCResult<()> {
@@ -379,7 +232,7 @@ impl LibraryStore {
 
     async fn resolve_dir(
         &self,
-        txn_id: StorageTxnId,
+        txn_id: StorageTxnKey,
         create: bool,
     ) -> TCResult<Option<LibraryRoot>> {
         let mut current = self.root.clone();
@@ -406,7 +259,7 @@ impl LibraryStore {
         Ok(Some(current))
     }
 
-    async fn resolve_canonical_dir(&self, txn_id: StorageTxnId) -> TCResult<Option<LibraryRoot>> {
+    async fn resolve_canonical_dir(&self, txn_id: StorageTxnKey) -> TCResult<Option<LibraryRoot>> {
         let mut current = self.root.clone();
 
         for segment in self.segments.iter() {
@@ -420,7 +273,7 @@ impl LibraryStore {
         Ok(Some(current))
     }
 
-    async fn finalize_storage_txn(&self, txn_id: StorageTxnId, commit: bool) -> TCResult<()> {
+    async fn finalize_storage_txn(&self, txn_id: StorageTxnKey, commit: bool) -> TCResult<()> {
         if commit {
             self.root.commit(txn_id, true).await;
         } else {
@@ -452,7 +305,7 @@ pub(crate) async fn load_library_root(root: PathBuf) -> TCResult<LibraryRoot> {
 
 async fn discover_schemas(
     dir: LibraryRoot,
-    txn_id: StorageTxnId,
+    txn_id: StorageTxnKey,
     schemas: &mut Vec<LibrarySchema>,
 ) -> TCResult<()> {
     let mut pending = vec![dir];
@@ -480,7 +333,7 @@ async fn discover_schemas(
 
 async fn read_canonical_file(
     dir: &LibraryRoot,
-    txn_id: StorageTxnId,
+    txn_id: StorageTxnKey,
     name: &str,
 ) -> TCResult<Option<Vec<u8>>> {
     let name = parse_name(name)?;
@@ -494,7 +347,7 @@ async fn read_canonical_file(
 
 async fn write_file(
     dir: &LibraryRoot,
-    version: StorageTxnId,
+    version: StorageTxnKey,
     name: &str,
     bytes: Vec<u8>,
 ) -> TCResult<()> {
@@ -600,6 +453,9 @@ impl TryFrom<RawSchema> for LibrarySchema {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::path::Path;
     use std::str::FromStr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -645,6 +501,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn storage_txn_key_uses_full_txn_id_identity() {
+        let a =
+            StorageTxnKey(TxnId::from_parts(NetworkTime::from_nanos(42), 7).with_trace([1u8; 32]));
+        let b =
+            StorageTxnKey(TxnId::from_parts(NetworkTime::from_nanos(42), 7).with_trace([2u8; 32]));
+
+        assert_ne!(
+            a, b,
+            "trace bytes are part of canonical transaction identity"
+        );
+
+        let mut hasher_a = DefaultHasher::new();
+        a.hash(&mut hasher_a);
+
+        let mut hasher_b = DefaultHasher::new();
+        b.hash(&mut hasher_b);
+
+        assert_ne!(
+            hasher_a.finish(),
+            hasher_b.finish(),
+            "hash must include full TxnId identity"
+        );
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

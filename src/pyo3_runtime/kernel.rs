@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::{Path, PathBuf}, sync::Arc};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -22,7 +22,7 @@ use crate::{
     txn::{TxnError, TxnManager},
 };
 
-use super::state::{PyState, PyTensor};
+use super::state::{PyBTree, PyState, PyTensor};
 use super::state_handle_conversions::{
     encode_state_to_bytes, py_state_handle_from_state, request_body_raw_bytes, request_body_state,
 };
@@ -42,6 +42,10 @@ fn parse_rjwt_alg(alg: &str) -> PyResult<rjwt::AlgKind> {
             "unsupported signature algorithm: {other}"
         ))),
     }
+}
+
+fn btree_decode_roots(data_dir: &Path) -> PyResult<crate::http::BTreeDecodeRoots> {
+    crate::http::load_btree_decode_roots(data_dir).map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 pub(crate) fn python_kernel_builder_with_config(
@@ -495,6 +499,11 @@ impl KernelHandle {
         let inbound_txn_id = txn_id;
         let mut minted_txn: Option<crate::txn::TxnHandle> = None;
         let mut request = http_request_from_py_with_body(&request, body_bytes.clone())?;
+        if let Some(data_dir) = self.config.data_dir.as_ref() {
+            let _enter = self.runtime.enter();
+            let decode_roots = btree_decode_roots(data_dir)?;
+            request.extensions_mut().insert(decode_roots);
+        }
         match native_state {
             Some(state) if !state.is_none() => {
                 request
@@ -637,6 +646,7 @@ pub fn register_python_api(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<KernelHandle>()?;
     module.add_class::<PyStateHandle>()?;
     module.add_class::<PyState>()?;
+    module.add_class::<PyBTree>()?;
     module.add_class::<PyTensor>()?;
     module.add_class::<PyKernelRequest>()?;
     module.add_class::<PyKernelResponse>()?;

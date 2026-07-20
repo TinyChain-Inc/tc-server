@@ -14,7 +14,7 @@ use tinychain::library::LibraryRegistry;
 use tinychain::library::default_library_schema;
 use tinychain::library::http::{build_http_library_module, http_library_handlers};
 use tinychain::replication::{
-    ReplicationIssuer, export_handler, parse_psk_keys, replicate_from_peers,
+    ReplicationIssuer, export_handler, parse_psk_keys, replicate_from_peers_targeted,
     replication_token_handler,
 };
 use umask::{USER_READ, USER_WRITE};
@@ -120,14 +120,16 @@ async fn replication_bootstrap_propagates_library_across_three_hosts() {
 
     let keys = shared_replication_keys();
     let leader_peer = format!("http://{}", leader.addr);
-    let report = replicate_from_peers(&replica_a.registry, &[leader_peer], &keys).await;
+    let report =
+        replicate_from_peers_targeted(&replica_a.registry, &[leader_peer], &keys, None).await;
     assert!(report.is_clean(), "replica_a bootstrap report: {report:?}");
 
     let replica_a_status = get_library_status(replica_a.addr, &schema.id().to_string()).await;
     assert_eq!(replica_a_status, StatusCode::OK);
 
     let replica_a_peer = format!("http://{}", replica_a.addr);
-    let report = replicate_from_peers(&replica_b.registry, &[replica_a_peer], &keys).await;
+    let report =
+        replicate_from_peers_targeted(&replica_b.registry, &[replica_a_peer], &keys, None).await;
     assert!(report.is_clean(), "replica_b bootstrap report: {report:?}");
 
     let replica_b_status = get_library_status(replica_b.addr, &schema.id().to_string()).await;
@@ -144,7 +146,7 @@ async fn replication_bootstrap_tolerates_membership_churn_and_dead_peers() {
 
     let seed = start_server("churn-seed").await;
     let leader_peer = format!("http://{}", leader.addr);
-    let report = replicate_from_peers(&seed.registry, &[leader_peer], &keys).await;
+    let report = replicate_from_peers_targeted(&seed.registry, &[leader_peer], &keys, None).await;
     assert!(report.is_clean(), "seed bootstrap report: {report:?}");
     let seed_status = get_library_status(seed.addr, &schema.id().to_string()).await;
     assert_eq!(seed_status, StatusCode::OK);
@@ -154,7 +156,7 @@ async fn replication_bootstrap_tolerates_membership_churn_and_dead_peers() {
         "http://127.0.0.1:1".to_string(),
         format!("http://{}", seed.addr),
     ];
-    let report = replicate_from_peers(&replacement.registry, &peers, &keys).await;
+    let report = replicate_from_peers_targeted(&replacement.registry, &peers, &keys, None).await;
     assert_eq!(
         report.installed.len(),
         1,
@@ -181,8 +183,13 @@ async fn scale_out_joiner_catches_up_after_existing_member_reconciles() {
 
     let seed = start_server("scale-seed").await;
     let leader_peer = format!("http://{}", leader.addr);
-    let report =
-        replicate_from_peers(&seed.registry, std::slice::from_ref(&leader_peer), &keys).await;
+    let report = replicate_from_peers_targeted(
+        &seed.registry,
+        std::slice::from_ref(&leader_peer),
+        &keys,
+        None,
+    )
+    .await;
     assert!(report.is_clean(), "seed bootstrap report: {report:?}");
 
     let seed_a = get_library_status(seed.addr, &schema_a.id().to_string()).await;
@@ -194,14 +201,14 @@ async fn scale_out_joiner_catches_up_after_existing_member_reconciles() {
     let seed_b_before = get_library_status(seed.addr, &schema_b.id().to_string()).await;
     assert_eq!(seed_b_before, StatusCode::NOT_FOUND);
 
-    let report = replicate_from_peers(&seed.registry, &[leader_peer], &keys).await;
+    let report = replicate_from_peers_targeted(&seed.registry, &[leader_peer], &keys, None).await;
     assert!(report.is_clean(), "seed reconcile report: {report:?}");
     let seed_b_after = get_library_status(seed.addr, &schema_b.id().to_string()).await;
     assert_eq!(seed_b_after, StatusCode::OK);
 
     let joiner = start_server("scale-joiner").await;
     let seed_peer = format!("http://{}", seed.addr);
-    let report = replicate_from_peers(&joiner.registry, &[seed_peer], &keys).await;
+    let report = replicate_from_peers_targeted(&joiner.registry, &[seed_peer], &keys, None).await;
     assert!(report.is_clean(), "joiner bootstrap report: {report:?}");
 
     let joiner_a = get_library_status(joiner.addr, &schema_a.id().to_string()).await;
@@ -221,8 +228,13 @@ async fn restart_rehydrates_and_catches_up_after_downtime() {
     let leader_peer = format!("http://{}", leader.addr);
 
     install_library_with_write_token(&leader, &schema_v0).await;
-    let report =
-        replicate_from_peers(&replica.registry, std::slice::from_ref(&leader_peer), &keys).await;
+    let report = replicate_from_peers_targeted(
+        &replica.registry,
+        std::slice::from_ref(&leader_peer),
+        &keys,
+        None,
+    )
+    .await;
     assert!(report.is_clean(), "replica bootstrap report: {report:?}");
     let replica_v0_before = get_library_status(replica.addr, &schema_v0.id().to_string()).await;
     assert_eq!(replica_v0_before, StatusCode::OK);
@@ -240,7 +252,8 @@ async fn restart_rehydrates_and_catches_up_after_downtime() {
     let replica_v1_before = get_library_status(replica.addr, &schema_v1.id().to_string()).await;
     assert_eq!(replica_v1_before, StatusCode::NOT_FOUND);
 
-    let report = replicate_from_peers(&replica.registry, &[leader_peer], &keys).await;
+    let report =
+        replicate_from_peers_targeted(&replica.registry, &[leader_peer], &keys, None).await;
     assert!(report.is_clean(), "replica reconcile report: {report:?}");
     let replica_v1_after = get_library_status(replica.addr, &schema_v1.id().to_string()).await;
     assert_eq!(replica_v1_after, StatusCode::OK);

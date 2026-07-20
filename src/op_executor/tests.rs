@@ -1,10 +1,10 @@
 use super::tensor_matmul::batched_matmul;
 use super::tensor_transpose::{tensor_transpose, transpose_output_shape};
 use super::*;
-use number_general::Number;
+use number_general::{FloatType, Number, NumberType};
 use tc_ir::{Cond, Map, OpDef, OpRef, Scalar, Subject, TCRef};
 use tc_state::{Collection, NativeClass, State, Tensor, TensorType};
-use tc_value::Value;
+use tc_value::{Value, number_type_path};
 
 #[tokio::test]
 async fn executes_post_opdef_with_id_ref() {
@@ -349,11 +349,13 @@ async fn decodes_f32_and_f64_tensor_literals_from_wire_form() {
         }
     }
 
-    let f32_tensor = decode_literal("f32").await;
+    let f32_tensor =
+        decode_literal(&number_type_path(&NumberType::Float(FloatType::F32)).to_string()).await;
     assert_eq!(f32_tensor.dtype_tag(), "f32");
     assert_eq!(f32_tensor.flattened_f32().expect("values"), vec![3.0, 5.0]);
 
-    let f64_tensor = decode_literal("f64").await;
+    let f64_tensor =
+        decode_literal(&number_type_path(&NumberType::Float(FloatType::F64)).to_string()).await;
     assert_eq!(f64_tensor.dtype_tag(), "f64");
     assert_eq!(f64_tensor.flattened_f64().expect("values"), vec![3.0, 5.0]);
 }

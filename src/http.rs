@@ -22,10 +22,21 @@ pub use host::host_handler_with_public_keys;
 pub use server::HttpServer;
 
 #[allow(unused_imports)]
-pub(crate) use codec::{NativeStateResponse, decode_state_bytes, state_response};
+pub(crate) use codec::{
+    NativeStateResponse, decode_state_bytes_with_context, state_response,
+};
 #[allow(unused_imports)]
-pub(crate) use parse::NativeStateBody;
+pub(crate) use parse::{BTreeDecodeRoots, NativeStateBody};
 pub(crate) use parse::{RequestBody, decode_request_body_with_txn};
+pub(crate) use parse::{decode_value_body, decode_value_body_for_key};
+pub(crate) use parse::state_context_for_request;
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn load_btree_decode_roots(
+    data_dir: &std::path::Path,
+) -> tc_error::TCResult<parse::BTreeDecodeRoots> {
+    parse::load_btree_decode_roots(data_dir)
+}
 #[cfg(test)]
 pub(crate) use server::KernelService;
 

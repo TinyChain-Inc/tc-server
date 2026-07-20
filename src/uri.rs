@@ -7,7 +7,7 @@ pub(crate) const HOST_ROOT_PREFIX: &str = "/host/";
 pub(crate) const HOST_METRICS: &str = "/host/metrics";
 pub(crate) const HOST_PUBLIC_KEY: &str = "/host/public_key";
 pub(crate) const HOST_AUTH_CONTEXT: &str = "/host/auth/context";
-pub(crate) const HOST_LIBRARY_EXPORT: &str = "/host/library/export";
+pub const HOST_LIBRARY_EXPORT: &str = "/host/library/export";
 pub(crate) const HEALTHZ: &str = "/healthz";
 
 pub(crate) fn append_kernel_txn_id(

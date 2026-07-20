@@ -80,7 +80,7 @@ impl LibraryRegistry {
         let mut out = Map::new();
         let mut has_match = path == uri::LIB_ROOT;
 
-        for (id, _) in entries.iter() {
+        for id in entries.keys() {
             if !is_path_prefix(&path, id) {
                 continue;
             }

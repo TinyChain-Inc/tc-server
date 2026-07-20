@@ -23,7 +23,7 @@ pub fn http_ir_route_handler_from_bytes(
 ) -> TCResult<(impl KernelHandler, LibrarySchema, SchemaRoutes)> {
     use crate::http::{
         Body, HttpMethod, NativeStateBody, Request, RequestBody, Response, StatusCode,
-        decode_request_body_with_txn, header,
+        decode_request_body_with_txn, decode_value_body, decode_value_body_for_key, header,
     };
     use crate::resolve::Resolve;
     use bytes::Bytes;
@@ -33,7 +33,6 @@ pub fn http_ir_route_handler_from_bytes(
     use tc_ir::{Map, OpDef, OpRef, Scalar, Subject, parse_route_path};
     use tc_state::State;
     use tc_value::Value;
-    use url::form_urlencoded;
 
     #[derive(Deserialize)]
     struct IrManifest {
@@ -300,93 +299,6 @@ pub fn http_ir_route_handler_from_bytes(
             .expect("error response")
     }
 
-    #[allow(clippy::collapsible_if)]
-    async fn decode_value_body_for_key(
-        req: &Request,
-        key_name: Option<&str>,
-    ) -> TCResult<Option<Value>> {
-        if let Some(body) = req.extensions().get::<NativeStateBody>() {
-            return decode_value_state_for_key(body.clone_state(), key_name);
-        }
-
-        if let Some(body) = req.extensions().get::<RequestBody>() {
-            if !body.is_empty() {
-                return decode_value_bytes(body.clone_bytes(), key_name).await;
-            }
-        }
-
-        let query = req.uri().query().unwrap_or("");
-        let key = form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .find(|(k, _)| k.eq_ignore_ascii_case("key"))
-            .map(|(_, v)| v);
-
-        let Some(raw) = key else {
-            return Ok(None);
-        };
-
-        if raw.trim().is_empty() {
-            return Ok(Some(Value::None));
-        }
-
-        decode_value_bytes(Bytes::from(raw.into_bytes()), key_name).await
-    }
-
-    async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> {
-        decode_value_body_for_key(req, None).await
-    }
-
-    fn decode_value_state_for_key(state: State, key_name: Option<&str>) -> TCResult<Option<Value>> {
-        if state.is_none() {
-            return Ok(None);
-        }
-
-        if let (Some(key_name), State::Map(map)) = (key_name, &state) {
-            let id = key_name
-                .parse::<Id>()
-                .map_err(|err| TCError::bad_request(format!("invalid key name: {err}")))?;
-
-            if let Some(item) = map.get(&id) {
-                return state_to_value(item.clone()).map(Some);
-            }
-        }
-
-        state_to_value(state).map(Some)
-    }
-
-    fn state_to_value(state: State) -> TCResult<Value> {
-        match state {
-            State::None => Ok(Value::None),
-            State::Scalar(Scalar::Value(value)) => Ok(value),
-            _ => Err(TCError::bad_request("expected scalar value request body")),
-        }
-    }
-
-    async fn decode_value_bytes(bytes: Bytes, key_name: Option<&str>) -> TCResult<Option<Value>> {
-        let bytes = if let Some(key_name) = key_name {
-            match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(serde_json::Value::Object(mut object)) => {
-                    if let Some(value) = object.remove(key_name) {
-                        Bytes::from(serde_json::to_vec(&value).map_err(|err| {
-                            TCError::bad_request(format!("invalid key value: {err}"))
-                        })?)
-                    } else {
-                        bytes
-                    }
-                }
-                _ => bytes,
-            }
-        } else {
-            bytes
-        };
-
-        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(bytes)]);
-        destream_json::try_decode((), stream)
-            .await
-            .map(Some)
-            .map_err(|err| TCError::bad_request(err.to_string()))
-    }
-
     async fn decode_state_map_body(req: &Request) -> TCResult<Option<Map<State>>> {
         if let Some(body) = req.extensions().get::<NativeStateBody>() {
             let state = body.clone_state();
@@ -434,7 +346,8 @@ pub fn http_ir_route_handler_from_bytes(
             .get::<TxnHandle>()
             .cloned()
             .ok_or_else(|| TCError::internal("missing transaction handle for request body"))?;
-        let context: Arc<dyn tc_ir::Transaction> = Arc::new(txn);
+        let txn_context: Arc<dyn tc_ir::Transaction> = Arc::new(txn);
+        let state_context = crate::http::state_context_for_request(req, txn_context);
 
         let mut out = Map::new();
         for (key, value) in map {
@@ -445,7 +358,7 @@ pub fn http_ir_route_handler_from_bytes(
                 serde_json::to_vec(&value).map_err(|err| TCError::bad_request(err.to_string()))?;
             let stream =
                 futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
-            let state: State = destream_json::try_decode(Arc::clone(&context), stream)
+            let state: State = destream_json::try_decode(state_context.clone(), stream)
                 .await
                 .map_err(|err| TCError::bad_request(err.to_string()))?;
             out.insert(id, state);

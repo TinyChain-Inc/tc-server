@@ -1,11 +1,12 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use bytes::Bytes;
 use futures::stream;
 use hyper::header::AUTHORIZATION;
 use hyper::{body::to_bytes, header};
+use tc_collection::btree::PersistentFile;
 use tc_error::{TCError, TCResult};
-use tc_ir::Scalar;
+use tc_ir::{Id, Scalar};
 use tc_state::State;
 use tc_value::Value;
 use url::form_urlencoded;
@@ -93,6 +94,63 @@ pub(crate) struct NativeStateBody {
     state: State,
 }
 
+#[derive(Clone)]
+pub(crate) struct BTreeDecodeRoots {
+    persistent_dir: freqfs::DirLock<PersistentFile>,
+    txn_root: freqfs::DirLock<PersistentFile>,
+}
+
+impl BTreeDecodeRoots {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        persistent_dir: freqfs::DirLock<PersistentFile>,
+        txn_root: freqfs::DirLock<PersistentFile>,
+    ) -> Self {
+        Self {
+            persistent_dir,
+            txn_root,
+        }
+    }
+
+    pub(crate) fn persistent_dir(&self) -> freqfs::DirLock<PersistentFile> {
+        self.persistent_dir.clone()
+    }
+
+    pub(crate) fn txn_root(&self) -> freqfs::DirLock<PersistentFile> {
+        self.txn_root.clone()
+    }
+}
+
+pub(crate) fn load_btree_decode_roots(data_dir: &Path) -> TCResult<BTreeDecodeRoots> {
+    let root = data_dir.join("state").join("collection").join("btree_decode");
+    std::fs::create_dir_all(root.join("persistent"))
+        .map_err(|err| TCError::internal(err.to_string()))?;
+    std::fs::create_dir_all(root.join("txn"))
+        .map_err(|err| TCError::internal(err.to_string()))?;
+
+    let cache = freqfs::Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
+    let persistent = Arc::clone(&cache)
+        .load(root.join("persistent"))
+        .map_err(|err| TCError::internal(err.to_string()))?;
+    let txn = Arc::clone(&cache)
+        .load(root.join("txn"))
+        .map_err(|err| TCError::internal(err.to_string()))?;
+
+    Ok(BTreeDecodeRoots::new(persistent, txn))
+}
+
+pub(crate) fn state_context_for_request(
+    req: &Request,
+    transaction: Arc<dyn tc_ir::Transaction>,
+) -> tc_state::StateContext {
+    let mut context = tc_state::state_context(transaction);
+    if let Some(roots) = req.extensions().get::<BTreeDecodeRoots>() {
+        context = context.with_btree_roots(roots.persistent_dir(), roots.txn_root());
+    }
+
+    context
+}
+
 #[allow(dead_code)]
 impl NativeStateBody {
     pub(crate) fn new(state: State) -> Self {
@@ -126,7 +184,8 @@ impl RequestBody {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn decode_request_body_with_txn<T>(req: &Request) -> TCResult<Option<T>>
 where
-    T: destream::de::FromStream<Context = Arc<dyn tc_ir::Transaction>> + TryFrom<State>,
+    T: destream::de::FromStream + TryFrom<State>,
+    T::Context: From<tc_state::StateContext>,
     <T as TryFrom<State>>::Error: std::fmt::Display,
 {
     if let Some(body) = req.extensions().get::<NativeStateBody>() {
@@ -153,31 +212,28 @@ where
     let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body)]);
 
     let context: Arc<dyn tc_ir::Transaction> = Arc::new(txn);
-    destream_json::try_decode(context, stream)
+    let state_context = state_context_for_request(req, context);
+    destream_json::try_decode(state_context.into(), stream)
         .await
         .map(Some)
         .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
 pub(crate) async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> {
-    if let Some(body) = req.extensions().get::<NativeStateBody>() {
-        if body.is_none() {
-            return Ok(None);
-        }
+    decode_value_body_for_key(req, None).await
+}
 
-        return match body.clone_state() {
-            State::Scalar(Scalar::Value(value)) => Ok(Some(value)),
-            _ => Err(TCError::bad_request("expected scalar value request body")),
-        };
+pub(crate) async fn decode_value_body_for_key(
+    req: &Request,
+    key_name: Option<&str>,
+) -> TCResult<Option<Value>> {
+    if let Some(body) = req.extensions().get::<NativeStateBody>() {
+        return decode_value_state_for_key(body.clone_state(), key_name);
     }
 
     match req.extensions().get::<RequestBody>() {
         Some(body) if !body.is_empty() => {
-            let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(body.clone_bytes())]);
-            return destream_json::try_decode((), stream)
-                .await
-                .map(Some)
-                .map_err(|err| TCError::bad_request(err.to_string()));
+            return decode_value_bytes_for_key(body.clone_bytes(), key_name).await;
         }
         _ => {}
     }
@@ -196,10 +252,57 @@ pub(crate) async fn decode_value_body(req: &Request) -> TCResult<Option<Value>> 
         return Ok(Some(Value::None));
     }
 
-    let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
-        raw.into_bytes(),
-    ))]);
+    decode_value_bytes_for_key(Bytes::from(raw.into_bytes()), key_name).await
+}
 
+fn decode_value_state_for_key(state: State, key_name: Option<&str>) -> TCResult<Option<Value>> {
+    if state.is_none() {
+        return Ok(None);
+    }
+
+    if let (Some(key_name), State::Map(map)) = (key_name, &state) {
+        let id = key_name
+            .parse::<Id>()
+            .map_err(|err| TCError::bad_request(format!("invalid key name: {err}")))?;
+
+        if let Some(item) = map.get(&id) {
+            return state_to_value(item.clone()).map(Some);
+        }
+    }
+
+    state_to_value(state).map(Some)
+}
+
+fn state_to_value(state: State) -> TCResult<Value> {
+    match state {
+        State::None => Ok(Value::None),
+        State::Scalar(Scalar::Value(value)) => Ok(value),
+        _ => Err(TCError::bad_request("expected scalar value request body")),
+    }
+}
+
+async fn decode_value_bytes_for_key(
+    bytes: Bytes,
+    key_name: Option<&str>,
+) -> TCResult<Option<Value>> {
+    let bytes = if let Some(key_name) = key_name {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(serde_json::Value::Object(mut object)) => {
+                if let Some(value) = object.remove(key_name) {
+                    Bytes::from(serde_json::to_vec(&value).map_err(|err| {
+                        TCError::bad_request(format!("invalid key value: {err}"))
+                    })?)
+                } else {
+                    bytes
+                }
+            }
+            _ => bytes,
+        }
+    } else {
+        bytes
+    };
+
+    let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(bytes)]);
     destream_json::try_decode((), stream)
         .await
         .map(Some)
