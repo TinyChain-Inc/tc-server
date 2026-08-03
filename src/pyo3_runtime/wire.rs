@@ -6,7 +6,8 @@ use tc_ir::TxnId;
 use crate::{Body, Method, Request, Response, StatusCode};
 
 use super::state_handle_conversions::{
-    encode_state_to_bytes, py_state_handle_from_state, request_body_state,
+    py_state_handle_from_bytes, py_state_handle_from_state, request_body_bytes_async,
+    request_body_state,
 };
 use super::types::{PyKernelRequest, PyKernelResponse, PyStateHandle};
 
@@ -70,13 +71,10 @@ pub(super) async fn py_request_from_http(req: Request) -> PyResult<PyKernelReque
         let body_bytes = hyper::body::to_bytes(body)
             .await
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
-
         if body_bytes.is_empty() {
             None
         } else {
-            return Err(PyValueError::new_err(
-                "missing native request body extension for non-empty payload",
-            ));
+            Some(py_state_handle_from_bytes(body_bytes.to_vec())?)
         }
     };
 
@@ -98,20 +96,16 @@ pub(super) async fn py_response_from_http(response: Response) -> PyResult<PyKern
         })
         .collect::<Vec<_>>();
 
-    match response
+    if let Some(native) = response
         .extensions()
         .get::<crate::http::NativeStateResponse>()
     {
-        Some(native) if status < 400 => {
-            let body = if native.is_none() {
-                None
-            } else {
-                Some(py_state_handle_from_state(native.clone_state())?)
-            };
-
-            return Ok(PyKernelResponse::new(status, Some(headers), body));
-        }
-        _ => {}
+        let body = if native.is_none() {
+            None
+        } else {
+            Some(py_state_handle_from_state(native.clone_state())?)
+        };
+        return Ok(PyKernelResponse::new(status, Some(headers), body));
     }
 
     let body_bytes = hyper::body::to_bytes(response.into_body())
@@ -139,11 +133,7 @@ pub(super) async fn py_response_to_http(response: PyKernelResponse) -> PyResult<
     }
 
     let native_state = request_body_state(response.body())?;
-    let body_bytes = match native_state.as_ref() {
-        None => Vec::new(),
-        Some(state) if state.is_none() => Vec::new(),
-        Some(state) => encode_state_to_bytes(state.clone())?,
-    };
+    let body_bytes = request_body_bytes_async(response.body()).await?;
     if !body_bytes.is_empty() {
         builder = builder.header(crate::header::CONTENT_TYPE, "application/json");
     }

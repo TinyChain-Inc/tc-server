@@ -22,7 +22,7 @@ pub fn http_ir_route_handler_from_bytes(
     bytes: Vec<u8>,
 ) -> TCResult<(impl KernelHandler, LibrarySchema, SchemaRoutes)> {
     use crate::http::{
-        Body, HttpMethod, NativeStateBody, Request, RequestBody, Response, StatusCode,
+        Body, HttpMethod, Request, RequestBody, Response, StatusCode,
         decode_request_body_with_txn, decode_value_body, decode_value_body_for_key, header,
     };
     use crate::resolve::Resolve;
@@ -300,31 +300,6 @@ pub fn http_ir_route_handler_from_bytes(
     }
 
     async fn decode_state_map_body(req: &Request) -> TCResult<Option<Map<State>>> {
-        if let Some(body) = req.extensions().get::<NativeStateBody>() {
-            let state = body.clone_state();
-            if state.is_none() {
-                return Ok(None);
-            }
-
-            return match state {
-                State::Map(map) => Ok(Some(map)),
-                State::Scalar(Scalar::Map(map)) => {
-                    let mut out = Map::new();
-                    for (id, scalar) in map {
-                        let state = match scalar {
-                            Scalar::Value(value) => State::from(value),
-                            other => State::Scalar(other),
-                        };
-                        out.insert(id, state);
-                    }
-                    Ok(Some(out))
-                }
-                _ => Err(TCError::bad_request(
-                    "expected map request body".to_string(),
-                )),
-            };
-        }
-
         let Some(body) = req.extensions().get::<RequestBody>() else {
             return Ok(None);
         };

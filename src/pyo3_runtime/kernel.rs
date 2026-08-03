@@ -1,4 +1,7 @@
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -22,9 +25,9 @@ use crate::{
     txn::{TxnError, TxnManager},
 };
 
-use super::state::{PyBTree, PyState, PyTensor};
+use super::state::{PyState, PyTensor};
 use super::state_handle_conversions::{
-    encode_state_to_bytes, py_state_handle_from_state, request_body_raw_bytes, request_body_state,
+    encode_state_to_bytes, py_state_handle_from_bytes, request_body_bytes, request_body_state,
 };
 use super::types::{
     PyKernelConfig, PyKernelRequest, PyKernelResponse, PyStateHandle, apply_config_overrides,
@@ -45,7 +48,8 @@ fn parse_rjwt_alg(alg: &str) -> PyResult<rjwt::AlgKind> {
 }
 
 fn btree_decode_roots(data_dir: &Path) -> PyResult<crate::http::BTreeDecodeRoots> {
-    crate::http::load_btree_decode_roots(data_dir).map_err(|err| PyValueError::new_err(err.to_string()))
+    crate::http::load_btree_decode_roots(data_dir)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 pub(crate) fn python_kernel_builder_with_config(
@@ -446,7 +450,7 @@ impl KernelHandle {
                 let body = if state.is_none() {
                     None
                 } else {
-                    Some(py_state_handle_from_state(state)?)
+                    Some(py_state_handle_from_bytes(encode_state_to_bytes(state)?)?)
                 };
 
                 Ok(PyKernelResponse::new(200, None, body))
@@ -465,30 +469,15 @@ impl KernelHandle {
         let raw_path = request.path_owned();
         let (route_path, txn_id) = parse_path_and_txn_id(&raw_path)?;
         let native_state = request_body_state(request.body())?;
-        let raw_body = request_body_raw_bytes(request.body())?;
+        let body_bytes = request_body_bytes(request.body())?;
         let body_is_none = native_state
             .as_ref()
             .map(|state| state.is_none())
-            .unwrap_or(true);
+            .unwrap_or_else(|| body_bytes.is_empty());
         let bearer = py_bearer_token(&request);
-        let body_bytes = if let Some(bytes) = raw_body {
-            if bearer.is_none() && bytes.len() > self.config.limits.max_request_bytes_unauth {
-                return Ok(PyKernelResponse::new(413, None, None));
-            }
-            bytes
-        } else if let Some(state) = native_state.as_ref() {
-            if state.is_none() {
-                Vec::new()
-            } else {
-                let bytes = encode_state_to_bytes(state.clone())?;
-                if bearer.is_none() && bytes.len() > self.config.limits.max_request_bytes_unauth {
-                    return Ok(PyKernelResponse::new(413, None, None));
-                }
-                bytes
-            }
-        } else {
-            Vec::new()
-        };
+        if bearer.is_none() && body_bytes.len() > self.config.limits.max_request_bytes_unauth {
+            return Ok(PyKernelResponse::new(413, None, None));
+        }
         let token = match bearer {
             Some(token) => Some(
                 self.block_on(self.inner.token_verifier().verify(token))
@@ -504,13 +493,10 @@ impl KernelHandle {
             let decode_roots = btree_decode_roots(data_dir)?;
             request.extensions_mut().insert(decode_roots);
         }
-        match native_state {
-            Some(state) if !state.is_none() => {
-                request
-                    .extensions_mut()
-                    .insert(crate::http::NativeStateBody::new(state));
-            }
-            _ => {}
+        if let Some(state) = native_state.filter(|state| !state.is_none()) {
+            request
+                .extensions_mut()
+                .insert(crate::http::NativeStateBody::new(state));
         }
         if !body_bytes.is_empty() {
             request
@@ -646,7 +632,6 @@ pub fn register_python_api(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<KernelHandle>()?;
     module.add_class::<PyStateHandle>()?;
     module.add_class::<PyState>()?;
-    module.add_class::<PyBTree>()?;
     module.add_class::<PyTensor>()?;
     module.add_class::<PyKernelRequest>()?;
     module.add_class::<PyKernelResponse>()?;

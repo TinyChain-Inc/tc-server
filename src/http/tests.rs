@@ -5,15 +5,20 @@ mod tests {
     use crate::resolve::Resolve;
     use crate::{Kernel, Method, NativeLibrary, State, TxnHandle, Value};
     use bytes::Bytes;
+    use freqfs::Cache;
     use futures::FutureExt;
     use hyper::Body;
     use pathlink::Link;
+    use safecast::TryCastFrom;
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
+    use tc_collection::btree::{BTree, BTreeColumnSchema, BTreeSchema, PersistentFile};
     use tc_error::TCError;
     use tc_error::TCResult;
-    use tc_ir::{LibrarySchema, NetworkTime, TxnId};
     use tc_ir::{HandleDelete, HandleGet, HandlePost, HandlePut, LibraryModule, tc_library_routes};
+    use tc_ir::{LibrarySchema, NetworkTime, TxnId};
+    use tc_state::{BTreeCollection, Collection};
+    use tc_value::ValueType;
     use tower::Service;
 
     fn ok_handler() -> impl crate::KernelHandler {
@@ -72,6 +77,39 @@ mod tests {
             .unwrap_or_default()
             .as_nanos() as u64;
         TxnId::from_parts(NetworkTime::from_nanos(now), nonce).with_trace([nonce as u8; 32])
+    }
+
+    #[tokio::test]
+    async fn state_response_uses_http_json_for_btree() {
+        let root =
+            std::env::temp_dir().join(format!("tc-server-btree-response-{}", fresh_txn_id(0)));
+        std::fs::create_dir_all(root.join("persistent")).expect("create persistent root");
+        std::fs::create_dir_all(root.join("txn")).expect("create transaction root");
+
+        let cache = Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
+        let persistent = Arc::clone(&cache)
+            .load(root.join("persistent"))
+            .expect("load persistent root");
+        let txn = Arc::clone(&cache)
+            .load(root.join("txn"))
+            .expect("load transaction root");
+        let schema = vec![BTreeColumnSchema {
+            name: "id".to_string(),
+            dtype: ValueType::Number,
+            max_size: None,
+        }];
+        let btree_schema =
+            BTreeSchema::try_cast_from(schema.clone(), |_| "empty schema").expect("BTree schema");
+        let btree = BTree::with_schema(persistent, txn, btree_schema);
+
+        let response = state_response(State::Collection(Collection::from(
+            BTreeCollection::with_schema(schema, btree),
+        )));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(hyper::header::CONTENT_TYPE),
+            Some(&hyper::header::HeaderValue::from_static("application/json"))
+        );
     }
 
     #[derive(Clone)]
@@ -238,7 +276,10 @@ mod tests {
             .await
             .expect("context body");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("context json");
-        assert_eq!(payload["principal"], serde_json::Value::String("/host::owner-a".to_string()));
+        assert_eq!(
+            payload["principal"],
+            serde_json::Value::String("/host::owner-a".to_string())
+        );
         assert!(payload.get("txn_id").is_none());
         assert!(payload["txn_timestamp_nanos"].is_u64());
         assert!(payload["token_verified_at_nanos"].is_u64());
@@ -505,9 +546,10 @@ mod tests {
 
         let leader_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("leader bind");
         let leader_addr = leader_listener.local_addr().expect("leader addr");
-        let leader_origin = Link::from_str(&format!("http://{leader_addr}")).expect("leader origin");
-        let leader_actor = crate::auth::Actor::new_falcon512("leader-host".to_string())
-            .expect("leader actor");
+        let leader_origin =
+            Link::from_str(&format!("http://{leader_addr}")).expect("leader origin");
+        let leader_actor =
+            crate::auth::Actor::new_falcon512("leader-host".to_string()).expect("leader actor");
         let leader_keys = crate::auth::PublicKeyStore::default();
         leader_keys.insert_actor(&leader_actor);
 
@@ -540,10 +582,12 @@ mod tests {
                         .cloned()
                         .expect("remote txn handle");
                     let auth = txn.auth_context().expect("remote auth context");
-                    let txn_claim = Link::from_str(&format!("/txn/{}", txn.id()))
-                        .expect("txn claim link");
-                    let has_matching_claim =
-                        auth.claims.iter().any(|entry| entry.claim.link == txn_claim);
+                    let txn_claim =
+                        Link::from_str(&format!("/txn/{}", txn.id())).expect("txn claim link");
+                    let has_matching_claim = auth
+                        .claims
+                        .iter()
+                        .any(|entry| entry.claim.link == txn_claim);
 
                     *remote_seen_txn.lock().expect("txn lock") = Some(txn.id());
                     *remote_seen_principal.lock().expect("principal lock") =
@@ -590,8 +634,7 @@ mod tests {
         let leader_module = crate::library::http::build_http_library_module(leader_schema, None)
             .await
             .expect("leader module");
-        let leader_handlers =
-            crate::library::http::http_library_handlers(&leader_module);
+        let leader_handlers = crate::library::http::http_library_handlers(&leader_module);
         let leader_kernel = Kernel::builder()
             .with_host_id("leader-host")
             .with_protocol_actor(leader_origin.clone(), leader_actor)
@@ -672,18 +715,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decodes_native_state_body_with_txn_context() {
-        let request = http::Request::builder()
+    async fn decodes_http_state_body_with_txn_context() {
+        let mut request = http::Request::builder()
             .method("PUT")
             .uri("/lib")
             .body(Body::empty())
             .expect("request");
-        let mut request = request;
         let txn = crate::txn::TxnManager::with_host_id("test-host").begin();
         request.extensions_mut().insert(txn);
-        request.extensions_mut().insert(super::parse::NativeStateBody::new(
-            State::from(Value::from("bar")),
-        ));
+        request
+            .extensions_mut()
+            .insert(RequestBody::new(Bytes::from_static(b"\"bar\"")));
 
         let state = decode_request_body_with_txn::<State>(&request)
             .await
@@ -792,7 +834,8 @@ mod tests {
         use tc_ir::{Claim, NetworkTime, TxnId};
         use umask::USER_EXEC;
 
-        let actor = rjwt::Actor::new_falcon512("actor-a".to_string()).expect("generate Falcon-512 actor");
+        let actor =
+            rjwt::Actor::new_falcon512("actor-a".to_string()).expect("generate Falcon-512 actor");
         let keys = crate::auth::PublicKeyStore::default();
         keys.insert_actor(&actor);
 

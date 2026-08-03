@@ -6,7 +6,6 @@ use hyper::header::AUTHORIZATION;
 use hyper::{body::to_bytes, header};
 use tc_collection::btree::PersistentFile;
 use tc_error::{TCError, TCResult};
-use tc_ir::{Id, Scalar};
 use tc_state::State;
 use tc_value::Value;
 use url::form_urlencoded;
@@ -88,10 +87,24 @@ pub(crate) struct RequestBody {
     bytes: Bytes,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+/// An optional in-process representation of an HTTP request body.
+#[cfg_attr(not(feature = "pyo3"), allow(dead_code))]
 #[derive(Clone)]
-pub(crate) struct NativeStateBody {
-    state: State,
+pub(crate) struct NativeStateBody(State);
+
+#[cfg_attr(not(feature = "pyo3"), allow(dead_code))]
+impl NativeStateBody {
+    pub(crate) fn new(state: State) -> Self {
+        Self(state)
+    }
+
+    pub(crate) fn clone_state(&self) -> State {
+        self.0.clone()
+    }
+
+    pub(crate) fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
 }
 
 #[derive(Clone)]
@@ -149,21 +162,6 @@ pub(crate) fn state_context_for_request(
     }
 
     context
-}
-
-#[allow(dead_code)]
-impl NativeStateBody {
-    pub(crate) fn new(state: State) -> Self {
-        Self { state }
-    }
-
-    pub(crate) fn clone_state(&self) -> State {
-        self.state.clone()
-    }
-
-    pub(crate) fn is_none(&self) -> bool {
-        self.state.is_none()
-    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -227,10 +225,6 @@ pub(crate) async fn decode_value_body_for_key(
     req: &Request,
     key_name: Option<&str>,
 ) -> TCResult<Option<Value>> {
-    if let Some(body) = req.extensions().get::<NativeStateBody>() {
-        return decode_value_state_for_key(body.clone_state(), key_name);
-    }
-
     match req.extensions().get::<RequestBody>() {
         Some(body) if !body.is_empty() => {
             return decode_value_bytes_for_key(body.clone_bytes(), key_name).await;
@@ -253,32 +247,6 @@ pub(crate) async fn decode_value_body_for_key(
     }
 
     decode_value_bytes_for_key(Bytes::from(raw.into_bytes()), key_name).await
-}
-
-fn decode_value_state_for_key(state: State, key_name: Option<&str>) -> TCResult<Option<Value>> {
-    if state.is_none() {
-        return Ok(None);
-    }
-
-    if let (Some(key_name), State::Map(map)) = (key_name, &state) {
-        let id = key_name
-            .parse::<Id>()
-            .map_err(|err| TCError::bad_request(format!("invalid key name: {err}")))?;
-
-        if let Some(item) = map.get(&id) {
-            return state_to_value(item.clone()).map(Some);
-        }
-    }
-
-    state_to_value(state).map(Some)
-}
-
-fn state_to_value(state: State) -> TCResult<Value> {
-    match state {
-        State::None => Ok(Value::None),
-        State::Scalar(Scalar::Value(value)) => Ok(value),
-        _ => Err(TCError::bad_request("expected scalar value request body")),
-    }
 }
 
 async fn decode_value_bytes_for_key(
