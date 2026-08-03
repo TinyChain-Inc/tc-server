@@ -119,6 +119,10 @@ fn scalar_requires(scalar: &Scalar, deps: &mut HashSet<Id>) {
                 scalar_requires(&cond.then, deps);
                 scalar_requires(&cond.or_else, deps);
             }
+            TCRef::After(after) => {
+                scalar_requires(&after.when, deps);
+                scalar_requires(&after.then, deps);
+            }
             TCRef::While(while_ref) => {
                 scalar_requires(&while_ref.cond, deps);
                 scalar_requires(&while_ref.closure, deps);
@@ -156,6 +160,10 @@ fn tcref_requires(r: &TCRef, deps: &mut HashSet<Id>) {
             tcref_requires(&cond.cond, deps);
             scalar_requires(&cond.then, deps);
             scalar_requires(&cond.or_else, deps);
+        }
+        TCRef::After(after) => {
+            scalar_requires(&after.when, deps);
+            scalar_requires(&after.then, deps);
         }
         TCRef::While(while_ref) => {
             scalar_requires(&while_ref.cond, deps);

@@ -6,7 +6,7 @@ use number_general::Number;
 use pathlink::{Link, PathSegment};
 use safecast::CastInto;
 use tc_error::{TCError, TCResult};
-use tc_ir::{Cond, ForEach, Id, Map, NativeClass, OpDef, OpRef, Scalar, Subject, TCRef, While};
+use tc_ir::{After, Cond, ForEach, Id, Map, NativeClass, OpDef, OpRef, Scalar, Subject, TCRef, While};
 use tc_state::{Collection, State, TensorType};
 use tc_value::Value;
 
@@ -58,6 +58,7 @@ pub(crate) fn resolve_scalar<'a>(
                     .ok_or_else(|| TCError::not_found(format!("unknown id ${}", id_ref.as_str()))),
                 TCRef::Op(op) => resolve_opref(op, values, txn, self_link).await,
                 TCRef::Cond(cond) => resolve_cond(*cond, values, txn, self_link).await,
+                TCRef::After(after) => resolve_after(*after, values, txn, self_link).await,
                 TCRef::While(while_ref) => resolve_while(*while_ref, values, txn, self_link).await,
                 TCRef::ForEach(for_each) => {
                     resolve_for_each(*for_each, values, txn, self_link).await
@@ -693,6 +694,9 @@ fn scalar_to_value(
                     TCRef::Cond(cond) => {
                         resolve_cond(*cond, &values, &txn, self_link.as_ref()).await?
                     }
+                    TCRef::After(after) => {
+                        resolve_after(*after, &values, &txn, self_link.as_ref()).await?
+                    }
                     TCRef::While(while_ref) => {
                         resolve_while(*while_ref, &values, &txn, self_link.as_ref()).await?
                     }
@@ -740,6 +744,7 @@ fn scalar_to_state(
                     .ok_or_else(|| TCError::not_found(format!("unknown id ${}", id_ref.as_str()))),
                 TCRef::Op(op) => resolve_opref(op, &values, &txn, self_link.as_ref()).await,
                 TCRef::Cond(cond) => resolve_cond(*cond, &values, &txn, self_link.as_ref()).await,
+                TCRef::After(after) => resolve_after(*after, &values, &txn, self_link.as_ref()).await,
                 TCRef::While(while_ref) => {
                     resolve_while(*while_ref, &values, &txn, self_link.as_ref()).await
                 }
@@ -774,6 +779,17 @@ async fn resolve_cond(
         }
         scalar => resolve_scalar(scalar, values, txn, self_link).await,
     }
+}
+
+async fn resolve_after(
+    after: After,
+    values: &Arc<HashMap<Id, State>>,
+    txn: &crate::txn::TxnHandle,
+    self_link: Option<&Link>,
+) -> TCResult<State> {
+    let After { when, then } = after;
+    resolve_scalar(when, values, txn, self_link).await?;
+    resolve_scalar(then, values, txn, self_link).await
 }
 
 async fn resolve_while(

@@ -46,6 +46,9 @@ pub(super) fn reflect_link(
                     cond.then.clone(),
                     cond.or_else.clone(),
                 ]),
+                TCRef::After(after) => {
+                    Scalar::Tuple(vec![after.when.clone(), after.then.clone()])
+                }
                 TCRef::While(while_ref) => Scalar::Tuple(vec![
                     while_ref.cond.clone(),
                     while_ref.closure.clone(),
@@ -155,6 +158,7 @@ fn class_from_opdef(opdef: &OpDef) -> Link {
 fn class_from_tcref(tc_ref: &TCRef) -> Link {
     let path = match tc_ref {
         TCRef::Cond(_) => pathlink::PathBuf::from(tc_ir::TCREF_COND).to_string(),
+        TCRef::After(_) => pathlink::PathBuf::from(tc_ir::TCREF_AFTER).to_string(),
         TCRef::While(_) => pathlink::PathBuf::from(tc_ir::TCREF_WHILE).to_string(),
         TCRef::ForEach(_) => pathlink::PathBuf::from(tc_ir::TCREF_FOR_EACH).to_string(),
         TCRef::Id(_) => pathlink::PathBuf::from(tc_ir::SCALAR_REF_PREFIX).to_string(),

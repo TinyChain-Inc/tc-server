@@ -46,6 +46,18 @@ pub(crate) fn state_response(state: State) -> Response {
     #[cfg(feature = "pyo3")]
     let native_state = state.clone();
 
+    #[cfg(feature = "pyo3")]
+    if contains_btree(&state) {
+        let mut response = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .expect("native state response");
+        response
+            .extensions_mut()
+            .insert(NativeStateResponse::new(native_state));
+        return response;
+    }
+
     match destream_json::encode(state) {
         Ok(stream) => {
             let response = http::Response::builder()
@@ -73,5 +85,15 @@ pub(crate) fn state_response(state: State) -> Response {
             .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from(err.to_string()))
             .expect("state encode error response"),
+    }
+}
+
+#[cfg(feature = "pyo3")]
+fn contains_btree(state: &State) -> bool {
+    match state {
+        State::Collection(tc_state::Collection::BTree(_)) => true,
+        State::Map(map) => map.values().any(contains_btree),
+        State::Tuple(items) => items.iter().any(contains_btree),
+        State::None | State::Scalar(_) | State::Collection(_) => false,
     }
 }
