@@ -7,17 +7,13 @@ mod issuer;
 mod membership;
 mod peers;
 
-#[cfg(test)]
-mod tests;
-
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::library::{
-    LibraryRegistry, decode_authorize_and_stage_install, stage_install_error_response,
-};
+use crate::library::{LibraryRegistry, StageInstallError, decode_authorize_and_stage_install};
+use crate::txn::ParticipantSet;
 use aes_gcm_siv::{Aes256GcmSiv, Key};
 use futures::future::{FutureExt, join_all};
 use hyper::body::to_bytes;
@@ -46,16 +42,24 @@ impl Default for ParticipantFanoutPolicy {
     }
 }
 
-pub use client::{
-    HttpClusterGateway, PeerClusterListing, discover_library_paths, fetch_compiled_library_package,
-    fetch_library_listing, fetch_library_schema, heartbeat_peer, leave_peer_cluster,
-    list_peer_cluster, normalize_peer, register_with_peer, request_replication_token,
-};
+pub use client::{HttpClusterGateway, PeerClusterListing, normalize_peer};
 pub use gateway::ClusterGateway;
 pub use handler::{export_handler, replication_token_handler};
 pub use issuer::{ReplicationIssuer, parse_psk_keys, parse_psk_list};
 pub use membership::{PeerDescriptor, PeerIdentity, PeerMembership};
 pub use peers::peer_membership_handler;
+
+fn stage_install_error_response(error: StageInstallError) -> hyper::Response<Body> {
+    let (status, message) = match error {
+        StageInstallError::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message),
+        StageInstallError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+        StageInstallError::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
+    hyper::Response::builder()
+        .status(status)
+        .body(Body::from(message))
+        .expect("replication install error response")
+}
 
 pub fn is_supported_replicated_path(path: &str) -> bool {
     path.starts_with("/lib/") || path.starts_with("/service/")
@@ -149,7 +153,7 @@ fn normalize_cluster_root(value: &str) -> TCResult<String> {
 }
 
 struct ParticipantFanoutError {
-    delivered: Vec<String>,
+    delivered: ParticipantSet<String>,
     err: TCError,
 }
 
@@ -231,21 +235,8 @@ pub async fn replicate_from_peers_targeted(
     peers: &[String],
     keys: &[Key<Aes256GcmSiv>],
     target_paths: Option<&HashSet<String>>,
+    gateway: &impl ClusterGateway,
 ) -> ReplicationReport {
-    replicate_from_peers_with_gateway(registry, peers, keys, target_paths, &HttpClusterGateway)
-        .await
-}
-
-pub async fn replicate_from_peers_with_gateway<G>(
-    registry: &Arc<LibraryRegistry>,
-    peers: &[String],
-    keys: &[Key<Aes256GcmSiv>],
-    target_paths: Option<&HashSet<String>>,
-    gateway: &G,
-) -> ReplicationReport
-where
-    G: ClusterGateway,
-{
     let mut report = ReplicationReport::default();
 
     for peer in peers {
@@ -295,29 +286,8 @@ pub async fn announce_self_to_cluster(
     routes: &PeerRoutes,
     keys: &[Key<Aes256GcmSiv>],
     issuer: &ReplicationIssuer,
+    gateway: &impl ClusterGateway,
 ) -> ClusterJoinReport {
-    announce_self_to_cluster_with_gateway(
-        membership,
-        self_identity,
-        routes,
-        keys,
-        issuer,
-        &HttpClusterGateway,
-    )
-    .await
-}
-
-pub async fn announce_self_to_cluster_with_gateway<G>(
-    membership: &PeerMembership,
-    self_identity: &PeerIdentity,
-    routes: &PeerRoutes,
-    keys: &[Key<Aes256GcmSiv>],
-    issuer: &ReplicationIssuer,
-    gateway: &G,
-) -> ClusterJoinReport
-where
-    G: ClusterGateway,
-{
     let mut report = ClusterJoinReport::default();
     let mut pending = membership.snapshot_active_peers();
     let mut visited = std::collections::HashSet::new();
@@ -372,12 +342,12 @@ where
 pub fn live_replicating_install_put_handler(
     registry: Arc<LibraryRegistry>,
     membership: PeerMembership,
-    keys: Vec<Key<Aes256GcmSiv>>,
-) -> impl crate::KernelHandler {
+    gateway: HttpClusterGateway,
+) -> impl crate::http::HttpHandler {
     move |req: Request<Body>| {
         let registry = Arc::clone(&registry);
         let membership = membership.clone();
-        let keys = keys.clone();
+        let gateway = gateway.clone();
         async move {
             let forwarded = req
                 .headers()
@@ -397,28 +367,18 @@ pub fn live_replicating_install_put_handler(
                 Err(err) => return bad_request(err.to_string()),
             };
 
-            let schema_path = match decode_authorize_and_stage_install(&registry, &txn, &body).await
-            {
-                Ok(schema_path) => schema_path,
+            match decode_authorize_and_stage_install(&registry, &txn, &body).await {
+                Ok(_) => {}
                 Err(err) => return stage_install_error_response(err),
-            };
+            }
 
             if !forwarded {
                 let install_bytes = body.to_vec();
-                match forward_install_to_peers(
-                    &membership,
-                    &txn,
-                    &schema_path,
-                    install_bytes,
-                    &keys,
-                )
-                .await
-                {
+                match forward_install_to_peers(&membership, &txn, install_bytes, &gateway).await {
                     Ok(participants) => {
                         registry.record_replication_participants(txn.id(), participants)
                     }
                     Err(err) => {
-                        registry.discard_txn(txn.id());
                         return text_response(StatusCode::BAD_GATEWAY, err.to_string());
                     }
                 }
@@ -433,39 +393,16 @@ pub fn live_replicating_install_put_handler(
 pub async fn forward_install_to_peers(
     membership: &PeerMembership,
     txn: &crate::txn::TxnHandle,
-    schema_path: &str,
     install_compiled_package: Vec<u8>,
-    keys: &[Key<Aes256GcmSiv>],
+    gateway: &impl ClusterGateway,
 ) -> TCResult<Vec<String>> {
-    forward_install_to_peers_with_gateway(
-        membership,
-        txn,
-        schema_path,
-        install_compiled_package,
-        keys,
-        &HttpClusterGateway,
-    )
-    .await
-}
-
-pub async fn forward_install_to_peers_with_gateway<G>(
-    membership: &PeerMembership,
-    txn: &crate::txn::TxnHandle,
-    schema_path: &str,
-    install_compiled_package: Vec<u8>,
-    keys: &[Key<Aes256GcmSiv>],
-    gateway: &G,
-) -> TCResult<Vec<String>>
-where
-    G: ClusterGateway,
-{
     let token = txn
         .raw_token()
         .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?
         .to_string();
     let txn_id = txn.id();
 
-    let participants = membership.snapshot_active_peers();
+    let participants = membership.snapshot_active_peers().into_iter().collect();
     let delivered = fanout_participants(
         &participants,
         "install payload",
@@ -475,15 +412,6 @@ where
             let payload = install_compiled_package.clone();
             async move {
                 gateway
-                    .request_replication_token(&peer, schema_path, keys)
-                    .await
-                    .map_err(|err| {
-                        tc_error::TCError::bad_gateway(format!(
-                            "failed to request replication token from {peer}: {err}"
-                        ))
-                    })?;
-
-                gateway
                     .push_install_compiled_package(&peer, &token, txn_id, payload)
                     .await
             }
@@ -492,29 +420,29 @@ where
     .await
     .map_err(|err| err.err)?;
 
-    Ok(delivered)
+    Ok(delivered.into_iter().collect())
 }
 
-pub fn live_replicating_finalize_hook(
+pub fn live_replicating_finalize_hook<G>(
     registry: Arc<LibraryRegistry>,
+    gateway: G,
 ) -> impl Fn(crate::txn::TxnHandle, bool) -> futures::future::BoxFuture<'static, TCResult<()>>
 + Send
 + Sync
-+ 'static {
++ 'static
+where
+    G: ClusterGateway + Clone,
+{
     move |txn: crate::txn::TxnHandle, commit: bool| {
         let registry = Arc::clone(&registry);
+        let gateway = gateway.clone();
         async move {
             let Some(participants) = registry.replication_participants(txn.id()) else {
                 return Ok(());
             };
 
-            match forward_finalize_to_participants_progress(
-                &participants,
-                &txn,
-                commit,
-                &HttpClusterGateway,
-            )
-            .await
+            match forward_finalize_to_participants_progress(&participants, &txn, commit, &gateway)
+                .await
             {
                 Ok(_) => Ok(()),
                 Err(err) => {
@@ -531,26 +459,14 @@ pub async fn forward_finalize_to_peers(
     membership: &PeerMembership,
     txn: &crate::txn::TxnHandle,
     commit: bool,
+    gateway: &impl ClusterGateway,
 ) -> TCResult<()> {
-    let participants = membership.snapshot_active_peers();
-    forward_finalize_to_participants(&participants, txn, commit, &HttpClusterGateway).await
-}
-
-pub async fn forward_finalize_to_peers_with_gateway<G>(
-    membership: &PeerMembership,
-    txn: &crate::txn::TxnHandle,
-    commit: bool,
-    gateway: &G,
-) -> TCResult<()>
-where
-    G: ClusterGateway,
-{
-    let participants = membership.snapshot_active_peers();
+    let participants = membership.snapshot_active_peers().into_iter().collect();
     forward_finalize_to_participants(&participants, txn, commit, gateway).await
 }
 
 async fn forward_finalize_to_participants<G>(
-    participants: &[String],
+    participants: &ParticipantSet<String>,
     txn: &crate::txn::TxnHandle,
     commit: bool,
     gateway: &G,
@@ -565,18 +481,18 @@ where
 }
 
 async fn forward_finalize_to_participants_progress<G>(
-    participants: &[String],
+    participants: &ParticipantSet<String>,
     txn: &crate::txn::TxnHandle,
     commit: bool,
     gateway: &G,
-) -> Result<Vec<String>, ParticipantFanoutError>
+) -> Result<ParticipantSet<String>, ParticipantFanoutError>
 where
     G: ClusterGateway,
 {
     let token = txn
         .raw_token()
         .ok_or_else(|| ParticipantFanoutError {
-            delivered: Vec::new(),
+            delivered: ParticipantSet::default(),
             err: tc_error::TCError::unauthorized("missing bearer token"),
         })?
         .to_string();
@@ -599,16 +515,16 @@ where
 }
 
 async fn fanout_participants<F, Fut>(
-    participants: &[String],
+    participants: &ParticipantSet<String>,
     operation: &str,
     policy: ParticipantFanoutPolicy,
     apply: F,
-) -> Result<Vec<String>, ParticipantFanoutError>
+) -> Result<ParticipantSet<String>, ParticipantFanoutError>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = TCResult<()>>,
 {
-    let mut delivered = HashSet::new();
+    let mut delivered = ParticipantSet::default();
     let mut first_error = None;
 
     for _ in 1..=policy.max_attempts {
@@ -619,8 +535,6 @@ where
             .collect::<Vec<_>>();
 
         if targets.is_empty() {
-            let mut delivered = delivered.into_iter().collect::<Vec<_>>();
-            delivered.sort();
             return Ok(delivered);
         }
 
@@ -651,12 +565,8 @@ where
         .collect::<Vec<_>>();
 
     if unresolved.is_empty() {
-        let mut delivered = delivered.into_iter().collect::<Vec<_>>();
-        delivered.sort();
         Ok(delivered)
     } else {
-        let mut delivered = delivered.into_iter().collect::<Vec<_>>();
-        delivered.sort();
         Err(ParticipantFanoutError {
             delivered,
             err: first_error.unwrap_or_else(|| {
@@ -666,5 +576,103 @@ where
                 ))
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod rpc_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct CountingGateway {
+        token: AtomicUsize,
+        work: AtomicUsize,
+        finalize: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ClusterGateway for CountingGateway {
+        async fn discover_library_paths(&self, _peer: &str) -> TCResult<Vec<String>> {
+            unreachable!("transactional fanout must not perform discovery")
+        }
+
+        async fn request_replication_token(
+            &self,
+            _peer: &str,
+            _path: &str,
+            _keys: &[Key<Aes256GcmSiv>],
+        ) -> TCResult<String> {
+            self.token.fetch_add(1, Ordering::SeqCst);
+            Ok("redundant-token".to_string())
+        }
+
+        async fn fetch_compiled_library_package(
+            &self,
+            _peer: &str,
+            _token: &str,
+        ) -> TCResult<Option<crate::library::CompiledLibraryPackage>> {
+            unreachable!("transactional fanout must not fetch an artifact")
+        }
+
+        async fn register_with_peer(
+            &self,
+            _seed: &str,
+            _joiner: &PeerIdentity,
+            _routes: &PeerRoutes,
+            _keys: &[Key<Aes256GcmSiv>],
+        ) -> TCResult<PeerClusterListing> {
+            unreachable!("transactional fanout must not register a peer")
+        }
+
+        async fn push_install_compiled_package(
+            &self,
+            _peer: &str,
+            _token: &str,
+            _txn_id: tc_ir::TxnId,
+            _payload: Vec<u8>,
+        ) -> TCResult<()> {
+            self.work.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn finalize_install_txn(
+            &self,
+            _peer: &str,
+            _token: &str,
+            _txn_id: tc_ir::TxnId,
+            _commit: bool,
+        ) -> TCResult<()> {
+            self.finalize.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn transactional_fanout_meets_the_failure_free_rpc_lower_bound() {
+        let peers = vec![
+            "http://peer-a".to_string(),
+            "http://peer-b".to_string(),
+            "http://peer-c".to_string(),
+        ];
+        let membership = PeerMembership::new(peers.clone());
+        let txn = crate::txn::test_txn("rpc-minimality");
+        let gateway = CountingGateway::default();
+
+        let prepared =
+            forward_install_to_peers(&membership, &txn, b"compiled-library".to_vec(), &gateway)
+                .await
+                .expect("prepare participants");
+        let prepared = prepared.into_iter().collect();
+        forward_finalize_to_participants(&prepared, &txn, true, &gateway)
+            .await
+            .expect("finalize participants");
+
+        assert_eq!(prepared, peers.into_iter().collect());
+        assert_eq!(gateway.token.load(Ordering::SeqCst), 0);
+        let participant_count = prepared.iter().count();
+        assert_eq!(gateway.work.load(Ordering::SeqCst), participant_count);
+        assert_eq!(gateway.finalize.load(Ordering::SeqCst), participant_count);
     }
 }

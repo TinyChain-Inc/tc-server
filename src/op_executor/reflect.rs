@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use crate::State;
 use pathlink::Link;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Id, Map, NativeClass, OpDef, OpRef, Scalar, TCRef};
-use tc_state::State;
 use tc_value::Value;
 
 pub(super) fn reflect_link(
@@ -46,9 +46,7 @@ pub(super) fn reflect_link(
                     cond.then.clone(),
                     cond.or_else.clone(),
                 ]),
-                TCRef::After(after) => {
-                    Scalar::Tuple(vec![after.when.clone(), after.then.clone()])
-                }
+                TCRef::After(after) => Scalar::Tuple(vec![after.when.clone(), after.then.clone()]),
                 TCRef::While(while_ref) => Scalar::Tuple(vec![
                     while_ref.cond.clone(),
                     while_ref.closure.clone(),

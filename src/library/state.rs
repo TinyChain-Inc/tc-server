@@ -6,13 +6,11 @@ use std::{
 use pathlink::Link;
 use tc_ir::{Library, LibraryModule, LibrarySchema};
 
-use crate::txn::TxnHandle;
-
 use super::SchemaRoutes;
 
 #[derive(Clone)]
 pub struct LibraryState {
-    inner: Arc<RwLock<LibraryModule<TxnHandle, SchemaRoutes>>>,
+    inner: Arc<RwLock<LibraryModule<crate::State, SchemaRoutes>>>,
 }
 
 impl LibraryState {

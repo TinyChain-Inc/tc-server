@@ -1,29 +1,24 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::State;
 use futures::future::BoxFuture;
 use number_general::Number;
-use pathlink::{Link, PathSegment};
-use safecast::CastInto;
+use pathlink::Link;
+use safecast::{CastInto, TryCastFrom};
 use tc_error::{TCError, TCResult};
-use tc_ir::{After, Cond, ForEach, Id, Map, NativeClass, OpDef, OpRef, Scalar, Subject, TCRef, While};
-use tc_state::{Collection, State, TensorType};
+use tc_ir::{After, Cond, ForEach, Id, Map, OpDef, OpRef, Scalar, Subject, TCRef, While};
 use tc_value::Value;
 
+use super::collection;
 use super::execute::execute_post_with_self;
 use super::reflect::reflect_link;
 use crate::gateway::RpcGateway;
 use crate::op_plan::opdef_free_ids;
 
-mod btree;
 mod params;
-mod tensor;
 
-use self::btree::{resolve_btree_delete, resolve_btree_get, resolve_btree_post};
 use self::params::{param_id, param_opdef, param_state, resolve_params};
-use self::tensor::{
-    bool_from_state, parse_tensor_literal_put, resolve_tensor_get, resolve_tensor_post,
-};
 
 pub(crate) fn resolve_scalar<'a>(
     scalar: Scalar,
@@ -38,18 +33,16 @@ pub(crate) fn resolve_scalar<'a>(
             Scalar::Map(map) => {
                 let mut out = Map::new();
                 for (key, value) in map {
-                    let state = resolve_scalar(value, values, txn, self_link).await?;
-                    out.insert(key, state_to_scalar(state)?);
+                    out.insert(key, resolve_scalar(value, values, txn, self_link).await?);
                 }
-                Ok(State::Scalar(Scalar::Map(out)))
+                Ok(State::Map(out))
             }
             Scalar::Tuple(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
-                    let state = resolve_scalar(item, values, txn, self_link).await?;
-                    out.push(state_to_scalar(state)?);
+                    out.push(resolve_scalar(item, values, txn, self_link).await?);
                 }
-                Ok(State::Scalar(Scalar::Tuple(out)))
+                Ok(State::Tuple(out))
             }
             Scalar::Ref(r) => match *r {
                 TCRef::Id(id_ref) => values
@@ -81,28 +74,13 @@ fn resolve_opref(
         match op {
             OpRef::Get((subject, key)) => match subject {
                 Subject::Ref(id_ref, suffix) => {
-                    if let Some(state) = resolve_tensor_get(
-                        &id_ref,
-                        suffix.as_ref(),
-                        key.clone(),
-                        &values,
-                        &txn,
-                        self_link.as_ref(),
-                    )
-                    .await?
-                    {
-                        return Ok(state);
-                    }
-
-                    if let Some(state) = resolve_btree_get(
-                        &id_ref,
-                        suffix.as_ref(),
-                        key.clone(),
-                        &values,
-                        &txn,
-                        self_link.as_ref(),
-                    )
-                    .await?
+                    let state = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
+                        TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
+                    })?;
+                    let local_key =
+                        resolve_scalar(key.clone(), &values, &txn, self_link.as_ref()).await?;
+                    if let Some(state) =
+                        collection::get(&state, suffix.as_ref(), local_key, &txn).await?
                     {
                         return Ok(state);
                     }
@@ -112,24 +90,36 @@ fn resolve_opref(
                         values.as_ref(),
                         self_link.as_ref(),
                     )?;
-                    let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
+                    let key = Scalar::try_cast_from(
+                        resolve_scalar(key, &values, &txn, self_link.as_ref()).await?,
+                        |_| TCError::bad_request("expected scalar GET key"),
+                    )?;
                     txn.get(link, txn.clone(), key).await
                 }
                 Subject::Link(_) => {
                     let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
-                    let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
+                    let key = Scalar::try_cast_from(
+                        resolve_scalar(key, &values, &txn, self_link.as_ref()).await?,
+                        |_| TCError::bad_request("expected scalar GET key"),
+                    )?;
                     txn.get(link, txn.clone(), key).await
                 }
             },
             OpRef::Put((subject, key, value)) => match subject {
                 Subject::Link(_) | Subject::Ref(_, _) => {
                     let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
-                    if matches!(key, Scalar::Tuple(_)) && link == TensorType.path().to_string() {
-                        let tensor = parse_tensor_literal_put(key, value)?;
-                        return Ok(State::Collection(Collection::Tensor(tensor)));
+                    let local_key =
+                        resolve_scalar(key.clone(), &values, &txn, self_link.as_ref()).await?;
+                    let local_value =
+                        resolve_scalar(value.clone(), &values, &txn, self_link.as_ref()).await?;
+                    if let Some(state) = collection::from_put(&link, local_key, local_value)? {
+                        return Ok(state);
                     }
-                    let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
-                    let value = scalar_to_state(value, &values, &txn, self_link.as_ref()).await?;
+                    let key = Scalar::try_cast_from(
+                        resolve_scalar(key, &values, &txn, self_link.as_ref()).await?,
+                        |_| TCError::bad_request("expected scalar PUT key"),
+                    )?;
+                    let value = resolve_scalar(value, &values, &txn, self_link.as_ref()).await?;
                     txn.put(link, txn.clone(), key, value)
                         .await
                         .map(|()| State::default())
@@ -155,28 +145,27 @@ fn resolve_opref(
                             resolve_params(params, &values, &txn, self_link.as_ref()).await?;
                         return txn.post(link, txn.clone(), params).await;
                     }
-                    if let Some(state) = resolve_tensor_post(
-                        &id_ref,
-                        suffix.as_ref(),
-                        &params,
-                        &values,
-                        &txn,
-                        self_link.as_ref(),
-                    )
-                    .await?
-                    {
-                        return Ok(state);
-                    }
                     let segments = suffix.as_ref();
                     if segments.len() == 1 && segments[0].as_str() == "add" {
                         let left = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                             TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
                         })?;
 
-                        let State::Scalar(Scalar::Value(Value::Number(left))) = left else {
-                            return Err(TCError::bad_request(
-                                "expected add subject to be a number".to_string(),
-                            ));
+                        let left = match left {
+                            State::Scalar(Scalar::Value(Value::Number(left))) => left,
+                            state => {
+                                let params =
+                                    resolve_params(params, &values, &txn, self_link.as_ref())
+                                        .await?;
+                                if let Some(result) =
+                                    collection::post(&state, segments, params, &txn).await?
+                                {
+                                    return Ok(result);
+                                }
+                                return Err(TCError::bad_request(
+                                    "expected add subject to be a number".to_string(),
+                                ));
+                            }
                         };
 
                         let r_id: Id = "r".parse().expect("Id");
@@ -375,9 +364,8 @@ fn resolve_opref(
                             .into_iter()
                             .skip(start as usize)
                             .take((stop - start) as usize)
-                            .map(state_to_scalar)
-                            .collect::<TCResult<Vec<_>>>()?;
-                        Ok(State::Scalar(Scalar::Tuple(sliced)))
+                            .collect();
+                        Ok(State::Tuple(sliced))
                     } else if segments.len() == 1 && segments[0].as_str() == "head" {
                         let tuple_state =
                             values.get(id_ref.as_str()).cloned().ok_or_else(|| {
@@ -387,20 +375,15 @@ fn resolve_opref(
                         let head = items.drain(..1).next().ok_or_else(|| {
                             TCError::bad_request("cannot take head of empty tuple".to_string())
                         })?;
-                        let head = state_to_scalar(head)?;
-                        Ok(State::Scalar(head))
+                        Ok(head)
                     } else if segments.len() == 1 && segments[0].as_str() == "tail" {
                         let tuple_state =
                             values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                                 TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
                             })?;
                         let items = tuple_state_to_items(tuple_state, "tail")?;
-                        let tail = items
-                            .into_iter()
-                            .skip(1)
-                            .map(state_to_scalar)
-                            .collect::<TCResult<Vec<_>>>()?;
-                        Ok(State::Scalar(Scalar::Tuple(tail)))
+                        let tail = items.into_iter().skip(1).collect();
+                        Ok(State::Tuple(tail))
                     } else if segments.len() == 1 && segments[0].as_str() == "concat" {
                         let left_state = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                             TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
@@ -427,16 +410,10 @@ fn resolve_opref(
                             return Ok(State::Scalar(Scalar::Value(Value::String(out))));
                         }
 
-                        let mut left = tuple_state_to_items(left_state, "concat")?
-                            .into_iter()
-                            .map(state_to_scalar)
-                            .collect::<TCResult<Vec<_>>>()?;
-                        let mut right = tuple_state_to_items(right_state, "concat")?
-                            .into_iter()
-                            .map(state_to_scalar)
-                            .collect::<TCResult<Vec<_>>>()?;
+                        let mut left = tuple_state_to_items(left_state, "concat")?;
+                        let mut right = tuple_state_to_items(right_state, "concat")?;
                         left.append(&mut right);
-                        Ok(State::Scalar(Scalar::Tuple(left)))
+                        Ok(State::Tuple(left))
                     } else if segments.len() == 1 && segments[0].as_str() == "render" {
                         let template = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
                             TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
@@ -485,8 +462,7 @@ fn resolve_opref(
                                 let item = items.get(idx).cloned().ok_or_else(|| {
                                     TCError::bad_request("tuple index out of bounds".to_string())
                                 })?;
-                                let item = state_to_scalar(item)?;
-                                Ok(State::Scalar(item))
+                                Ok(item)
                             }
                             State::Scalar(Scalar::Tuple(items)) => {
                                 let Value::Number(idx_num) = idx_value else {
@@ -562,25 +538,23 @@ fn resolve_opref(
                         }
 
                         Ok(state)
-                    } else if let Some(state) = resolve_btree_post(
-                        &id_ref,
-                        suffix.as_ref(),
-                        &params,
-                        &values,
-                        &txn,
-                        self_link.as_ref(),
-                    )
-                    .await?
-                    {
-                        Ok(state)
                     } else {
+                        let state = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
+                            TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
+                        })?;
+                        let params =
+                            resolve_params(params, &values, &txn, self_link.as_ref()).await?;
+                        if let Some(state) =
+                            collection::post(&state, suffix.as_ref(), params.clone(), &txn).await?
+                        {
+                            return Ok(state);
+                        }
+
                         let link = resolve_subject(
                             Subject::Ref(id_ref, suffix),
                             values.as_ref(),
                             self_link.as_ref(),
                         )?;
-                        let params =
-                            resolve_params(params, &values, &txn, self_link.as_ref()).await?;
                         txn.post(link, txn.clone(), params).await
                     }
                 }
@@ -588,21 +562,22 @@ fn resolve_opref(
             OpRef::Delete((subject, key)) => match subject {
                 Subject::Link(_) => {
                     let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
-                    let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
+                    let key = Scalar::try_cast_from(
+                        resolve_scalar(key, &values, &txn, self_link.as_ref()).await?,
+                        |_| TCError::bad_request("expected scalar DELETE key"),
+                    )?;
                     txn.delete(link, txn.clone(), key)
                         .await
                         .map(|()| State::default())
                 }
                 Subject::Ref(id_ref, suffix) => {
-                    if let Some(state) = resolve_btree_delete(
-                        &id_ref,
-                        suffix.as_ref(),
-                        key.clone(),
-                        &values,
-                        &txn,
-                        self_link.as_ref(),
-                    )
-                    .await?
+                    let state = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
+                        TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
+                    })?;
+                    let local_key =
+                        resolve_scalar(key.clone(), &values, &txn, self_link.as_ref()).await?;
+                    if let Some(state) =
+                        collection::delete(&state, suffix.as_ref(), local_key, &txn).await?
                     {
                         return Ok(state);
                     }
@@ -612,7 +587,10 @@ fn resolve_opref(
                         values.as_ref(),
                         self_link.as_ref(),
                     )?;
-                    let key = scalar_to_value(key, &values, &txn, self_link.as_ref()).await?;
+                    let key = Scalar::try_cast_from(
+                        resolve_scalar(key, &values, &txn, self_link.as_ref()).await?,
+                        |_| TCError::bad_request("expected scalar DELETE key"),
+                    )?;
                     txn.delete(link, txn.clone(), key)
                         .await
                         .map(|()| State::default())
@@ -719,39 +697,6 @@ fn scalar_to_value(
                     )),
                 }
             }
-        }
-    })
-}
-
-fn scalar_to_state(
-    scalar: Scalar,
-    values: &Arc<HashMap<Id, State>>,
-    txn: &crate::txn::TxnHandle,
-    self_link: Option<&Link>,
-) -> BoxFuture<'static, TCResult<State>> {
-    let values = Arc::clone(values);
-    let txn = txn.clone();
-    let self_link = self_link.cloned();
-    Box::pin(async move {
-        match scalar {
-            Scalar::Value(value) => Ok(State::from(value)),
-            Scalar::Op(_) => Ok(State::Scalar(scalar)),
-            Scalar::Map(_) | Scalar::Tuple(_) => Ok(State::Scalar(scalar)),
-            Scalar::Ref(r) => match *r {
-                TCRef::Id(id_ref) => values
-                    .get(id_ref.as_str())
-                    .cloned()
-                    .ok_or_else(|| TCError::not_found(format!("unknown id ${}", id_ref.as_str()))),
-                TCRef::Op(op) => resolve_opref(op, &values, &txn, self_link.as_ref()).await,
-                TCRef::Cond(cond) => resolve_cond(*cond, &values, &txn, self_link.as_ref()).await,
-                TCRef::After(after) => resolve_after(*after, &values, &txn, self_link.as_ref()).await,
-                TCRef::While(while_ref) => {
-                    resolve_while(*while_ref, &values, &txn, self_link.as_ref()).await
-                }
-                TCRef::ForEach(for_each) => {
-                    resolve_for_each(*for_each, &values, &txn, self_link.as_ref()).await
-                }
-            },
         }
     })
 }
@@ -987,31 +932,5 @@ async fn resolve_bool_state(
                 )));
             }
         }
-    }
-}
-
-pub(super) fn state_to_scalar(state: State) -> TCResult<Scalar> {
-    match state {
-        State::None => Ok(Scalar::Value(Value::None)),
-        State::Scalar(scalar) => Ok(scalar),
-        State::Map(map) => {
-            let mut out = Map::new();
-            for (key, value) in map {
-                out.insert(key, state_to_scalar(value)?);
-            }
-
-            Ok(Scalar::Map(out))
-        }
-        State::Tuple(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for value in items {
-                out.push(state_to_scalar(value)?);
-            }
-
-            Ok(Scalar::Tuple(out))
-        }
-        _ => Err(TCError::bad_request(
-            "expected scalar state while resolving op".to_string(),
-        )),
     }
 }

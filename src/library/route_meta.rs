@@ -23,10 +23,10 @@ impl SchemaRoutes {
     }
 }
 
-impl Route for SchemaRoutes {
+impl Route<crate::State> for SchemaRoutes {
     type Handler = RouteMetadata;
 
-    fn route<'a>(&'a self, path: &'a [PathSegment]) -> Option<&'a Self::Handler> {
+    fn route(&self, path: &[PathSegment]) -> Option<Self::Handler> {
         self.dir.route(path)
     }
 }

@@ -1,20 +1,20 @@
+use crate::State;
 use futures::future::BoxFuture;
 use pathlink::Link;
 use tc_error::TCResult;
-use tc_ir::Map;
-use tc_state::State;
-use tc_value::Value;
+use tc_ir::{Map, Scalar};
 
 use crate::txn::TxnHandle;
 
 pub trait RpcGateway: Send + Sync + 'static {
-    fn get(&self, target: Link, txn: TxnHandle, key: Value) -> BoxFuture<'static, TCResult<State>>;
+    fn get(&self, target: Link, txn: TxnHandle, key: Scalar)
+    -> BoxFuture<'static, TCResult<State>>;
 
     fn put(
         &self,
         target: Link,
         txn: TxnHandle,
-        key: Value,
+        key: Scalar,
         value: State,
     ) -> BoxFuture<'static, TCResult<()>>;
 
@@ -25,5 +25,6 @@ pub trait RpcGateway: Send + Sync + 'static {
         params: Map<State>,
     ) -> BoxFuture<'static, TCResult<State>>;
 
-    fn delete(&self, target: Link, txn: TxnHandle, key: Value) -> BoxFuture<'static, TCResult<()>>;
+    fn delete(&self, target: Link, txn: TxnHandle, key: Scalar)
+    -> BoxFuture<'static, TCResult<()>>;
 }

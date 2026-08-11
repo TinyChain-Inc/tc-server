@@ -1,14 +1,13 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tc_error::{ErrorKind, TCError, TCResult};
+use tc_error::{TCError, TCResult};
 use tc_ir::{LibrarySchema, TxnHeader, parse_route_path};
 use tokio::sync::Mutex;
 
-use crate::KernelHandler;
+use crate::http::HttpHandler;
 use crate::http::{Body, Request, Response, StatusCode};
 use crate::library::{RouteMetadata, SchemaRoutes};
-use crate::resolve::Resolve;
 use crate::txn::TxnHandle;
 
 use super::WasmLibrary;
@@ -16,7 +15,7 @@ use super::decode::try_decode_wasm_ref;
 
 pub fn http_wasm_route_handler_from_bytes(
     bytes: Vec<u8>,
-) -> TCResult<(impl KernelHandler, LibrarySchema, SchemaRoutes)> {
+) -> TCResult<(impl HttpHandler, LibrarySchema, SchemaRoutes)> {
     let engine = wasmtime::Engine::default();
     let wasm = WasmLibrary::from_bytes(&engine, &bytes)?;
     let schema = wasm.schema().clone();
@@ -65,10 +64,6 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request) -> Respo
         Some(txn) => txn,
         None => return error_response(TCError::internal("missing transaction handle")),
     };
-    let btree_roots = req
-        .extensions()
-        .get::<crate::http::BTreeDecodeRoots>()
-        .cloned();
 
     let body = match hyper::body::to_bytes(req.into_body()).await {
         Ok(bytes) => bytes.to_vec(),
@@ -108,21 +103,13 @@ async fn http_handle_route(wasm: Arc<Mutex<WasmLibrary>>, req: Request) -> Respo
             // If the WASM route returns a TinyChain ref envelope (`TCRef` or `OpRef`) as JSON,
             // resolve it within the current transaction and return the resolved state.
             if let Some(r) = try_decode_wasm_ref(&bytes).await {
-                match r.resolve(&txn).await {
+                match crate::resolve::resolve(r, &txn).await {
                     Ok(state) => return state_response(state),
                     Err(err) => return error_response(err),
                 }
             }
 
-            let txn_context: Arc<dyn tc_ir::Transaction> = Arc::new(txn.clone());
-            let state_context = if let Some(roots) = btree_roots {
-                tc_state::state_context(txn_context)
-                    .with_btree_roots(roots.persistent_dir(), roots.txn_root())
-            } else {
-                tc_state::state_context(txn_context)
-            };
-
-            match crate::http::decode_state_bytes_with_context(Bytes::from(bytes), state_context)
+            match crate::http::decode_state_bytes_with_context(Bytes::from(bytes), txn.clone())
                 .await
             {
                 Ok(state) => crate::http::state_response(state),
@@ -155,22 +142,9 @@ fn not_found(path: &str) -> Response {
 }
 
 fn error_response(err: TCError) -> Response {
-    let status = match err.code() {
-        ErrorKind::BadGateway | ErrorKind::BadRequest => StatusCode::BAD_REQUEST,
-        ErrorKind::Conflict => StatusCode::CONFLICT,
-        ErrorKind::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-        ErrorKind::NotFound => StatusCode::NOT_FOUND,
-        ErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-
-    hyper::Response::builder()
-        .status(status)
-        .header(crate::http::header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(err.message().to_string()))
-        .unwrap()
+    crate::http::tc_error_response(err)
 }
 
-fn state_response(state: tc_state::State) -> Response {
+fn state_response(state: crate::State) -> Response {
     crate::http::state_response(state)
 }

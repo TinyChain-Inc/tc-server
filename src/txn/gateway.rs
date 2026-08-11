@@ -1,8 +1,8 @@
+use crate::State;
 use futures::future::BoxFuture;
 use pathlink::Link;
 use tc_error::TCError;
-use tc_state::State;
-use tc_value::Value;
+use tc_ir::Scalar;
 
 use crate::gateway::RpcGateway;
 
@@ -13,7 +13,7 @@ impl RpcGateway for TxnHandle {
         &self,
         target: Link,
         txn: TxnHandle,
-        key: Value,
+        key: Scalar,
     ) -> BoxFuture<'static, tc_error::TCResult<State>> {
         match &self.resolver {
             Some(resolver) => resolver.get(target, txn, key),
@@ -27,7 +27,7 @@ impl RpcGateway for TxnHandle {
         &self,
         target: Link,
         txn: TxnHandle,
-        key: Value,
+        key: Scalar,
         value: State,
     ) -> BoxFuture<'static, tc_error::TCResult<()>> {
         match &self.resolver {
@@ -56,7 +56,7 @@ impl RpcGateway for TxnHandle {
         &self,
         target: Link,
         txn: TxnHandle,
-        key: Value,
+        key: Scalar,
     ) -> BoxFuture<'static, tc_error::TCResult<()>> {
         match &self.resolver {
             Some(resolver) => resolver.delete(target, txn, key),

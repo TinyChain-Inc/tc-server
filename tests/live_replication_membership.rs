@@ -1,22 +1,20 @@
 use std::net::TcpListener;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hyper::{Body, Client, Request, StatusCode};
 use pathlink::Link;
 use tc_ir::{Claim, LibrarySchema, NetworkTime, TxnId};
 use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore, Token};
-use tinychain::http::{HttpServer, host_handler_with_public_keys};
+use tinychain::http::{HttpRouter, HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
 use tinychain::library::CompiledLibraryPackage;
-use tinychain::library::http::{build_http_library_module, http_library_handlers};
+use tinychain::library::http::build_http_library_module;
 use tinychain::replication::{
-    PeerMembership, ReplicationIssuer, discover_library_paths, export_handler,
-    fetch_compiled_library_package, live_replicating_finalize_hook,
-    live_replicating_install_put_handler, parse_psk_keys, replication_token_handler,
-    request_replication_token,
+    ClusterGateway, HttpClusterGateway, PeerMembership, ReplicationIssuer, export_handler,
+    live_replicating_finalize_hook, live_replicating_install_put_handler, parse_psk_keys,
+    replication_token_handler,
 };
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
@@ -57,7 +55,8 @@ async fn discover_library_paths_lists_installed_libraries() {
     install_with_write_token(&server, &schema_a).await;
     install_with_write_token(&server, &schema_b).await;
 
-    let mut paths = discover_library_paths(&format!("http://{}", server.addr))
+    let mut paths = HttpClusterGateway::new()
+        .discover_library_paths(&format!("http://{}", server.addr))
         .await
         .expect("discover paths");
     paths.sort();
@@ -98,8 +97,7 @@ async fn live_replicated_install_retry_finalizes_after_peer_recovers() {
     .await;
 
     let schema = sample_schema("/lib/example-devco/live-retry/0.1.0");
-    let token = token_for_schema(&actor, &schema, USER_WRITE);
-    let txn_id = begin_transaction(primary.addr, token).await;
+    let txn_id = new_txn_id();
     let txn_token = token_for_schema_and_txn(&actor, &schema, USER_WRITE, txn_id);
     let response = put_library_definition(
         primary.addr,
@@ -169,8 +167,7 @@ async fn live_replicated_install_prepare_fails_when_peer_unavailable() {
     peer_b_proxy.set_enabled(false);
 
     let schema = sample_schema("/lib/example-devco/live-prepare-fail/0.1.0");
-    let token = token_for_schema(&actor, &schema, USER_WRITE);
-    let txn_id = begin_transaction(primary.addr, token).await;
+    let txn_id = new_txn_id();
     let txn_token = token_for_schema_and_txn(&actor, &schema, USER_WRITE, txn_id);
     let response = put_library_definition(
         primary.addr,
@@ -208,7 +205,7 @@ impl Drop for RunningServer {
 
 struct TcpProxy {
     addr: std::net::SocketAddr,
-    enabled: Arc<AtomicBool>,
+    availability: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -218,37 +215,41 @@ impl TcpProxy {
             .await
             .expect("proxy listener");
         let addr = listener.local_addr().expect("proxy addr");
-        let enabled = Arc::new(AtomicBool::new(true));
-        let enabled_for_task = Arc::clone(&enabled);
+        let (availability, _) = tokio::sync::watch::channel(true);
+        let availability_for_task = availability.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut inbound, _)) = listener.accept().await else {
                     break;
                 };
 
-                if !enabled_for_task.load(Ordering::SeqCst) {
+                if !*availability_for_task.borrow() {
                     drop(inbound);
                     continue;
                 }
 
+                let mut availability = availability_for_task.subscribe();
                 tokio::spawn(async move {
                     let Ok(mut outbound) = TcpStream::connect(target).await else {
                         return;
                     };
-                    let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                    tokio::select! {
+                        _ = copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = availability.changed() => {}
+                    }
                 });
             }
         });
 
         Self {
             addr,
-            enabled,
+            availability,
             task,
         }
     }
 
     fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::SeqCst);
+        self.availability.send_replace(enabled);
     }
 }
 
@@ -301,11 +302,14 @@ async fn start_server_with_listener(
     listener: TcpListener,
 ) -> RunningServer {
     let schema = tinychain::library::default_library_schema();
-    let module = build_http_library_module(schema, storage_root)
+    let storage = tinychain::HostStorage::new(&tinychain::HostLimits::default().storage);
+    let store = match storage_root {
+        Some(path) => Some(storage.library_store(path).await.expect("library store")),
+        None => None,
+    };
+    let module = build_http_library_module(schema, store)
         .await
         .expect("module");
-    let handlers = http_library_handlers(&module);
-
     let host = Link::from_str("/host").expect("host link");
     let actor =
         Actor::new_falcon512(format!("installer-{label}")).expect("generate Falcon-512 actor");
@@ -325,18 +329,21 @@ async fn start_server_with_listener(
         .with_host_id(format!("live-replication-{label}"))
         .with_http_rpc_gateway()
         .with_rjwt_keyring_token_verifier(keyring)
-        .with_library_module(module.clone(), handlers)
-        .with_service_handler(|_req| async move { hyper::Response::new(Body::empty()) })
-        .with_kernel_handler(combine_host_handlers(
-            host_handler_with_public_keys(public_keys),
-            replication_token_handler(issuer.clone()),
-            export_handler(module),
-        ))
-        .with_health_handler(|_req| async move { hyper::Response::new(Body::empty()) })
+        .with_library_module(module.clone())
         .finish();
 
     let addr = listener.local_addr().expect("addr");
-    let server = HttpServer::new(kernel);
+    let router = HttpRouter::new(
+        module.clone(),
+        |_req| async move { hyper::Response::new(Body::empty()) },
+        combine_host_handlers(
+            host_handler_with_public_keys(public_keys),
+            replication_token_handler(issuer.clone()),
+            export_handler(module),
+        ),
+        |_req| async move { hyper::Response::new(Body::empty()) },
+    );
+    let server = HttpServer::new(kernel, router);
     let task = tokio::spawn(async move {
         let _ = server.serve_listener(listener).await;
     });
@@ -368,11 +375,14 @@ async fn start_replicating_server_with_listener(
     listener: TcpListener,
 ) -> RunningServer {
     let schema = tinychain::library::default_library_schema();
-    let module = build_http_library_module(schema, storage_root)
+    let storage = tinychain::HostStorage::new(&tinychain::HostLimits::default().storage);
+    let store = match storage_root {
+        Some(path) => Some(storage.library_store(path).await.expect("library store")),
+        None => None,
+    };
+    let module = build_http_library_module(schema, store)
         .await
         .expect("module");
-    let handlers = http_library_handlers(&module);
-
     let host = Link::from_str("/host").expect("host link");
     let keyring = KeyringActorResolver::default().with_actor(host.clone(), actor.clone());
     let public_keys = PublicKeyStore::default();
@@ -386,28 +396,32 @@ async fn start_replicating_server_with_listener(
         public_keys.clone(),
     ));
     let membership = PeerMembership::new(peers);
+    let gateway = HttpClusterGateway::new();
     let live_put =
-        live_replicating_install_put_handler(module.clone(), membership.clone(), keys.clone());
-    let finalize_hook = live_replicating_finalize_hook(module.clone());
+        live_replicating_install_put_handler(module.clone(), membership.clone(), gateway.clone());
+    let finalize_hook = live_replicating_finalize_hook(module.clone(), gateway);
 
     let kernel = Kernel::builder()
         .with_host_id(format!("live-replication-{label}"))
         .with_http_rpc_gateway()
         .with_rjwt_keyring_token_verifier(keyring)
-        .with_library_module(module.clone(), handlers)
-        .with_lib_put_handler(live_put)
+        .with_library_module(module.clone())
         .with_txn_finalize_hook(finalize_hook)
-        .with_service_handler(|_req| async move { hyper::Response::new(Body::empty()) })
-        .with_kernel_handler(combine_host_handlers(
-            host_handler_with_public_keys(public_keys),
-            replication_token_handler(issuer.clone()),
-            export_handler(module),
-        ))
-        .with_health_handler(|_req| async move { hyper::Response::new(Body::empty()) })
         .finish();
 
     let addr = listener.local_addr().expect("addr");
-    let server = HttpServer::new(kernel);
+    let router = HttpRouter::new(
+        module.clone(),
+        |_req| async move { hyper::Response::new(Body::empty()) },
+        combine_host_handlers(
+            host_handler_with_public_keys(public_keys),
+            replication_token_handler(issuer.clone()),
+            export_handler(module),
+        ),
+        |_req| async move { hyper::Response::new(Body::empty()) },
+    )
+    .with_library_put_handler(live_put);
+    let server = HttpServer::new(kernel, router);
     let task = tokio::spawn(async move {
         let _ = server.serve_listener(listener).await;
     });
@@ -422,8 +436,7 @@ async fn start_replicating_server_with_listener(
 }
 
 async fn install_with_write_token(server: &RunningServer, schema: &LibrarySchema) {
-    let token = token_for_schema(&server.actor, schema, USER_WRITE);
-    let txn_id = begin_transaction(server.addr, token).await;
+    let txn_id = new_txn_id();
     let txn_token = token_for_schema_and_txn(&server.actor, schema, USER_WRITE, txn_id);
     let definition = library_definition_for_schema(schema);
     let response = put_library_definition(
@@ -443,28 +456,17 @@ async fn fetch_compiled_package_for_schema(
     schema: &LibrarySchema,
 ) -> CompiledLibraryPackage {
     let peer = format!("http://{}", server.addr);
-    let token = request_replication_token(&peer, &schema.id().to_string(), &server.keys)
+    let gateway = HttpClusterGateway::new();
+    let token = gateway
+        .request_replication_token(&peer, &schema.id().to_string(), &server.keys)
         .await
         .expect("replication token");
 
-    fetch_compiled_library_package(&peer, &token)
+    gateway
+        .fetch_compiled_library_package(&peer, &token)
         .await
         .expect("export request")
         .expect("export compiled package")
-}
-
-fn token_for_schema(actor: &Actor, schema: &LibrarySchema, mask: umask::Mode) -> String {
-    let host = Link::from_str("/host").expect("host link");
-    let claim = Claim::new(schema.id().clone(), mask);
-    let token = Token::new(
-        host,
-        std::time::SystemTime::now(),
-        Duration::from_secs(30),
-        actor.id().clone(),
-        claim,
-    );
-    let signed = actor.sign_token(token).expect("sign token");
-    signed.into_jwt()
 }
 
 fn token_for_schema_and_txn(
@@ -494,24 +496,12 @@ fn token_for_schema_and_txn(
         .into_jwt()
 }
 
-async fn begin_transaction(addr: std::net::SocketAddr, bearer: String) -> TxnId {
+fn new_txn_id() -> TxnId {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("time")
         .as_nanos() as u64;
-    let txn_id = TxnId::from_parts(NetworkTime::from_nanos(now), 0);
-    let request = Request::builder()
-        .method("GET")
-        .uri(format!("http://{addr}/lib?txn_id={txn_id}"))
-        .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
-        .body(Body::empty())
-        .expect("begin request");
-    let response = Client::new()
-        .request(request)
-        .await
-        .expect("begin response");
-    assert_eq!(response.status(), StatusCode::OK);
-    txn_id
+    TxnId::from_parts(NetworkTime::from_nanos(now), 0)
 }
 
 async fn finalize_install(
@@ -555,13 +545,13 @@ async fn put_library_definition(
 }
 
 fn combine_host_handlers(
-    public: impl tinychain::KernelHandler,
-    token: impl tinychain::KernelHandler,
-    export: impl tinychain::KernelHandler,
-) -> impl tinychain::KernelHandler {
-    let public: Arc<dyn tinychain::KernelHandler> = Arc::new(public);
-    let token: Arc<dyn tinychain::KernelHandler> = Arc::new(token);
-    let export: Arc<dyn tinychain::KernelHandler> = Arc::new(export);
+    public: impl tinychain::http::HttpHandler,
+    token: impl tinychain::http::HttpHandler,
+    export: impl tinychain::http::HttpHandler,
+) -> impl tinychain::http::HttpHandler {
+    let public: Arc<dyn tinychain::http::HttpHandler> = Arc::new(public);
+    let token: Arc<dyn tinychain::http::HttpHandler> = Arc::new(token);
+    let export: Arc<dyn tinychain::http::HttpHandler> = Arc::new(export);
 
     move |req: tinychain::Request| {
         let path = req.uri().path().to_string();

@@ -1,48 +1,18 @@
-use std::{fmt, sync::Arc};
+use crate::State;
+use tc_ir::Method;
 
-use futures::future::BoxFuture;
-use tc_error::TCResult;
-
-use crate::{Request, Response};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Method {
-    Get,
-    Put,
-    Post,
-    Delete,
+/// A transport-neutral local route invocation.
+pub struct KernelRequest {
+    pub method: Method,
+    pub path: pathlink::Link,
+    /// `None` is an absent request body; `Some(State::None)` is an explicit
+    /// runtime value.
+    pub body: Option<State>,
+    pub txn: crate::txn::TxnHandle,
 }
 
-impl Method {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Method::Get => "GET",
-            Method::Put => "PUT",
-            Method::Post => "POST",
-            Method::Delete => "DELETE",
-        }
-    }
+/// A transaction bound for native execution.
+pub(crate) struct BoundTransaction {
+    pub(crate) txn: crate::txn::TxnHandle,
+    pub(crate) implicit: bool,
 }
-
-impl fmt::Display for Method {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-pub trait KernelHandler: Send + Sync + 'static {
-    fn call(&self, req: Request) -> BoxFuture<'static, Response>;
-}
-
-impl<F, Fut> KernelHandler for F
-where
-    F: Fn(Request) -> Fut + Send + Sync + 'static,
-    Fut: futures::Future<Output = Response> + Send + 'static,
-{
-    fn call(&self, req: Request) -> BoxFuture<'static, Response> {
-        Box::pin((self)(req))
-    }
-}
-
-pub type TxnFinalizeHook =
-    Arc<dyn Fn(crate::txn::TxnHandle, bool) -> BoxFuture<'static, TCResult<()>> + Send + Sync>;

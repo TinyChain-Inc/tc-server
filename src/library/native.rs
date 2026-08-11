@@ -1,12 +1,6 @@
 use std::sync::Arc;
 
-use tc_error::TCError;
-use tc_ir::{
-    Dir, HandleDelete, HandleGet, HandlePost, HandlePut, Library, LibraryModule, LibrarySchema,
-};
-use tc_value::Value;
-
-use crate::txn::TxnHandle;
+use tc_ir::{Dir, Library, LibraryModule, LibrarySchema};
 
 #[derive(Clone)]
 pub struct NativeLibrary<H> {
@@ -16,9 +10,9 @@ pub struct NativeLibrary<H> {
 
 impl<H> NativeLibrary<H>
 where
-    H: Clone,
+    H: Clone + Send + Sync,
 {
-    pub fn new(module: LibraryModule<TxnHandle, Dir<H>>) -> Self {
+    pub fn new(module: LibraryModule<crate::State, Dir<H>>) -> Self {
         Self {
             schema: module.schema().clone(),
             routes: Arc::new(module.routes().clone()),
@@ -32,47 +26,4 @@ where
     pub fn routes(&self) -> Arc<Dir<H>> {
         Arc::clone(&self.routes)
     }
-}
-
-pub trait NativeLibraryHandler: HandleGet<TxnHandle, Request = Value, RequestContext = (), Response = Value, Error = TCError>
-    + HandlePut<TxnHandle, Request = Value, RequestContext = (), Response = Value, Error = TCError>
-    + HandlePost<TxnHandle, Request = Value, RequestContext = (), Response = Value, Error = TCError>
-    + HandleDelete<TxnHandle, Request = Value, RequestContext = (), Response = Value, Error = TCError>
-    + Clone
-    + Send
-    + Sync
-    + 'static
-{
-}
-
-impl<T> NativeLibraryHandler for T where
-    T: HandleGet<
-            TxnHandle,
-            Request = Value,
-            RequestContext = (),
-            Response = Value,
-            Error = TCError,
-        > + HandlePut<
-            TxnHandle,
-            Request = Value,
-            RequestContext = (),
-            Response = Value,
-            Error = TCError,
-        > + HandlePost<
-            TxnHandle,
-            Request = Value,
-            RequestContext = (),
-            Response = Value,
-            Error = TCError,
-        > + HandleDelete<
-            TxnHandle,
-            Request = Value,
-            RequestContext = (),
-            Response = Value,
-            Error = TCError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static
-{
 }

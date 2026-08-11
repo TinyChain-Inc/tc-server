@@ -8,7 +8,18 @@ use hyper::{Body, Client, Request, StatusCode};
 use pathlink::Link;
 use tc_ir::{Claim, LibrarySchema, NetworkTime, TxnId};
 use tinychain::auth::{Actor, Token};
+use tinychain::http::{HttpHandler, HttpRouter, Response};
+use tinychain::library::LibraryRegistry;
 use tinychain::replication::is_peer_membership_path;
+
+pub fn http_router(registry: Arc<LibraryRegistry>, host: impl HttpHandler) -> HttpRouter {
+    HttpRouter::new(
+        registry,
+        |_req| async move { Response::new(Body::empty()) },
+        host,
+        |_req| async move { Response::new(Body::empty()) },
+    )
+}
 
 pub fn token_for_schema(actor: &Actor, schema: &LibrarySchema, mask: umask::Mode) -> String {
     let host = Link::from_str("/host").expect("host link");
@@ -52,24 +63,12 @@ pub fn token_for_schema_and_txn(
     token.into_jwt()
 }
 
-pub async fn begin_transaction(addr: std::net::SocketAddr, bearer: String) -> TxnId {
+pub fn new_txn_id() -> TxnId {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("time")
         .as_nanos() as u64;
-    let txn_id = TxnId::from_parts(NetworkTime::from_nanos(now), 0);
-    let request = Request::builder()
-        .method("GET")
-        .uri(format!("http://{addr}/lib?txn_id={txn_id}"))
-        .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
-        .body(Body::empty())
-        .expect("begin request");
-    let response = Client::new()
-        .request(request)
-        .await
-        .expect("begin response");
-    assert_eq!(response.status(), StatusCode::OK);
-    txn_id
+    TxnId::from_parts(NetworkTime::from_nanos(now), 0)
 }
 
 pub async fn put_library_definition(
@@ -127,13 +126,13 @@ pub async fn get_library_status(addr: std::net::SocketAddr, path: &str) -> Statu
 }
 
 pub fn combine_host_handlers(
-    public: impl tinychain::KernelHandler,
-    token: impl tinychain::KernelHandler,
-    export: impl tinychain::KernelHandler,
-) -> impl tinychain::KernelHandler {
-    let public: Arc<dyn tinychain::KernelHandler> = Arc::new(public);
-    let token: Arc<dyn tinychain::KernelHandler> = Arc::new(token);
-    let export: Arc<dyn tinychain::KernelHandler> = Arc::new(export);
+    public: impl tinychain::http::HttpHandler,
+    token: impl tinychain::http::HttpHandler,
+    export: impl tinychain::http::HttpHandler,
+) -> impl tinychain::http::HttpHandler {
+    let public: Arc<dyn tinychain::http::HttpHandler> = Arc::new(public);
+    let token: Arc<dyn tinychain::http::HttpHandler> = Arc::new(token);
+    let export: Arc<dyn tinychain::http::HttpHandler> = Arc::new(export);
 
     move |req: tinychain::Request| {
         let path = req.uri().path().to_string();
@@ -151,15 +150,15 @@ pub fn combine_host_handlers(
 }
 
 pub fn combine_host_handlers_with_peers(
-    public: impl tinychain::KernelHandler,
-    token: impl tinychain::KernelHandler,
-    export: impl tinychain::KernelHandler,
-    peers: impl tinychain::KernelHandler,
-) -> impl tinychain::KernelHandler {
-    let public: Arc<dyn tinychain::KernelHandler> = Arc::new(public);
-    let token: Arc<dyn tinychain::KernelHandler> = Arc::new(token);
-    let export: Arc<dyn tinychain::KernelHandler> = Arc::new(export);
-    let peers: Arc<dyn tinychain::KernelHandler> = Arc::new(peers);
+    public: impl tinychain::http::HttpHandler,
+    token: impl tinychain::http::HttpHandler,
+    export: impl tinychain::http::HttpHandler,
+    peers: impl tinychain::http::HttpHandler,
+) -> impl tinychain::http::HttpHandler {
+    let public: Arc<dyn tinychain::http::HttpHandler> = Arc::new(public);
+    let token: Arc<dyn tinychain::http::HttpHandler> = Arc::new(token);
+    let export: Arc<dyn tinychain::http::HttpHandler> = Arc::new(export);
+    let peers: Arc<dyn tinychain::http::HttpHandler> = Arc::new(peers);
 
     move |req: tinychain::Request| {
         let path = req.uri().path().to_string();

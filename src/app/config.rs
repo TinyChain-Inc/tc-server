@@ -8,6 +8,7 @@ use tinychain::replication::parse_psk_list;
 
 const DEFAULT_BIND: &str = "0.0.0.0:8702";
 const DEFAULT_DATA_DIR: &str = "/tmp/tinychain";
+const DEFAULT_WORKSPACE: &str = "/tmp/tinychain-workspace";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BootstrapReadinessMode {
@@ -72,6 +73,9 @@ pub(crate) struct Config {
 
     #[arg(long, env = "TC_DATA_DIR", default_value = DEFAULT_DATA_DIR)]
     pub(crate) data_dir: PathBuf,
+
+    #[arg(long, env = "TC_WORKSPACE", default_value = DEFAULT_WORKSPACE)]
+    pub(crate) workspace: PathBuf,
 
     #[arg(long, env = "TC_HOST_ID", default_value = "tc-server")]
     pub(crate) host_id: String,

@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures::FutureExt;
 use hyper::{Body, Request, Response, StatusCode};
 
-use tinychain::kernel::KernelHandler;
+use tinychain::http::HttpHandler;
 use tinychain::replication::is_peer_membership_path;
 
-pub(crate) fn ok_handler() -> impl KernelHandler {
+pub(crate) fn ok_handler() -> impl HttpHandler {
     |_req: Request<Body>| {
         async move {
             Response::builder()
@@ -19,7 +19,7 @@ pub(crate) fn ok_handler() -> impl KernelHandler {
     }
 }
 
-pub(crate) fn health_handler(bootstrap_ready: Arc<AtomicBool>) -> impl KernelHandler {
+pub(crate) fn health_handler(bootstrap_ready: Arc<AtomicBool>) -> impl HttpHandler {
     move |_req: Request<Body>| {
         let bootstrap_ready = Arc::clone(&bootstrap_ready);
         async move {
@@ -40,11 +40,11 @@ pub(crate) fn health_handler(bootstrap_ready: Arc<AtomicBool>) -> impl KernelHan
 }
 
 pub(crate) fn combined_host_handler(
-    public: Arc<dyn KernelHandler>,
-    token: Arc<dyn KernelHandler>,
-    export: Arc<dyn KernelHandler>,
-    peers: Arc<dyn KernelHandler>,
-) -> impl KernelHandler {
+    public: Arc<dyn HttpHandler>,
+    token: Arc<dyn HttpHandler>,
+    export: Arc<dyn HttpHandler>,
+    peers: Arc<dyn HttpHandler>,
+) -> impl HttpHandler {
     move |req: Request<Body>| {
         let path = req.uri().path().to_string();
         let public = Arc::clone(&public);

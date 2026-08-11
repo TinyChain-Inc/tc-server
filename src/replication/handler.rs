@@ -5,7 +5,7 @@ use aes_gcm_siv::aead::rand_core::RngCore;
 use futures::FutureExt;
 use hyper::{Body, Request, StatusCode};
 
-use crate::KernelHandler;
+use crate::http::HttpHandler;
 use crate::library::{LibraryRegistry, encode_compiled_library_package};
 use crate::txn::TxnHandle;
 
@@ -15,7 +15,7 @@ use super::http_util::{
 };
 use super::{LIBRARY_EXPORT_PATH, ReplicationIssuer, TOKEN_PATH};
 
-pub fn replication_token_handler(issuer: Arc<ReplicationIssuer>) -> impl KernelHandler {
+pub fn replication_token_handler(issuer: Arc<ReplicationIssuer>) -> impl HttpHandler {
     move |req: Request<Body>| {
         let issuer = issuer.clone();
         async move {
@@ -62,7 +62,7 @@ pub fn replication_token_handler(issuer: Arc<ReplicationIssuer>) -> impl KernelH
     }
 }
 
-pub fn export_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
+pub fn export_handler(registry: Arc<LibraryRegistry>) -> impl HttpHandler {
     move |req: Request<Body>| {
         let registry = Arc::clone(&registry);
         async move {

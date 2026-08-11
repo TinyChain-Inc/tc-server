@@ -5,8 +5,8 @@ use std::str::FromStr;
 use tc_ir::{Claim, LibrarySchema};
 use umask;
 
-#[test]
-fn picks_longest_matching_claim_for_egress() {
+#[tokio::test]
+async fn picks_longest_matching_claim_for_egress() {
     let registry = LibraryRegistry::new(None, BTreeMap::new());
 
     let parent_id = format!("{}/acme/parent/1.0.0", crate::uri::LIB_ROOT);
@@ -22,15 +22,19 @@ fn picks_longest_matching_claim_for_egress() {
         vec![],
     );
 
-    futures::executor::block_on(registry.insert_schema(parent.clone())).expect("insert parent");
-    futures::executor::block_on(registry.insert_schema(child.clone())).expect("insert child");
+    registry
+        .insert_schema(parent.clone())
+        .await
+        .expect("insert parent");
+    registry
+        .insert_schema(child.clone())
+        .await
+        .expect("insert child");
 
-    let txn = crate::txn::TxnManager::with_host_id("test-claim")
-        .begin()
-        .with_claims(vec![
-            Claim::new(parent.id().clone(), umask::USER_READ),
-            Claim::new(child.id().clone(), umask::USER_READ),
-        ]);
+    let txn = crate::txn::test_txn("test-claim").with_claims(vec![
+        Claim::new(parent.id().clone(), umask::USER_READ),
+        Claim::new(child.id().clone(), umask::USER_READ),
+    ]);
 
     let resolved = registry.schema_for_txn(&txn).expect("schema");
 

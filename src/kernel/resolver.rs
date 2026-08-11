@@ -1,24 +1,20 @@
-use std::{str::FromStr, sync::Arc};
+use std::str::FromStr;
+use std::sync::Arc;
 
-use futures::{TryStreamExt, future::BoxFuture};
+use futures::future::BoxFuture;
 
+use super::Method;
 use crate::egress::EgressPolicy;
 use crate::library::LibraryRegistry;
-use crate::txn_server::TxnServer;
-use crate::{Body, Request, Response};
-
-use super::{KernelHandler, Method};
+use crate::txn::TxnServer;
+use crate::{KernelRequest, State};
 
 #[derive(Clone)]
 pub(super) struct KernelTxnResolver {
     pub(super) gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     pub(super) library_registry: Option<Arc<LibraryRegistry>>,
     pub(super) egress: EgressPolicy,
-    pub(super) token_verifier: Arc<dyn crate::auth::TokenVerifier>,
-    pub(super) txn_manager: crate::txn::TxnManager,
     pub(super) txn_server: TxnServer,
-    pub(super) lib_route_handler: Option<Arc<dyn KernelHandler>>,
-    pub(super) host_handler: Arc<dyn KernelHandler>,
 }
 
 enum OutboundTarget {
@@ -33,217 +29,95 @@ impl KernelTxnResolver {
         target: &str,
         txn: &crate::txn::TxnHandle,
     ) -> tc_error::TCResult<String> {
-        let token = txn.raw_token().ok_or_else(|| {
+        let claim = token_claim_for_target(method, target).ok_or_else(|| {
             tc_error::TCError::unauthorized(
-                "cross-host dependency call requires transaction-chained bearer auth",
+                "cross-host dependency target has no canonical component root",
             )
         })?;
-
-        let ctx = self
-            .token_verifier
-            .verify(token.to_string())
-            .await
-            .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
-
-        if let Ok(owner_id) = crate::txn::owner_id_from_token(txn.id(), &ctx) {
-            if self.txn_manager.get(&txn.id()).is_some() {
-                match self.txn_manager.interpret_request(
-                    Some(txn.id()),
-                    Some(&owner_id),
-                    Some(&ctx.bearer_token),
-                ) {
-                    Ok(crate::txn::TxnFlow::Begin(handle))
-                    | Ok(crate::txn::TxnFlow::Use(handle)) => self.txn_server.touch(handle.id()),
-                    Err(crate::txn::TxnError::NotFound) => {
-                        return Err(tc_error::TCError::bad_request("unknown transaction id"));
-                    }
-                    Err(crate::txn::TxnError::Unauthorized) => {
-                        return Err(tc_error::TCError::unauthorized(
-                            "unauthorized transaction owner",
-                        ));
-                    }
-                };
-            }
-
-            let claim = token_claim_for_target(method, target);
-            let ctx = match claim {
-                Some(claim) => {
-                    if self.txn_manager.get(&txn.id()).is_some() {
-                        let _ = self.txn_manager.record_claim(&txn.id(), claim.clone());
-                    }
-                    if txn.has_signed_token() {
-                        let updated = txn
-                            .grant(
-                                self.txn_manager.protocol_actor(),
-                                self.txn_manager.protocol_host().clone(),
-                                claim.link,
-                                claim.mask,
-                            )
-                            .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
-                        return updated.raw_token().map(str::to_string).ok_or_else(|| {
-                            tc_error::TCError::unauthorized("invalid bearer token")
-                        });
-                    }
-                    self.token_verifier
-                        .grant(ctx, claim)
-                        .await
-                        .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?
-                }
-                None => ctx,
-            };
-
-            Ok(ctx.bearer_token)
-        } else {
-            if crate::txn::has_txn_claim(&ctx) {
-                return Err(tc_error::TCError::unauthorized("invalid bearer token"));
-            }
-
-            if txn.owner_id() != Some(ctx.owner_id.as_str()) {
-                return Err(tc_error::TCError::unauthorized(
-                    "cross-host dependency call requires exact transaction claim",
-                ));
-            }
-
-            let txn_claim = pathlink::Link::from_str(&format!("/txn/{}", txn.id()))
-                .map_err(|_| tc_error::TCError::unauthorized("invalid transaction id"))?;
-            let mut updated = txn
-                .grant(
-                    self.txn_manager.protocol_actor(),
-                    self.txn_manager.protocol_host().clone(),
-                    txn_claim,
-                    umask::USER_EXEC | umask::USER_WRITE,
-                )
-                .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
-
-            if let Some(claim) = token_claim_for_target(method, target) {
-                let _ = self.txn_manager.record_claim(&txn.id(), claim.clone());
-                updated = updated
-                    .grant(
-                        self.txn_manager.protocol_actor(),
-                        self.txn_manager.protocol_host().clone(),
-                        claim.link,
-                        claim.mask,
-                    )
-                    .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
-            }
-
-            updated
-                .raw_token()
-                .map(str::to_string)
-                .ok_or_else(|| tc_error::TCError::unauthorized("invalid bearer token"))
-        }
+        self.txn_server.grant(txn, claim).await
     }
 
-    async fn local_call(
+    async fn local_library(
         &self,
-        method: http::Method,
+        method: Method,
         target: pathlink::Link,
         txn: crate::txn::TxnHandle,
-        body: Body,
-    ) -> tc_error::TCResult<Response> {
-        let mut req = host_request(method, target, body)?;
-        req.extensions_mut().insert(txn);
-
-        let path = req.uri().path().to_string();
-        if path == crate::uri::LIB_ROOT || path.starts_with(crate::uri::LIB_ROOT_PREFIX) {
-            let handler = self
-                .lib_route_handler
-                .clone()
-                .ok_or_else(|| tc_error::TCError::not_found(path.clone()))?;
-            return Ok(handler.call(req).await);
+        body: State,
+    ) -> tc_error::TCResult<State> {
+        let path = target.to_string();
+        let registry = self
+            .library_registry
+            .as_ref()
+            .ok_or_else(|| tc_error::TCError::not_found(path.clone()))?;
+        let (routes, route, is_root) = registry
+            .resolve_native(&path)
+            .ok_or_else(|| tc_error::TCError::not_found(path.clone()))?;
+        if is_root {
+            return Err(tc_error::TCError::not_found(path));
         }
 
-        if path == crate::uri::HOST_ROOT || path.starts_with(crate::uri::HOST_ROOT_PREFIX) {
-            return Ok(self.host_handler.call(req).await);
-        }
-
-        Err(tc_error::TCError::bad_gateway(format!(
-            "no local route handler for {path}"
-        )))
+        super::kernel::execute_native(
+            &routes,
+            &route,
+            KernelRequest {
+                method,
+                path: target,
+                body: Some(body),
+                txn,
+            },
+        )
+        .await
     }
 
     async fn local_get(
         &self,
         target: pathlink::Link,
         txn: crate::txn::TxnHandle,
-        key: tc_value::Value,
-    ) -> tc_error::TCResult<tc_state::State> {
-        let stream = destream_json::encode(key)
-            .map_err(|err| tc_error::TCError::bad_request(err.to_string()))?;
-        let body = Body::wrap_stream(stream.map_err(|err| std::io::Error::other(err.to_string())));
-        let response = self
-            .local_call(http::Method::GET, target, txn, body)
-            .await?;
-        decode_host_state_response(response).await
+        key: tc_ir::Scalar,
+    ) -> tc_error::TCResult<crate::State> {
+        if target.to_string() == crate::uri::HOST_AUTH_CONTEXT {
+            return crate::host::auth_context(&txn);
+        }
+        self.local_library(Method::Get, target, txn, State::from_scalar(key))
+            .await
     }
 
     async fn local_put(
         &self,
         target: pathlink::Link,
         txn: crate::txn::TxnHandle,
-        _key: tc_value::Value,
-        value: tc_state::State,
+        key: tc_ir::Scalar,
+        value: crate::State,
     ) -> tc_error::TCResult<()> {
-        let stream = destream_json::encode(value)
-            .map_err(|err| tc_error::TCError::bad_request(err.to_string()))?;
-        let body = Body::wrap_stream(stream.map_err(|err| std::io::Error::other(err.to_string())));
-        let response = self
-            .local_call(http::Method::PUT, target, txn, body)
-            .await?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-
-        let body = hyper::body::to_bytes(response.into_body())
-            .await
-            .map_err(|err| tc_error::TCError::internal(err.to_string()))?;
-        let message = if body.is_empty() {
-            status.to_string()
-        } else {
-            String::from_utf8_lossy(&body).to_string()
-        };
-        Err(status_to_error(status, message))
+        self.local_library(
+            Method::Put,
+            target,
+            txn,
+            State::Tuple(vec![State::from_scalar(key), value]),
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn local_post(
         &self,
         target: pathlink::Link,
         txn: crate::txn::TxnHandle,
-        params: tc_ir::Map<tc_state::State>,
-    ) -> tc_error::TCResult<tc_state::State> {
-        let stream = destream_json::encode(params)
-            .map_err(|err| tc_error::TCError::bad_request(err.to_string()))?;
-        let body = Body::wrap_stream(stream.map_err(|err| std::io::Error::other(err.to_string())));
-        let response = self
-            .local_call(http::Method::POST, target, txn, body)
-            .await?;
-        decode_host_state_response(response).await
+        params: tc_ir::Map<crate::State>,
+    ) -> tc_error::TCResult<crate::State> {
+        self.local_library(Method::Post, target, txn, State::Map(params))
+            .await
     }
 
     async fn local_delete(
         &self,
         target: pathlink::Link,
         txn: crate::txn::TxnHandle,
-        _key: tc_value::Value,
+        key: tc_ir::Scalar,
     ) -> tc_error::TCResult<()> {
-        let response = self
-            .local_call(http::Method::DELETE, target, txn, Body::empty())
-            .await?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-
-        let body = hyper::body::to_bytes(response.into_body())
+        self.local_library(Method::Delete, target, txn, State::from_scalar(key))
             .await
-            .map_err(|err| tc_error::TCError::internal(err.to_string()))?;
-        let message = if body.is_empty() {
-            status.to_string()
-        } else {
-            String::from_utf8_lossy(&body).to_string()
-        };
-        Err(status_to_error(status, message))
+            .map(|_| ())
     }
 
     async fn prepare_outbound(
@@ -319,8 +193,8 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
         &self,
         target: pathlink::Link,
         txn: crate::txn::TxnHandle,
-        key: tc_value::Value,
-    ) -> BoxFuture<'static, tc_error::TCResult<tc_state::State>> {
+        key: tc_ir::Scalar,
+    ) -> BoxFuture<'static, tc_error::TCResult<crate::State>> {
         let resolver = self.clone();
         Box::pin(async move {
             let (resolved, outbound_txn) = resolver
@@ -331,6 +205,10 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
                     resolver.local_get(target, outbound_txn, key).await
                 }
                 OutboundTarget::Remote(target) => {
+                    let _permit = outbound_txn
+                        .resources()
+                        .admit_outbound(outbound_txn.deadline())
+                        .await?;
                     let gateway = resolver.gateway.clone().ok_or_else(|| {
                         tc_error::TCError::bad_gateway("no RPC gateway configured")
                     })?;
@@ -344,8 +222,8 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
         &self,
         target: pathlink::Link,
         txn: crate::txn::TxnHandle,
-        key: tc_value::Value,
-        value: tc_state::State,
+        key: tc_ir::Scalar,
+        value: crate::State,
     ) -> BoxFuture<'static, tc_error::TCResult<()>> {
         let resolver = self.clone();
         Box::pin(async move {
@@ -357,6 +235,10 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
                     resolver.local_put(target, outbound_txn, key, value).await
                 }
                 OutboundTarget::Remote(target) => {
+                    let _permit = outbound_txn
+                        .resources()
+                        .admit_outbound(outbound_txn.deadline())
+                        .await?;
                     let gateway = resolver.gateway.clone().ok_or_else(|| {
                         tc_error::TCError::bad_gateway("no RPC gateway configured")
                     })?;
@@ -370,12 +252,18 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
         &self,
         target: pathlink::Link,
         txn: crate::txn::TxnHandle,
-        params: tc_ir::Map<tc_state::State>,
-    ) -> BoxFuture<'static, tc_error::TCResult<tc_state::State>> {
+        params: tc_ir::Map<crate::State>,
+    ) -> BoxFuture<'static, tc_error::TCResult<crate::State>> {
         let resolver = self.clone();
         Box::pin(async move {
             if is_scalar_reflect_path(&target) {
-                return dispatch_host_post(resolver.host_handler.clone(), target, params).await;
+                return crate::reflect::execute(KernelRequest {
+                    method: Method::Post,
+                    path: target,
+                    body: Some(State::Map(params)),
+                    txn: txn.clone(),
+                })
+                .await;
             }
             let (resolved, outbound_txn) = resolver
                 .prepare_outbound(Method::Post, &target, &txn)
@@ -385,6 +273,10 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
                     resolver.local_post(target, outbound_txn, params).await
                 }
                 OutboundTarget::Remote(target) => {
+                    let _permit = outbound_txn
+                        .resources()
+                        .admit_outbound(outbound_txn.deadline())
+                        .await?;
                     let gateway = resolver.gateway.clone().ok_or_else(|| {
                         tc_error::TCError::bad_gateway("no RPC gateway configured")
                     })?;
@@ -398,7 +290,7 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
         &self,
         target: pathlink::Link,
         txn: crate::txn::TxnHandle,
-        key: tc_value::Value,
+        key: tc_ir::Scalar,
     ) -> BoxFuture<'static, tc_error::TCResult<()>> {
         let resolver = self.clone();
         Box::pin(async move {
@@ -410,6 +302,10 @@ impl crate::gateway::RpcGateway for KernelTxnResolver {
                     resolver.local_delete(target, outbound_txn, key).await
                 }
                 OutboundTarget::Remote(target) => {
+                    let _permit = outbound_txn
+                        .resources()
+                        .admit_outbound(outbound_txn.deadline())
+                        .await?;
                     let gateway = resolver.gateway.clone().ok_or_else(|| {
                         tc_error::TCError::bad_gateway("no RPC gateway configured")
                     })?;
@@ -444,85 +340,4 @@ pub(super) fn is_scalar_reflect_path(target: &pathlink::Link) -> bool {
         || path == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_FORM)
         || path == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_LAST_ID)
         || path == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_SCALARS)
-}
-
-pub(super) fn is_scalar_reflect_path_str(path: &str) -> bool {
-    let Ok(parsed) = pathlink::PathBuf::from_str(path) else {
-        return false;
-    };
-    parsed == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_CLASS)
-        || parsed == pathlink::PathBuf::from(tc_ir::SCALAR_REFLECT_REF_PARTS)
-        || parsed == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_FORM)
-        || parsed == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_LAST_ID)
-        || parsed == pathlink::PathBuf::from(tc_ir::OPDEF_REFLECT_SCALARS)
-}
-
-pub(super) fn host_request(
-    method: http::Method,
-    target: pathlink::Link,
-    body: Body,
-) -> tc_error::TCResult<Request> {
-    let target = target.to_string();
-    let uri = http::Uri::from_str(&target)
-        .map_err(|err| tc_error::TCError::bad_request(err.to_string()))?;
-    http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .body(body)
-        .map_err(|err| tc_error::TCError::bad_request(err.to_string()))
-}
-
-pub(super) async fn decode_host_state_response(
-    resp: Response,
-) -> tc_error::TCResult<tc_state::State> {
-    use futures::stream;
-
-    let status = resp.status();
-    let body = hyper::body::to_bytes(resp.into_body())
-        .await
-        .map_err(|err| tc_error::TCError::internal(err.to_string()))?;
-
-    if status.is_success() {
-        if body.is_empty() || body.iter().all(|b| b.is_ascii_whitespace()) {
-            return Ok(tc_state::State::None);
-        }
-        let stream = stream::iter(vec![Ok::<bytes::Bytes, std::io::Error>(body)]);
-        return destream_json::try_decode(
-            tc_state::state_context(tc_state::null_transaction()),
-            stream,
-        )
-        .await
-        .map_err(|err| tc_error::TCError::bad_request(err.to_string()));
-    }
-
-    let message = if body.is_empty() {
-        status.to_string()
-    } else {
-        String::from_utf8_lossy(&body).to_string()
-    };
-    Err(status_to_error(status, message))
-}
-
-pub(super) fn status_to_error(status: hyper::StatusCode, message: String) -> tc_error::TCError {
-    match status {
-        hyper::StatusCode::BAD_REQUEST => tc_error::TCError::bad_request(message),
-        hyper::StatusCode::CONFLICT => tc_error::TCError::conflict(message),
-        hyper::StatusCode::METHOD_NOT_ALLOWED => tc_error::TCError::bad_request(message),
-        hyper::StatusCode::NOT_FOUND => tc_error::TCError::not_found(message),
-        hyper::StatusCode::UNAUTHORIZED => tc_error::TCError::unauthorized(message),
-        _ => tc_error::TCError::internal(message),
-    }
-}
-
-pub(super) async fn dispatch_host_post(
-    handler: Arc<dyn KernelHandler>,
-    target: pathlink::Link,
-    params: tc_ir::Map<tc_state::State>,
-) -> tc_error::TCResult<tc_state::State> {
-    let stream = destream_json::encode(params)
-        .map_err(|err| tc_error::TCError::bad_request(err.to_string()))?;
-    let body = Body::wrap_stream(stream.map_err(|err| std::io::Error::other(err.to_string())));
-    let req = host_request(http::Method::POST, target, body)?;
-    let resp = handler.call(req).await;
-    decode_host_state_response(resp).await
 }

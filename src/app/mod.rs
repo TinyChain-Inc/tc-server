@@ -8,13 +8,12 @@ use pathlink::Link;
 
 use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore, RjwtTokenVerifier};
 use tinychain::http::{
-    HttpKernelConfig, HttpServer, build_http_kernel_and_registry_with_config_and_builder,
+    HttpKernelConfig, HttpRuntime, HttpServer, build_http_runtime_with_config,
     host_handler_with_public_keys,
 };
-use tinychain::kernel::KernelHandler;
 use tinychain::replication::{
-    PeerMembership, PeerRoutes, ReplicationIssuer, export_handler, live_replicating_finalize_hook,
-    live_replicating_install_put_handler, parse_psk_keys, peer_membership_handler,
+    HttpClusterGateway, PeerMembership, PeerRoutes, ReplicationIssuer, export_handler,
+    live_replicating_finalize_hook, parse_psk_keys, peer_membership_handler,
     replication_token_handler,
 };
 
@@ -40,13 +39,19 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse()?;
     let bind = config.bind_addr()?;
     tokio::fs::create_dir_all(&config.data_dir).await?;
+    tokio::fs::create_dir_all(&config.workspace).await?;
+    let limits = tinychain::HostLimits::default();
+    let storage = tinychain::storage::HostStorage::new(&limits.storage);
+    let workspace = storage.workspace(&config.workspace)?;
+    let library_store = storage.library_store(&config.data_dir).await?;
 
     let kernel_config = HttpKernelConfig::default()
-        .with_data_dir(config.data_dir.clone())
+        .with_library_store(library_store)
+        .with_workspace(workspace)
         .with_initial_schema(tinychain::library::default_library_schema())
         .with_host_id(config.host_id.clone())
         .with_txn_ttl(Duration::from_secs(config.request_ttl_secs))
-        .with_max_request_bytes_unauth(config.max_request_bytes);
+        .with_max_request_bytes(config.max_request_bytes);
 
     let peer_routes = PeerRoutes::new(&config.cluster_root)?;
     let trusted_installers = load_trusted_installers(&config)?;
@@ -100,62 +105,59 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let membership = PeerMembership::new(peers.clone());
+    let replication_gateway = HttpClusterGateway::new();
 
     let keyring_for_kernel = keyring.clone();
-    let issuer_for_kernel = issuer.clone();
-    let public_keys_for_kernel = public_keys.clone();
     let installer_policy_for_kernel = installer_policy.clone();
     let membership_for_kernel = membership.clone();
     let replication_actor_id_for_kernel = replication_actor_id.clone();
-    let peer_routes_for_kernel = peer_routes.clone();
-    let keys_for_kernel = keys.clone();
     let bootstrap_ready = Arc::new(AtomicBool::new(
         config.bootstrap_readiness == BootstrapReadinessMode::Lenient,
     ));
     let bootstrap_ready_for_kernel = Arc::clone(&bootstrap_ready);
-    let (kernel, registry) = build_http_kernel_and_registry_with_config_and_builder(
+    let finalize_gateway = replication_gateway.clone();
+    let runtime = build_http_runtime_with_config(
         kernel_config,
         ok_handler(),
         health_handler(bootstrap_ready_for_kernel),
+        |registry| {
+            combined_host_handler(
+                Arc::new(host_handler_with_public_keys(public_keys.clone())),
+                Arc::new(replication_token_handler(issuer.clone())),
+                Arc::new(export_handler(registry)),
+                Arc::new(peer_membership_handler(
+                    membership.clone(),
+                    issuer.clone(),
+                    peer_routes.clone(),
+                )),
+            )
+        },
         move |registry, builder| {
-            let public: Arc<dyn KernelHandler> = Arc::new(host_handler_with_public_keys(
-                public_keys_for_kernel.clone(),
-            ));
-            let token: Arc<dyn KernelHandler> =
-                Arc::new(replication_token_handler(issuer_for_kernel.clone()));
-            let export: Arc<dyn KernelHandler> = Arc::new(export_handler(registry.clone()));
-            let peers_handler: Arc<dyn KernelHandler> = Arc::new(peer_membership_handler(
-                membership_for_kernel.clone(),
-                issuer_for_kernel.clone(),
-                peer_routes_for_kernel.clone(),
-            ));
-            let host_handler = combined_host_handler(public, token, export, peers_handler);
             let verifier = TrustedInstallerTokenVerifier::new(
                 RjwtTokenVerifier::new(Arc::new(keyring_for_kernel)),
                 installer_policy_for_kernel,
                 membership_for_kernel.clone(),
                 replication_actor_id_for_kernel.clone(),
             );
-            let live_put = live_replicating_install_put_handler(
-                registry.clone(),
-                membership_for_kernel.clone(),
-                keys_for_kernel.clone(),
-            );
-            let finalize_hook = live_replicating_finalize_hook(registry.clone());
+            let finalize_hook =
+                live_replicating_finalize_hook(registry.clone(), finalize_gateway.clone());
 
             builder
                 .with_protocol_actor(
                     Link::from_str("/host").expect("host link"),
                     local_host_actor,
                 )
-                .with_kernel_handler(host_handler)
-                .with_lib_put_handler(live_put)
                 .with_txn_finalize_hook(finalize_hook)
                 .with_token_verifier(verifier)
         },
     )
     .await?;
 
+    let HttpRuntime {
+        kernel,
+        router,
+        registry,
+    } = runtime;
     let bootstrap_registry = Arc::clone(&registry);
     let bootstrap_membership = membership.clone();
     let bootstrap_peers = peers.clone();
@@ -166,6 +168,7 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_retry_delay = Duration::from_secs(config.bootstrap_retry_delay_secs);
     let bootstrap_self_peer = self_peer(bind, config.advertise_ip);
     let bootstrap_issuer = issuer.clone();
+    let bootstrap_gateway = replication_gateway.clone();
     let bootstrap_readiness_mode = config.bootstrap_readiness;
     let bootstrap_ready_signal = Arc::clone(&bootstrap_ready);
     tokio::spawn(async move {
@@ -178,6 +181,7 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
             replicate: bootstrap_replicate,
             self_peer: bootstrap_self_peer,
             issuer: &bootstrap_issuer,
+            gateway: &bootstrap_gateway,
         };
 
         let outcome = run_bootstrap_with_retries(
@@ -250,9 +254,7 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut server = HttpServer::new_with_limits(kernel, config.max_request_bytes);
-    server = server.with_btree_decode_roots_from_data_dir(&config.data_dir)?;
-    server.serve(bind).await?;
+    HttpServer::new(kernel, router).serve(bind).await?;
     Ok(())
 }
 

@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
     fmt,
-    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -13,6 +12,7 @@ use umask::Mode;
 
 use crate::auth::{Actor, SignedToken, Token};
 use crate::gateway::RpcGateway;
+use crate::workspace::Workspace;
 
 #[derive(Clone, Debug)]
 pub struct AuthClaimContext {
@@ -66,9 +66,41 @@ pub struct TxnHandle {
     pub(super) ttl: Duration,
     pub(super) token: Option<Arc<SignedToken>>,
     pub(super) auth_context: Option<AuthContext>,
+    pub(super) workspace: Option<Workspace>,
+    pub(super) workspace_path: Vec<String>,
+    pub(super) resources: crate::HostResources,
+    pub(super) deadline: crate::Deadline,
 }
 
 impl TxnHandle {
+    pub fn subcontext(&self, name: impl Into<String>) -> Self {
+        let mut txn = self.clone();
+        txn.workspace_path.push(name.into());
+        txn
+    }
+
+    pub fn subcontext_unique(&self) -> Self {
+        let workspace = self
+            .workspace
+            .as_ref()
+            .expect("a local transaction workspace is required for collection storage");
+
+        self.subcontext("tmp").subcontext(workspace.unique_name())
+    }
+
+    pub(crate) fn with_deadline(&self, deadline: crate::Deadline) -> Self {
+        let mut txn = self.clone();
+        txn.deadline = deadline;
+        txn
+    }
+
+    pub(crate) fn resources(&self) -> &crate::HostResources {
+        &self.resources
+    }
+
+    pub(crate) fn deadline(&self) -> crate::Deadline {
+        self.deadline
+    }
     pub fn with_resolver(&self, resolver: Arc<dyn RpcGateway>) -> Self {
         Self {
             id: self.id,
@@ -80,6 +112,10 @@ impl TxnHandle {
             ttl: self.ttl,
             token: self.token.clone(),
             auth_context: self.auth_context.clone(),
+            workspace: self.workspace.clone(),
+            workspace_path: self.workspace_path.clone(),
+            resources: self.resources.clone(),
+            deadline: self.deadline,
         }
     }
 
@@ -132,6 +168,10 @@ impl TxnHandle {
             ttl: self.ttl,
             token: self.token.clone(),
             auth_context: self.auth_context.clone(),
+            workspace: self.workspace.clone(),
+            workspace_path: self.workspace_path.clone(),
+            resources: self.resources.clone(),
+            deadline: self.deadline,
         }
     }
 
@@ -146,11 +186,35 @@ impl TxnHandle {
             ttl: self.ttl,
             token: self.token.clone(),
             auth_context: self.auth_context.clone(),
+            workspace: self.workspace.clone(),
+            workspace_path: self.workspace_path.clone(),
+            resources: self.resources.clone(),
+            deadline: self.deadline,
         }
     }
 
     pub fn header(&self) -> TxnHeader {
-        TxnHeader::new(self.id, self.id.timestamp(), self.claim.clone())
+        TxnHeader::from_transaction(self)
+    }
+
+    pub async fn context(
+        &self,
+    ) -> tc_error::TCResult<freqfs::DirLock<tc_collection::PersistentFile>> {
+        self.workspace
+            .as_ref()
+            .ok_or_else(|| {
+                TCError::internal("transaction workspace is not configured at bootstrap")
+            })?
+            .transaction_child(self.id, &self.workspace_path)
+            .await
+    }
+
+    pub(super) async fn remove_workspace(&self) -> tc_error::TCResult<()> {
+        if let Some(workspace) = &self.workspace {
+            workspace.remove_transaction(self.id).await?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn with_claims(&self, claims: Vec<Claim>) -> Self {
@@ -164,11 +228,15 @@ impl TxnHandle {
             ttl: self.ttl,
             token: self.token.clone(),
             auth_context: self.auth_context.clone(),
+            workspace: self.workspace.clone(),
+            workspace_path: self.workspace_path.clone(),
+            resources: self.resources.clone(),
+            deadline: self.deadline,
         }
     }
 
-    pub fn with_signed_token(&self, token: SignedToken) -> tc_error::TCResult<Self> {
-        let canonical_claim = self.validate_token(&token)?;
+    pub(super) fn with_signed_token(&self, token: SignedToken) -> tc_error::TCResult<Self> {
+        let canonical_claim = super::validate_signed_token(self.id, &token)?;
         let bearer_token = token.clone().into_jwt();
         let claims = token
             .claims()
@@ -185,6 +253,10 @@ impl TxnHandle {
             ttl: self.ttl,
             token: Some(Arc::new(token)),
             auth_context: self.auth_context.clone(),
+            workspace: self.workspace.clone(),
+            workspace_path: self.workspace_path.clone(),
+            resources: self.resources.clone(),
+            deadline: self.deadline,
         })
     }
 
@@ -199,10 +271,14 @@ impl TxnHandle {
             ttl: self.ttl,
             token: self.token.clone(),
             auth_context: Some(auth_context),
+            workspace: self.workspace.clone(),
+            workspace_path: self.workspace_path.clone(),
+            resources: self.resources.clone(),
+            deadline: self.deadline,
         }
     }
 
-    pub fn grant(
+    pub(super) fn grant(
         &self,
         actor: &Actor,
         host: Link,
@@ -245,66 +321,27 @@ impl TxnHandle {
 
         Ok(false)
     }
+}
 
-    fn validate_token(&self, token: &SignedToken) -> tc_error::TCResult<Claim> {
-        let txn_link = Link::from_str(&format!("/txn/{}", self.id))
-            .map_err(|err| TCError::bad_request(err.to_string()))?;
+impl tc_collection::StorageContext for TxnHandle {
+    fn context(
+        &self,
+    ) -> impl std::future::Future<
+        Output = tc_error::TCResult<freqfs::DirLock<tc_collection::PersistentFile>>,
+    > + Send {
+        TxnHandle::context(self)
+    }
 
-        let mut owner: Option<(&Link, &String)> = None;
-        let mut lock: Option<(&Link, &String)> = None;
-        let mut canonical_claim: Option<Claim> = None;
+    fn subcontext(&self, name: impl Into<String>) -> Self {
+        TxnHandle::subcontext(self, name)
+    }
 
-        for (index, (host, actor_id, claim)) in token.claims().iter().enumerate() {
-            let claim_link = claim.link.to_string();
-            if claim_link.starts_with("/txn/") {
-                if claim.link != txn_link {
-                    return Err(TCError::bad_request(format!(
-                        "cannot initialize txn {} with token for {}",
-                        self.id, claim.link
-                    )));
-                }
+    fn subcontext_unique(&self) -> Self {
+        TxnHandle::subcontext_unique(self)
+    }
 
-                if index <= 1 {
-                    if canonical_claim.is_none() {
-                        canonical_claim = Some(claim.clone());
-                    }
-                } else {
-                    return Err(TCError::bad_request(
-                        "invalid token: canonical claim must be first or second",
-                    ));
-                }
-
-                if claim.mask.has(umask::USER_EXEC) {
-                    if owner.is_some() {
-                        return Err(TCError::bad_request("invalid token: multiple txn owners"));
-                    }
-                    owner = Some((host, actor_id));
-                }
-
-                if claim.mask.has(umask::USER_WRITE) {
-                    if lock.is_some() {
-                        return Err(TCError::bad_request("invalid token: multiple txn locks"));
-                    }
-                    lock = Some((host, actor_id));
-                }
-            }
-        }
-
-        let canonical_claim = canonical_claim
-            .ok_or_else(|| TCError::bad_request("invalid token: missing canonical txn claim"))?;
-
-        if let Some(lock) = lock {
-            let owner = owner
-                .ok_or_else(|| TCError::bad_request("invalid token: txn lock without owner"))?;
-
-            if lock != owner {
-                return Err(TCError::bad_request(
-                    "invalid token: txn lock does not match owner",
-                ));
-            }
-        }
-
-        Ok(canonical_claim)
+    fn materialized_tensor_bytes(&self) -> usize {
+        self.resources.limits().device.materialized_tensor_bytes
     }
 }
 
