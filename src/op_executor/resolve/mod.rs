@@ -61,6 +61,22 @@ pub(crate) fn resolve_scalar<'a>(
     })
 }
 
+async fn put_link(
+    txn: &crate::txn::TxnHandle,
+    link: Link,
+    key: State,
+    value: State,
+) -> TCResult<State> {
+    if let Some(state) = collection::from_put(&link, key.clone(), value.clone())? {
+        return Ok(state);
+    }
+
+    let key = Scalar::try_cast_from(key, |_| TCError::bad_request("expected scalar PUT key"))?;
+    txn.put(link, txn.clone(), key, value)
+        .await
+        .map(|()| State::default())
+}
+
 fn resolve_opref(
     op: OpRef,
     values: &Arc<HashMap<Id, State>>,
@@ -106,23 +122,38 @@ fn resolve_opref(
                 }
             },
             OpRef::Put((subject, key, value)) => match subject {
-                Subject::Link(_) | Subject::Ref(_, _) => {
-                    let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
-                    let local_key =
-                        resolve_scalar(key.clone(), &values, &txn, self_link.as_ref()).await?;
+                Subject::Ref(id_ref, suffix) => {
+                    let state = values.get(id_ref.as_str()).cloned().ok_or_else(|| {
+                        TCError::not_found(format!("unknown id ${}", id_ref.as_str()))
+                    })?;
+                    let local_key = resolve_scalar(key, &values, &txn, self_link.as_ref()).await?;
                     let local_value =
-                        resolve_scalar(value.clone(), &values, &txn, self_link.as_ref()).await?;
-                    if let Some(state) = collection::from_put(&link, local_key, local_value)? {
+                        resolve_scalar(value, &values, &txn, self_link.as_ref()).await?;
+                    if let Some(state) = collection::put(
+                        &state,
+                        suffix.as_ref(),
+                        local_key.clone(),
+                        local_value.clone(),
+                        &txn,
+                    )
+                    .await?
+                    {
                         return Ok(state);
                     }
-                    let key = Scalar::try_cast_from(
-                        resolve_scalar(key, &values, &txn, self_link.as_ref()).await?,
-                        |_| TCError::bad_request("expected scalar PUT key"),
+
+                    let link = resolve_subject(
+                        Subject::Ref(id_ref, suffix),
+                        values.as_ref(),
+                        self_link.as_ref(),
                     )?;
-                    let value = resolve_scalar(value, &values, &txn, self_link.as_ref()).await?;
-                    txn.put(link, txn.clone(), key, value)
-                        .await
-                        .map(|()| State::default())
+                    put_link(&txn, link, local_key, local_value).await
+                }
+                Subject::Link(_) => {
+                    let link = resolve_subject(subject, values.as_ref(), self_link.as_ref())?;
+                    let local_key = resolve_scalar(key, &values, &txn, self_link.as_ref()).await?;
+                    let local_value =
+                        resolve_scalar(value, &values, &txn, self_link.as_ref()).await?;
+                    put_link(&txn, link, local_key, local_value).await
                 }
             },
             OpRef::Post((subject, params)) => match subject {

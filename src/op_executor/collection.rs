@@ -11,19 +11,10 @@ pub(super) async fn get(
     key: State,
     txn: &crate::txn::TxnHandle,
 ) -> TCResult<Option<State>> {
-    match state {
-        State::Collection(collection) => {
-            let Some(routes) = collection.routes::<State>() else {
-                return Ok(None);
-            };
-            match Public::get(&routes, txn, path, key.into_scalar()?).await {
-                Ok(state) => Ok(Some(state)),
-                Err(err) if err.code() == tc_error::ErrorKind::NotFound => Ok(None),
-                Err(err) => Err(err),
-            }
-        }
-        _ => Ok(None),
-    }
+    let Some(collection) = collection(state) else {
+        return Ok(None);
+    };
+    optional(Public::get(collection, txn, path, key.into_scalar()?).await)
 }
 
 pub(super) async fn post(
@@ -32,19 +23,24 @@ pub(super) async fn post(
     params: Map<State>,
     txn: &crate::txn::TxnHandle,
 ) -> TCResult<Option<State>> {
-    match state {
-        State::Collection(collection) => {
-            let Some(routes) = collection.routes::<State>() else {
-                return Ok(None);
-            };
-            match Public::post(&routes, txn, path, params).await {
-                Ok(state) => Ok(Some(state)),
-                Err(err) if err.code() == tc_error::ErrorKind::NotFound => Ok(None),
-                Err(err) => Err(err),
-            }
-        }
-        _ => Ok(None),
-    }
+    let Some(collection) = collection(state) else {
+        return Ok(None);
+    };
+    optional(Public::post(collection, txn, path, params).await)
+}
+
+pub(super) async fn put(
+    state: &State,
+    path: &[PathSegment],
+    key: State,
+    value: State,
+    txn: &crate::txn::TxnHandle,
+) -> TCResult<Option<State>> {
+    let Some(collection) = collection(state) else {
+        return Ok(None);
+    };
+    optional(Public::put(collection, txn, path, key.into_scalar()?, value).await)
+        .map(|result| result.map(|()| State::None))
 }
 
 pub(super) async fn delete(
@@ -53,21 +49,28 @@ pub(super) async fn delete(
     key: State,
     txn: &crate::txn::TxnHandle,
 ) -> TCResult<Option<State>> {
-    match state {
-        State::Collection(collection) => {
-            let Some(routes) = collection.routes::<State>() else {
-                return Ok(None);
-            };
-            match Public::delete(&routes, txn, path, key.into_scalar()?).await {
-                Ok(()) => Ok(Some(State::None)),
-                Err(err) if err.code() == tc_error::ErrorKind::NotFound => Ok(None),
-                Err(err) => Err(err),
-            }
-        }
-        _ => Ok(None),
+    let Some(collection) = collection(state) else {
+        return Ok(None);
+    };
+    optional(Public::<State>::delete(collection, txn, path, key.into_scalar()?).await)
+        .map(|result| result.map(|()| State::None))
+}
+
+fn collection(state: &State) -> Option<&Collection<crate::TxnHandle>> {
+    let State::Collection(collection) = state else {
+        return None;
+    };
+    Some(collection)
+}
+
+fn optional<T>(result: TCResult<T>) -> TCResult<Option<T>> {
+    match result {
+        Ok(result) => Ok(Some(result)),
+        Err(err) if err.code() == tc_error::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
 pub(super) fn from_put(link: &Link, key: State, value: State) -> TCResult<Option<State>> {
-    Collection::tensor_literal(link, key, value)
+    Collection::from_put(link, key, value)
 }

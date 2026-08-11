@@ -57,13 +57,15 @@ pub struct IrHandler {
 }
 
 impl Route<State> for IrRoutes {
-    type Handler = IrHandler;
-
-    fn route(&self, path: &[pathlink::PathSegment]) -> Option<Self::Handler> {
-        self.routes.get(path).cloned()
+    fn route(&self, path: &[pathlink::PathSegment]) -> Option<Box<dyn Handler<State> + '_>> {
+        self.routes
+            .get(path)
+            .cloned()
+            .map(|handler| Box::new(handler) as Box<dyn Handler<State>>)
     }
 }
 
+#[tc_ir::async_trait]
 impl Handler<State> for IrHandler {
     async fn get(&self, txn: &crate::TxnHandle, key: Scalar) -> TCResult<State> {
         match self.route.clone() {

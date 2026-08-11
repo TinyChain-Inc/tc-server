@@ -1,6 +1,6 @@
 use pathlink::PathSegment;
 use tc_error::TCResult;
-use tc_ir::{Dir, Route};
+use tc_ir::Dir;
 
 #[derive(Clone, Debug, Default)]
 pub struct RouteMetadata {
@@ -21,12 +21,8 @@ impl SchemaRoutes {
         let dir = Dir::from_routes(entries)?;
         Ok(Self { dir })
     }
-}
 
-impl Route<crate::State> for SchemaRoutes {
-    type Handler = RouteMetadata;
-
-    fn route(&self, path: &[PathSegment]) -> Option<Self::Handler> {
+    pub fn route(&self, path: &[PathSegment]) -> Option<RouteMetadata> {
         self.dir.route(path)
     }
 }
