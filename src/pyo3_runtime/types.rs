@@ -1,27 +1,33 @@
-use std::{fmt, marker::PhantomData, path::PathBuf, sync::Arc};
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use futures::TryStreamExt;
 use pyo3::prelude::*;
-use tc_ir::LibrarySchema;
-
-use crate::{Method, library::default_library_schema};
+use pyo3::types::PyString;
+use tc_ir::{IntoView, LibrarySchema};
 
 use super::wire::parse_method;
+use crate::Method;
+use crate::library::default_library_schema;
 
 #[derive(Clone)]
 pub struct PyKernelConfig {
     pub data_dir: Option<PathBuf>,
+    pub workspace: Option<PathBuf>,
     pub initial_schema: LibrarySchema,
     pub host_id: String,
-    pub limits: crate::KernelLimits,
+    pub limits: crate::HostLimits,
 }
 
 impl Default for PyKernelConfig {
     fn default() -> Self {
         Self {
             data_dir: None,
+            workspace: None,
             initial_schema: default_library_schema(),
             host_id: "tc-py-host".to_string(),
-            limits: crate::KernelLimits::default(),
+            limits: crate::HostLimits::default(),
         }
     }
 }
@@ -32,95 +38,61 @@ pub(super) fn apply_config_overrides(
     max_request_bytes_unauth: Option<usize>,
 ) -> PyKernelConfig {
     if let Some(secs) = request_ttl_secs.filter(|value| *value > 0) {
-        config.limits.txn_ttl = std::time::Duration::from_secs(secs);
+        config.limits.transaction_ttl = std::time::Duration::from_secs(secs);
     }
     if let Some(max_bytes) = max_request_bytes_unauth.filter(|value| *value > 0) {
-        config.limits.max_request_bytes_unauth = max_bytes;
+        config.limits.ingress.request_body_bytes = max_bytes;
     }
     config
 }
 
-/// Wrapper around a typed state value shared between handlers.
-///
-/// This intentionally mirrors the generics on `Handler` so the same concrete state
-/// types can flow between verb implementations and higher-level bindings without
-/// serializing/deserializing when a call chain stays in-process (e.g. PyO3 eager
-/// execution). The handle simply holds an `Arc<T>` and exposes lightweight helpers
-/// to borrow or clone that pointer; downcasting happens through the same visitor
-/// logic used for handlers in general rather than through a per-handle vtable.
-pub struct StateHandle<State> {
-    inner: Arc<State>,
-    _marker: PhantomData<State>,
-}
-
-impl<State> StateHandle<State> {
-    /// Create a new handle from an owned value.
-    pub fn new(state: State) -> Self {
-        Self {
-            inner: Arc::new(state),
-            _marker: PhantomData,
-        }
-    }
-
-    /// Wrap an existing `Arc` without copying.
-    pub fn from_arc(state: Arc<State>) -> Self {
-        Self {
-            inner: state,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Clone the inner `Arc` for use in another call-chain.
-    pub fn to_arc(&self) -> Arc<State> {
-        Arc::clone(&self.inner)
-    }
-
-    /// Consume the handle and return the inner `Arc`.
-    pub fn into_inner(self) -> Arc<State> {
-        self.inner
-    }
-}
-
-impl<State> Clone for StateHandle<State> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<State> AsRef<State> for StateHandle<State> {
-    fn as_ref(&self) -> &State {
-        &self.inner
-    }
-}
-
-impl<State: fmt::Debug> fmt::Debug for StateHandle<State> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StateHandle").finish()
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct PyWrapper<T> {
-    inner: T,
-}
-
-impl<T> PyWrapper<T> {
-    pub(super) fn new(inner: T) -> Self {
-        Self { inner }
-    }
-
-    pub(super) fn inner(&self) -> &T {
-        &self.inner
-    }
-}
-
 #[pyclass(name = "StateHandle")]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PyStateHandle {
-    handle: StateHandle<Py<PyAny>>,
+    value: Option<Py<PyAny>>,
+    state: Option<crate::State>,
+    txn: Option<crate::TxnHandle>,
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
+    finalize: Option<Arc<PendingFinalize>>,
+}
+
+struct PendingFinalize {
+    runtime: Arc<tokio::runtime::Runtime>,
+    pending: Mutex<Option<(Arc<crate::Kernel>, crate::TxnHandle)>>,
+    deadline: crate::Deadline,
+    _request: Arc<crate::resources::CapacityPermit>,
+}
+
+impl PendingFinalize {
+    fn ensure_active(&self) -> PyResult<()> {
+        if !self.deadline.is_expired() {
+            return Ok(());
+        }
+
+        let err = self
+            .pending
+            .lock()
+            .expect("finalize lock")
+            .as_ref()
+            .map(|(_, txn)| txn.deadline().exceeded());
+        let Some(err) = err else {
+            return Ok(());
+        };
+        self.pending.lock().expect("finalize lock").take();
+        Err(super::tc_error(err))
+    }
+
+    fn finish(&self) -> PyResult<()> {
+        let Some((kernel, txn)) = self.pending.lock().expect("finalize lock").take() else {
+            return Ok(());
+        };
+        super::wait(&self.runtime, async move {
+            kernel
+                .complete_transaction(txn, crate::txn::TransactionOutcome::Succeeded)
+                .await
+        })
+        .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))
+    }
 }
 
 #[pymethods]
@@ -128,7 +100,11 @@ impl PyStateHandle {
     #[new]
     pub fn new(value: Py<PyAny>) -> Self {
         Self {
-            handle: StateHandle::new(value),
+            value: Some(value),
+            state: None,
+            txn: None,
+            runtime: None,
+            finalize: None,
         }
     }
 
@@ -136,26 +112,83 @@ impl PyStateHandle {
         self.clone()
     }
 
-    pub fn value(&self) -> Py<PyAny> {
-        self.handle.as_ref().clone()
+    pub fn value(&self) -> PyResult<Py<PyAny>> {
+        if let Some(value) = &self.value {
+            return Ok(value.clone());
+        }
+
+        if let Some(finalize) = &self.finalize {
+            finalize.ensure_active()?;
+        }
+
+        let runtime = self.runtime.as_ref().map(Arc::clone).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("native state has no owning runtime")
+        })?;
+        let state = self
+            .state
+            .clone()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("state handle is empty"))?;
+        let txn = self.txn.clone().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("state view has no transaction")
+        })?;
+        let bytes = super::wait(&runtime, async move {
+            let view = state.into_view(txn).await.map_err(|err| err.to_string())?;
+            let stream = destream_json::encode(view).map_err(|err| err.to_string())?;
+            stream
+                .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                    bytes.extend_from_slice(&chunk);
+                    Ok(bytes)
+                })
+                .await
+                .map_err(|err| err.to_string())
+        })
+        .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+        if let Some(finalize) = &self.finalize {
+            finalize.finish()?;
+        }
+        Python::with_gil(|py| Ok(PyString::new_bound(py, &String::from_utf8_lossy(&bytes)).into()))
     }
 }
 
 impl PyStateHandle {
-    pub fn inner(&self) -> &StateHandle<Py<PyAny>> {
-        &self.handle
+    pub(crate) fn from_state(
+        state: crate::State,
+        txn: crate::TxnHandle,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Self {
+        Self {
+            value: None,
+            state: Some(state),
+            txn: Some(txn),
+            runtime: Some(runtime),
+            finalize: None,
+        }
     }
-}
 
-impl From<StateHandle<Py<PyAny>>> for PyStateHandle {
-    fn from(handle: StateHandle<Py<PyAny>>) -> Self {
-        Self { handle }
+    pub(crate) fn from_terminal_state(
+        state: crate::State,
+        kernel: Arc<crate::Kernel>,
+        txn: crate::TxnHandle,
+        runtime: Arc<tokio::runtime::Runtime>,
+        request: Arc<crate::resources::CapacityPermit>,
+    ) -> Self {
+        let deadline = txn.deadline();
+        Self {
+            value: None,
+            state: Some(state),
+            txn: Some(txn.clone()),
+            runtime: Some(Arc::clone(&runtime)),
+            finalize: Some(Arc::new(PendingFinalize {
+                runtime,
+                pending: Mutex::new(Some((kernel, txn))),
+                deadline,
+                _request: request,
+            })),
+        }
     }
-}
 
-impl From<PyStateHandle> for StateHandle<Py<PyAny>> {
-    fn from(handle: PyStateHandle) -> Self {
-        handle.handle
+    pub(crate) fn state(&self) -> Option<crate::State> {
+        self.state.clone()
     }
 }
 
@@ -226,16 +259,16 @@ impl PyKernelRequest {
     }
 }
 
-#[pyclass(name = "KernelResponse")]
-#[derive(Clone, Debug)]
-pub struct PyKernelResponse {
+#[pyclass(name = "Response")]
+#[derive(Clone)]
+pub struct PyResponse {
     status: u16,
     pub(super) headers: Vec<(String, String)>,
     body: Option<PyStateHandle>,
 }
 
 #[pymethods]
-impl PyKernelResponse {
+impl PyResponse {
     #[new]
     pub fn new(
         status: u16,
@@ -262,11 +295,5 @@ impl PyKernelResponse {
     #[getter]
     pub fn body(&self) -> Option<PyStateHandle> {
         self.body.clone()
-    }
-}
-
-impl PyKernelResponse {
-    pub(super) fn clone_inner(&self) -> Self {
-        self.clone()
     }
 }

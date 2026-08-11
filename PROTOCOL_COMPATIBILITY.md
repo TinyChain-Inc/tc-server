@@ -10,7 +10,7 @@ This note explains how to stand up a TinyChain-compatible server (or custom adap
   clients call routes and provide auth; they do not mint, continue, commit, or roll back
   transactions directly.
 - **IR contract:** Route inbound requests into `tc-ir` handlers so the same capability manifests and IR types are exercised regardless of transport.
-- **Transaction + auth surface:** Preserve the `txn_id` lifecycle and capability masks; adapters only translate protocol details and defer begin/commit/rollback to the shared kernel (`Kernel::route_request`).
+- **Transaction + auth surface:** Preserve the `txn_id` lifecycle and capability masks; adapters only translate protocol details and defer begin/commit/rollback to the shared kernel (`Kernel::bind_transaction + Kernel::execute`).
 - **Scalar value surface:** Treat booleans as `Number::Bool` within `Value::Number`, and support nested `Map`/`Tuple` value variants in addition to literal `None`/`String`/`Number` and `Link`.
 
 ## Dependency authorization & URI routing
@@ -34,7 +34,7 @@ helpers). The host remains the sole owner of both routing decisions and authoriz
   - absolute targets are only permitted if the host accepts the authority for that canonical path.
   This prevents callers from supplying arbitrary authorities to bypass dependency restrictions.
 - **Transport symmetry.** The same dependency rule applies whether the call is in-process (PyO3),
-  over HTTP, or via another adapter: all requests route through `Kernel::route_request` so the
+  over HTTP, or via another adapter: all requests route through `Kernel::bind_transaction + Kernel::execute` so the
   transaction and capability contract stays identical.
 
 ## Cross-service transaction propagation
@@ -182,19 +182,23 @@ must match the URI segments exactly so HTTP, PyO3, and future adapters stay alig
   public CAs, pinned self-signed certs, or optional mTLS for selected ports.
 - When TinyChain-hosted runtimes or control-plane services talk to each other in
   production, require mTLS and validate the client cert in your transport layer
-  (Hyper, axum, etc.) before invoking `Kernel::route_request`. For public or
+  (Hyper, axum, etc.) before invoking `Kernel::bind_transaction + Kernel::execute`. For public or
   end-user traffic, server-auth TLS plus capability tokens is sufficient.
 - No matter which TLS configuration you choose, once the HTTP request reaches
-  `Kernel::route_request` the protocol flow (txn IDs, capability enforcement,
+  `Kernel::bind_transaction + Kernel::execute` the protocol flow (txn IDs, capability enforcement,
   `/state` semantics) is identical.
 
 ## Fastest paths to a bespoke server
 
-1. **Reuse the kernel, swap the transport.** Instantiate the reference kernel via `tc_server::http::build_http_kernel_with_config` (or the config-free builder) and mount it behind your own HTTP/gRPC/serverless adapter. Your adapter should:
+1. **Reuse the kernel, swap the transport.** Assemble the native kernel with
+   `Kernel::builder`, or use `tinychain::http::build_http_runtime_with_config`
+   when the standard HTTP router is required. Bootstrap creates one
+   `HostStorage`, injects its `LibraryStore` and `Workspace`, and then mounts the
+   resulting native kernel behind the adapter. Your adapter should:
    - Parse the same transaction cues as the v1 HTTP wire protocol (`?txn_id=...`, and root-only
      empty POST/DELETE for finalize) and attach them to the request extensions. Do not expose
      helpers which ask application clients to construct those cues.
-   - Translate HTTP-style verbs/paths into the `Route` + `State` types expected by `Kernel::route_request`.
+   - Translate HTTP-style verbs/paths into the `Route` + `State` types expected by `Kernel::bind_transaction + Kernel::execute`.
    - Map `TCError` categories back to protocol status codes consistent with docs.tinychain.net.
 2. **Use `tc-server` as a minimal kernel crate.** When you want the TinyChain router primitives without the built-in HTTP/PyO3/WASM adapters, depend on `tc-server` with `default-features = false`. This exposes `Dir`, `Route`, `Handler`, `Transaction`, `Kernel`, and the `TxnManager`/`TxnHandle` pair while skipping optional transports. Re-enable adapters explicitly via `features = ["http-server"]`, `features = ["pyo3"]`, or `features = ["wasm"]` as needed for your embedding.
    - Use `features = ["http-client"]` when you need outbound HTTP proxying without compiling the HTTP server adapter.

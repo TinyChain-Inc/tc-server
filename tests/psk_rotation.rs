@@ -9,16 +9,16 @@ use tc_ir::LibrarySchema;
 use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore};
 use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
-use tinychain::library::http::{build_http_library_module, http_library_handlers};
+use tinychain::library::http::build_http_library_module;
 use tinychain::replication::{
-    ReplicationIssuer, export_handler, fetch_compiled_library_package, parse_psk_keys,
-    replication_token_handler, request_replication_token,
+    ClusterGateway, HttpClusterGateway, ReplicationIssuer, export_handler, parse_psk_keys,
+    replication_token_handler,
 };
-use tinychain::storage::{Artifact, LibraryStore};
+use tinychain::storage::Artifact;
 
 mod support;
 
-use support::combine_host_handlers;
+use support::{combine_host_handlers, http_router};
 
 #[tokio::test]
 async fn rotates_psk_keys_for_export_integration() {
@@ -57,7 +57,10 @@ async fn rotates_psk_keys_for_export_integration() {
     ])
     .expect("keys");
 
-    let store = LibraryStore::open(dir.clone()).await.expect("store");
+    let store = tinychain::HostStorage::new(&tinychain::HostLimits::default().storage)
+        .library_store(dir.clone())
+        .await
+        .expect("store");
     let store = store.for_schema(&schema).await.expect("store");
     store
         .persist_artifact_immediate(
@@ -73,12 +76,15 @@ async fn rotates_psk_keys_for_export_integration() {
 
     let addr = start_server(schema.clone(), Some(dir.clone()), keys.clone()).await;
     let peer = format!("http://{addr}");
+    let gateway = HttpClusterGateway::new();
 
-    let token = request_replication_token(&peer, &schema.id().to_string(), &keys)
+    let token = gateway
+        .request_replication_token(&peer, &schema.id().to_string(), &keys)
         .await
         .expect("token");
 
-    let payload = fetch_compiled_library_package(&peer, &token)
+    let payload = gateway
+        .fetch_compiled_library_package(&peer, &token)
         .await
         .expect("export")
         .expect("payload");
@@ -95,14 +101,17 @@ async fn rotates_psk_keys_for_export_integration() {
     let addr_new = start_server(schema.clone(), Some(dir), keys_new_only.clone()).await;
     let peer_new = format!("http://{addr_new}");
 
-    let token_old =
-        request_replication_token(&peer_new, &schema.id().to_string(), &keys_old_only).await;
+    let token_old = gateway
+        .request_replication_token(&peer_new, &schema.id().to_string(), &keys_old_only)
+        .await;
     assert!(token_old.is_err());
 
-    let token_new = request_replication_token(&peer_new, &schema.id().to_string(), &keys_new_only)
+    let token_new = gateway
+        .request_replication_token(&peer_new, &schema.id().to_string(), &keys_new_only)
         .await
         .expect("token");
-    let payload = fetch_compiled_library_package(&peer_new, &token_new)
+    let payload = gateway
+        .fetch_compiled_library_package(&peer_new, &token_new)
         .await
         .expect("export")
         .expect("payload");
@@ -114,11 +123,14 @@ async fn start_server(
     storage_root: Option<std::path::PathBuf>,
     keys: Vec<aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>>,
 ) -> std::net::SocketAddr {
-    let module = build_http_library_module(schema.clone(), storage_root)
+    let storage = tinychain::HostStorage::new(&tinychain::HostLimits::default().storage);
+    let store = match storage_root {
+        Some(path) => Some(storage.library_store(path).await.expect("library store")),
+        None => None,
+    };
+    let module = build_http_library_module(schema.clone(), store)
         .await
         .expect("module");
-    let handlers = http_library_handlers(&module);
-
     let keyring = KeyringActorResolver::default();
     let public_keys = PublicKeyStore::default();
     let issuer = Arc::new(ReplicationIssuer::new(
@@ -140,16 +152,13 @@ async fn start_server(
         .with_host_id("test-replication")
         .with_http_rpc_gateway()
         .with_rjwt_keyring_token_verifier(keyring)
-        .with_library_module(module, handlers)
-        .with_service_handler(|_req| async move { hyper::Response::new(hyper::Body::empty()) })
-        .with_kernel_handler(host_handler)
-        .with_health_handler(|_req| async move { hyper::Response::new(hyper::Body::empty()) })
+        .with_library_module(module.clone())
         .finish();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let addr = listener.local_addr().expect("addr");
 
-    let server = HttpServer::new(kernel);
+    let server = HttpServer::new(kernel, http_router(module, host_handler));
     tokio::spawn(async move {
         let _ = server.serve_listener(listener).await;
     });

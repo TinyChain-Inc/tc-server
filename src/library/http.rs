@@ -1,37 +1,38 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
-use crate::http::{Body, Request, Response, StatusCode};
+use crate::http::{Body, HttpHandler, Request, Response, StatusCode};
 use futures::FutureExt;
 use hyper::body;
-use number_general::Number;
 use tc_error::TCResult;
-use tc_ir::{LibrarySchema, Map};
-use tc_state::State;
-use tc_value::Value;
+use tc_ir::LibrarySchema;
 
 use crate::{
-    KernelHandler,
-    ir::{IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE, http_ir_route_handler_from_bytes},
+    ir::{IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE, compile_ir_library},
     storage::LibraryStore,
     wasm::http_wasm_route_handler_from_bytes,
 };
 
 use super::{
-    LibraryFactory, LibraryHandlers, LibraryRegistry, StageInstallError,
-    decode_authorize_and_stage_install, stage_install_error_response,
+    CompiledLibrary, LibraryCompiler, LibraryExecution, LibraryRegistry, RouteMetadata,
+    SchemaRoutes, StageInstallError, decode_authorize_and_stage_install,
 };
+
+fn stage_install_error_response(error: StageInstallError) -> Response {
+    let (status, message) = match error {
+        StageInstallError::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message),
+        StageInstallError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+        StageInstallError::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
+    http::Response::builder()
+        .status(status)
+        .body(Body::from(message))
+        .expect("library install error response")
+}
 
 pub async fn build_http_library_module(
     initial_schema: LibrarySchema,
-    storage_root: Option<PathBuf>,
+    store: Option<LibraryStore>,
 ) -> TCResult<Arc<LibraryRegistry>> {
-    let store = match storage_root {
-        Some(root) => {
-            let root_dir = crate::storage::load_library_root(root).await?;
-            Some(LibraryStore::from_root(root_dir))
-        }
-        None => None,
-    };
     build_http_library_module_with_store(initial_schema, store).await
 }
 
@@ -39,44 +40,52 @@ pub async fn build_http_library_module_with_store(
     initial_schema: LibrarySchema,
     store: Option<LibraryStore>,
 ) -> TCResult<Arc<LibraryRegistry>> {
-    let wasm_factory: LibraryFactory = Arc::new(|bytes: Vec<u8>| {
-        let (handler, schema, schema_routes) = http_wasm_route_handler_from_bytes(bytes)?;
-        let handler: Arc<dyn KernelHandler> = Arc::new(handler);
-        Ok((schema, schema_routes, handler))
+    let wasm_compiler: LibraryCompiler = Arc::new(|artifact| {
+        Box::pin(async move {
+            let engine = wasmtime::Engine::default();
+            let wasm = crate::wasm::WasmLibrary::from_bytes(&engine, &artifact.bytes)?;
+            let routes = wasm
+                .bindings()
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.path.clone(),
+                        RouteMetadata {
+                            export: Some(binding.export.clone()),
+                        },
+                    )
+                })
+                .collect();
+            Ok(CompiledLibrary {
+                schema: wasm.schema().clone(),
+                routes: SchemaRoutes::from_entries(routes)?,
+                artifact,
+                execution: LibraryExecution::Transport,
+            })
+        })
     });
 
-    let ir_factory: LibraryFactory = Arc::new(|bytes: Vec<u8>| {
-        let (handler, schema, schema_routes) = http_ir_route_handler_from_bytes(bytes)?;
-        let handler: Arc<dyn KernelHandler> = Arc::new(handler);
-        Ok((schema, schema_routes, handler))
-    });
+    let ir_compiler: LibraryCompiler = Arc::new(|artifact| Box::pin(compile_ir_library(artifact)));
 
     let registry = LibraryRegistry::new(
         store,
         BTreeMap::from([
-            (WASM_ARTIFACT_CONTENT_TYPE.to_string(), wasm_factory),
-            (IR_ARTIFACT_CONTENT_TYPE.to_string(), ir_factory),
+            (WASM_ARTIFACT_CONTENT_TYPE.to_string(), wasm_compiler),
+            (IR_ARTIFACT_CONTENT_TYPE.to_string(), ir_compiler),
         ]),
     );
     registry.insert_schema(initial_schema).await?;
     Ok(Arc::new(registry))
 }
 
-pub fn http_library_handlers(module: &Arc<LibraryRegistry>) -> LibraryHandlers {
-    let get = schema_get_handler(Arc::clone(module));
-    let put = schema_put_handler(Arc::clone(module));
-    let route = routes_handler(Arc::clone(module));
-    LibraryHandlers::with_route(get, put, route)
-}
-
-pub fn schema_get_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
+pub fn schema_get_handler(registry: Arc<LibraryRegistry>) -> impl HttpHandler {
     move |_req: Request| {
         let registry = Arc::clone(&registry);
         async move { respond_with_listing(registry.list_dir(crate::uri::LIB_ROOT)) }.boxed()
     }
 }
 
-pub fn schema_put_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
+pub fn schema_put_handler(registry: Arc<LibraryRegistry>) -> impl HttpHandler {
     move |req: Request| {
         let registry = Arc::clone(&registry);
         let txn = req.extensions().get::<crate::txn::TxnHandle>().cloned();
@@ -105,7 +114,7 @@ pub fn schema_put_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler 
 }
 
 fn respond_with_schema(schema: LibrarySchema) -> Response {
-    let state = schema_to_state(&schema);
+    let state = super::view::schema(&schema);
     crate::http::state_response(state)
 }
 
@@ -117,50 +126,8 @@ fn respond_with_listing(listing: Option<tc_ir::Map<bool>>) -> Response {
             .expect("dir not found response");
     };
 
-    let state = listing_to_state(&listing);
+    let state = super::view::listing(listing);
     crate::http::state_response(state)
-}
-
-fn schema_to_state(schema: &LibrarySchema) -> State {
-    let dependencies = schema
-        .dependencies()
-        .iter()
-        .enumerate()
-        .map(|(idx, dep)| {
-            (
-                idx.to_string().parse().expect("Id"),
-                State::from(Value::from(dep.to_string())),
-            )
-        })
-        .collect::<Map<State>>();
-
-    let mut map = Map::new();
-    map.insert(
-        "id".parse().expect("Id"),
-        State::from(Value::from(schema.id().to_string())),
-    );
-    map.insert(
-        "version".parse().expect("Id"),
-        State::from(Value::from(schema.version().to_string())),
-    );
-    map.insert(
-        "dependencies".parse().expect("Id"),
-        State::Map(dependencies),
-    );
-    State::Map(map)
-}
-
-fn listing_to_state(listing: &tc_ir::Map<bool>) -> State {
-    let map = listing
-        .iter()
-        .map(|(name, is_dir)| {
-            (
-                name.clone(),
-                State::from(Value::from(Number::from(*is_dir))),
-            )
-        })
-        .collect::<Map<State>>();
-    State::Map(map)
 }
 
 fn unauthorized_response(message: impl Into<String>) -> Response {
@@ -177,300 +144,39 @@ fn no_content_response() -> Response {
         .expect("library install response")
 }
 
-pub fn routes_handler(registry: Arc<LibraryRegistry>) -> impl KernelHandler {
+pub fn routes_handler(registry: Arc<LibraryRegistry>) -> impl HttpHandler {
     move |req: Request| {
         let path = req.uri().path().to_string();
         let registry = Arc::clone(&registry);
         async move {
             match registry.resolve_runtime_for_path(&path) {
                 Some((runtime, true)) => respond_with_schema(runtime.state.schema()),
-                Some((runtime, false)) => {
-                    let handler = runtime.routes.current_handler();
-                    if let Some(handler) = handler {
-                        handler.call(req).await
-                    } else {
-                        http::Response::builder()
+                Some((runtime, false)) => match runtime.execution() {
+                    // Native members are dispatched by HttpRouter through Kernel::execute.
+                    Some(LibraryExecution::Native(_)) => http::Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Body::empty())
+                        .expect("native route is not a transport route"),
+                    Some(LibraryExecution::Transport) => match runtime.artifact() {
+                        Some(artifact) if artifact.content_type == WASM_ARTIFACT_CONTENT_TYPE => {
+                            match http_wasm_route_handler_from_bytes(artifact.bytes) {
+                                Ok((handler, _, _)) => handler.call(req).await,
+                                Err(err) => crate::http::tc_error_response(err),
+                            }
+                        }
+                        _ => http::Response::builder()
                             .status(StatusCode::NOT_FOUND)
                             .body(Body::empty())
-                            .expect("missing route")
-                    }
-                }
+                            .expect("missing transport route"),
+                    },
+                    None => http::Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Body::empty())
+                        .expect("missing route"),
+                },
                 None => respond_with_listing(registry.list_dir(&path)),
             }
         }
         .boxed()
-    }
-}
-
-#[cfg(all(test, feature = "http-server"))]
-mod tests {
-    use super::*;
-    use crate::http::{Body, header};
-    use crate::library::{
-        CompiledLibraryPackage, decode_compiled_library_package, encode_compiled_library_package,
-    };
-    use crate::storage::Artifact;
-    use crate::{Method, kernel::Kernel};
-    use futures::stream;
-    use hyper::body::to_bytes;
-    use pathlink::Link;
-    use std::str::FromStr;
-    use tc_ir::LibrarySchema;
-    use tc_ir::Scalar;
-    use tc_state::{State, null_transaction, state_context};
-
-    async fn decode_state(bytes: Vec<u8>) -> State {
-        let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(bytes.into())]);
-        destream_json::try_decode(state_context(null_transaction()), stream)
-            .await
-            .expect("state decode")
-    }
-
-    #[test]
-    fn round_trips_install_compiled_package_bytes() {
-        let schema = LibrarySchema::new(
-            Link::from_str("/lib/example-devco/hello/0.1.0").expect("link"),
-            "0.1.0",
-            vec![],
-        );
-
-        let payload = CompiledLibraryPackage {
-            schema: schema.clone(),
-            artifacts: vec![Artifact {
-                path: schema.id().to_string(),
-                content_type: WASM_ARTIFACT_CONTENT_TYPE.to_string(),
-                bytes: b"wasm-bytes".to_vec(),
-            }],
-        };
-
-        let bytes = encode_compiled_library_package(&payload).expect("encode payload");
-        let decoded = decode_compiled_library_package(&bytes).expect("decode payload");
-
-        assert_eq!(decoded.schema.id(), schema.id());
-        assert_eq!(decoded.schema.version(), schema.version());
-        assert_eq!(decoded.artifacts.len(), 1);
-        assert_eq!(
-            decoded.artifacts[0].content_type,
-            WASM_ARTIFACT_CONTENT_TYPE
-        );
-    }
-
-    #[tokio::test]
-    async fn serves_schema_over_http() {
-        let initial = LibrarySchema::new(
-            Link::from_str("/lib/example-devco/service/0.1.0").expect("link"),
-            "0.1.0",
-            vec![],
-        );
-        let module = build_http_library_module(initial.clone(), None)
-            .await
-            .expect("module");
-        let handlers = http_library_handlers(&module);
-
-        let kernel = Kernel::builder()
-            .with_host_id("tc-library-test")
-            .with_library_module(module, handlers)
-            .finish();
-
-        let request = http::Request::builder()
-            .method("GET")
-            .uri("/lib")
-            .body(Body::empty())
-            .expect("request");
-
-        let response = kernel
-            .dispatch(Method::Get, "/lib", request)
-            .expect("handler")
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = to_bytes(response.into_body()).await.expect("body");
-        let state = decode_state(body.to_vec()).await;
-        let State::Map(listing) = state else {
-            panic!("expected State::Map listing");
-        };
-        assert!(listing.contains_key("example-devco"));
-
-        let schema_request = http::Request::builder()
-            .method("GET")
-            .uri("/lib/example-devco/service/0.1.0")
-            .body(Body::empty())
-            .expect("schema request");
-
-        let schema_response = kernel
-            .dispatch(
-                Method::Get,
-                "/lib/example-devco/service/0.1.0",
-                schema_request,
-            )
-            .expect("schema handler")
-            .await;
-
-        assert_eq!(schema_response.status(), StatusCode::OK);
-
-        let body = to_bytes(schema_response.into_body()).await.expect("body");
-        let state = decode_state(body.to_vec()).await;
-        let State::Map(schema_map) = state else {
-            panic!("expected State::Map schema");
-        };
-        let id = match schema_map.get("id") {
-            Some(State::Scalar(Scalar::Value(Value::String(value)))) => value.as_str(),
-            _ => panic!("missing schema id"),
-        };
-        let version = match schema_map.get("version") {
-            Some(State::Scalar(Scalar::Value(Value::String(value)))) => value.as_str(),
-            _ => panic!("missing schema version"),
-        };
-        assert_eq!(id, "/lib/example-devco/service/0.1.0");
-        assert_eq!(version, "0.1.0");
-        let deps = match schema_map.get("dependencies") {
-            Some(State::Map(map)) => map,
-            _ => panic!("missing dependencies"),
-        };
-        assert!(deps.is_empty());
-    }
-
-    #[tokio::test]
-    async fn rejects_schema_only_install_via_put() {
-        use tc_ir::Claim;
-        let initial = LibrarySchema::new(
-            Link::from_str("/lib/example-devco/service/0.1.0").expect("link"),
-            "0.1.0",
-            vec![],
-        );
-        let module = build_http_library_module(initial, None)
-            .await
-            .expect("module");
-        let handlers = http_library_handlers(&module);
-
-        let kernel = Kernel::builder()
-            .with_host_id("tc-library-test")
-            .with_library_module(module, handlers)
-            .finish();
-
-        let new_schema = serde_json::json!({
-            "id": "/lib/example-devco/updated/0.2.0",
-            "version": "0.2.0",
-            "dependencies": [],
-        });
-
-        let mut put_request = http::Request::builder()
-            .method("PUT")
-            .uri("/lib")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(new_schema.to_string()))
-            .expect("install request");
-        let install_claim = Claim::new(
-            Link::from_str("/lib/example-devco/updated/0.2.0").expect("install link"),
-            umask::USER_WRITE,
-        );
-        let install_txn = kernel
-            .txn_manager()
-            .begin()
-            .with_claims(vec![install_claim]);
-        put_request.extensions_mut().insert(install_txn.clone());
-
-        let put_response = kernel
-            .dispatch(Method::Put, "/lib", put_request)
-            .expect("put handler")
-            .await;
-
-        assert_eq!(put_response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn installs_canonical_definition_and_serves_member_route() {
-        use tc_ir::Claim;
-        let initial = LibrarySchema::new(
-            Link::from_str("/lib/example-devco/service/0.1.0").expect("link"),
-            "0.1.0",
-            vec![],
-        );
-        let module = build_http_library_module(initial, None)
-            .await
-            .expect("module");
-        let handlers = http_library_handlers(&module);
-
-        let kernel = Kernel::builder()
-            .with_host_id("tc-library-test")
-            .with_library_module(module, handlers)
-            .finish();
-
-        let definition = serde_json::json!({
-            "/lib/example-devco/greeter/0.1.0": {
-                "hello": {
-                    "/state/scalar/op/get": [
-                        "name",
-                        [
-                            ["_tmp0", "Hello, {{name}}!"],
-                            ["result", {"$_tmp0/render": {"name": {"$name": []}}}]
-                        ]
-                    ]
-                }
-            }
-        });
-
-        let mut put_request = http::Request::builder()
-            .method("PUT")
-            .uri("/lib")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(definition.to_string()))
-            .expect("install request");
-        let install_claim = Claim::new(
-            Link::from_str("/lib/example-devco/greeter/0.1.0").expect("install link"),
-            umask::USER_WRITE,
-        );
-        let install_txn = kernel
-            .txn_manager()
-            .begin()
-            .with_claims(vec![install_claim]);
-        put_request.extensions_mut().insert(install_txn.clone());
-
-        let put_response = kernel
-            .dispatch(Method::Put, "/lib", put_request)
-            .expect("put handler")
-            .await;
-
-        assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
-        kernel
-            .finalize_transaction(install_txn, true)
-            .await
-            .expect("commit install");
-
-        let mut route_request = http::Request::builder()
-            .method("GET")
-            .uri("/lib/example-devco/greeter/0.1.0/hello?key=%7B%22name%22%3A%22Ada%22%7D")
-            .body(Body::empty())
-            .expect("route request");
-        let route_claim = Claim::new(
-            Link::from_str("/lib/example-devco/greeter/0.1.0").expect("route link"),
-            umask::USER_EXEC,
-        );
-        let route_txn = kernel.txn_manager().begin().with_claims(vec![route_claim]);
-        route_request.extensions_mut().insert(route_txn);
-
-        let route_response = kernel
-            .dispatch(
-                Method::Get,
-                "/lib/example-devco/greeter/0.1.0/hello",
-                route_request,
-            )
-            .expect("route handler")
-            .await;
-
-        let status = route_response.status();
-        let body = to_bytes(route_response.into_body()).await.expect("body");
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "route error: {}",
-            String::from_utf8_lossy(&body)
-        );
-        let state = decode_state(body.to_vec()).await;
-        let State::Scalar(Scalar::Value(Value::String(value))) = state else {
-            panic!("expected string response");
-        };
-        assert_eq!(value, "Hello, Ada!");
     }
 }

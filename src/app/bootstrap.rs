@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use aes_gcm_siv::Aes256GcmSiv;
 use tinychain::replication::{
-    PeerMembership, PeerRoutes, ReplicationIssuer, ReplicationReport, announce_self_to_cluster,
-    replicate_from_peers_targeted,
+    HttpClusterGateway, PeerMembership, PeerRoutes, ReplicationIssuer, ReplicationReport,
+    announce_self_to_cluster, replicate_from_peers_targeted,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -30,6 +30,7 @@ pub(crate) struct BootstrapContext<'a> {
     pub(crate) replicate: bool,
     pub(crate) self_peer: Option<String>,
     pub(crate) issuer: &'a ReplicationIssuer,
+    pub(crate) gateway: &'a HttpClusterGateway,
 }
 
 pub(crate) async fn run_bootstrap_with_retries(
@@ -50,11 +51,7 @@ pub(crate) async fn run_bootstrap_with_retries(
 
     for attempt in 1..=max_attempts {
         let previous_unresolved = unresolved_paths.as_ref().map(HashSet::len);
-        let step = run_bootstrap_step(
-            &context,
-            unresolved_paths.as_ref(),
-        )
-        .await;
+        let step = run_bootstrap_step(&context, unresolved_paths.as_ref()).await;
 
         let mut next_unresolved = unresolved_paths
             .take()
@@ -121,6 +118,7 @@ async fn run_bootstrap_step(
             &peers,
             context.keys,
             target_paths,
+            context.gateway,
         )
         .await;
         hard_failure |= report.has_hard_failures();
@@ -137,15 +135,15 @@ async fn run_bootstrap_step(
     if let Some(self_peer) = context.self_peer.clone() {
         match context.issuer.self_identity(self_peer) {
             Ok(identity) => {
-                let report =
-                    announce_self_to_cluster(
-                        context.membership,
-                        &identity,
-                        context.routes,
-                        context.keys,
-                        context.issuer,
-                    )
-                    .await;
+                let report = announce_self_to_cluster(
+                    context.membership,
+                    &identity,
+                    context.routes,
+                    context.keys,
+                    context.issuer,
+                    context.gateway,
+                )
+                .await;
 
                 if !report.failed.is_empty() {
                     eprintln!("cluster join completed with partial failures: {report:?}");

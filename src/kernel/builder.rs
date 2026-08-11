@@ -1,48 +1,33 @@
 use std::sync::Arc;
 
-use crate::Request;
+use super::Kernel;
 use crate::egress::EgressPolicy;
-use crate::library::{LibraryHandlers, LibraryRegistry};
-use crate::txn_server::TxnServer;
-
-use super::{Kernel, KernelHandler, TxnFinalizeHook};
+use crate::library::LibraryRegistry;
 
 pub struct KernelBuilder {
-    lib_get_handler: Option<Arc<dyn KernelHandler>>,
-    lib_put_handler: Option<Arc<dyn KernelHandler>>,
-    lib_route_handler: Option<Arc<dyn KernelHandler>>,
-    service_handler: Option<Arc<dyn KernelHandler>>,
-    kernel_handler: Option<Arc<dyn KernelHandler>>,
-    health_handler: Option<Arc<dyn KernelHandler>>,
-    txn_manager: crate::txn::TxnManager,
-    txn_server: TxnServer,
+    resources: crate::HostResources,
+    txn: crate::txn::TxnConfig,
     egress: EgressPolicy,
     library_module: Option<Arc<LibraryRegistry>>,
     rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
     token_verifier: Arc<dyn crate::auth::TokenVerifier>,
     token_verifier_explicit: bool,
-    txn_finalize_hook: Option<TxnFinalizeHook>,
+    txn_finalize: Option<crate::txn::TxnFinalize>,
 }
 
 impl Default for KernelBuilder {
     fn default() -> Self {
-        let txn_manager = crate::txn::TxnManager::new();
-        let token_verifier = default_rjwt_verifier(&txn_manager);
+        let txn = crate::txn::TxnConfig::default();
+        let token_verifier = default_rjwt_verifier(&txn);
         Self {
-            lib_get_handler: None,
-            lib_put_handler: None,
-            lib_route_handler: None,
-            service_handler: None,
-            kernel_handler: None,
-            health_handler: None,
-            txn_manager,
-            txn_server: TxnServer::default(),
+            resources: crate::HostResources::default(),
+            txn,
             egress: EgressPolicy::default(),
             library_module: None,
             rpc_gateway: None,
             token_verifier,
             token_verifier_explicit: false,
-            txn_finalize_hook: None,
+            txn_finalize: None,
         }
     }
 }
@@ -52,86 +37,46 @@ impl KernelBuilder {
         Self::default()
     }
 
-    pub fn with_lib_handler<H>(mut self, handler: H) -> Self
-    where
-        H: KernelHandler,
-    {
-        self.lib_get_handler = Some(Arc::new(handler));
-        self
-    }
-
-    pub fn with_lib_put_handler<H>(mut self, handler: H) -> Self
-    where
-        H: KernelHandler,
-    {
-        self.lib_put_handler = Some(Arc::new(handler));
-        self
-    }
-
-    pub fn with_service_handler<H>(mut self, handler: H) -> Self
-    where
-        H: KernelHandler,
-    {
-        self.service_handler = Some(Arc::new(handler));
-        self
-    }
-
-    pub fn with_lib_route_handler<H>(mut self, handler: H) -> Self
-    where
-        H: KernelHandler,
-    {
-        self.lib_route_handler = Some(Arc::new(handler));
-        self
-    }
-
-    pub fn with_kernel_handler<H>(mut self, handler: H) -> Self
-    where
-        H: KernelHandler,
-    {
-        self.kernel_handler = Some(Arc::new(handler));
-        self
-    }
-
-    pub fn with_health_handler<H>(mut self, handler: H) -> Self
-    where
-        H: KernelHandler,
-    {
-        self.health_handler = Some(Arc::new(handler));
-        self
-    }
-
-    pub fn with_library_module(
-        mut self,
-        module: Arc<LibraryRegistry>,
-        handlers: LibraryHandlers,
-    ) -> Self {
+    pub fn with_library_module(mut self, module: Arc<LibraryRegistry>) -> Self {
         self.library_module = Some(module);
-        self.lib_get_handler = Some(handlers.get_handler());
-        self.lib_put_handler = Some(handlers.put_handler());
-        self.lib_route_handler = handlers.route_handler();
+        self
+    }
+
+    pub fn with_resources(mut self, resources: crate::HostResources) -> Self {
+        self.txn.resources = resources.clone();
+        self.resources = resources;
         self
     }
 
     pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
-        let ttl = self.txn_manager.ttl();
-        self.txn_manager = crate::txn::TxnManager::with_host_id_and_ttl(host_id.into(), ttl);
+        let ttl = self.txn.ttl;
+        let workspace = self.txn.workspace.clone();
+        self.txn = crate::txn::TxnConfig::with_host_id(host_id);
+        self.txn.ttl = ttl;
+        self.txn.workspace = workspace;
+        self.txn.resources = self.resources.clone();
         if !self.token_verifier_explicit {
-            self.token_verifier = default_rjwt_verifier(&self.txn_manager);
+            self.token_verifier = default_rjwt_verifier(&self.txn);
         }
         self
     }
 
     pub fn with_protocol_actor(mut self, host: pathlink::Link, actor: crate::auth::Actor) -> Self {
-        self.txn_manager = self.txn_manager.with_protocol_actor(host, actor);
+        self.txn.protocol_host = host;
+        self.txn.protocol_actor = Arc::new(actor);
         if !self.token_verifier_explicit {
-            self.token_verifier = default_rjwt_verifier(&self.txn_manager);
+            self.token_verifier = default_rjwt_verifier(&self.txn);
         }
         self
     }
 
     pub fn with_txn_ttl(mut self, ttl: std::time::Duration) -> Self {
-        self.txn_server = TxnServer::new(ttl);
-        self.txn_manager.set_ttl(ttl);
+        self.txn.ttl = ttl;
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: crate::Workspace) -> Self {
+        self.txn.workspace = Some(workspace);
         self
     }
 
@@ -171,7 +116,7 @@ impl KernelBuilder {
         F: Fn(crate::txn::TxnHandle, bool) -> Fut + Send + Sync + 'static,
         Fut: futures::Future<Output = tc_error::TCResult<()>> + Send + 'static,
     {
-        self.txn_finalize_hook = Some(Arc::new(move |txn, commit| Box::pin(hook(txn, commit))));
+        self.txn_finalize = Some(Arc::new(move |txn, commit| Box::pin(hook(txn, commit))));
         self
     }
 
@@ -187,8 +132,8 @@ impl KernelBuilder {
         keyring: crate::auth::KeyringActorResolver,
     ) -> Self {
         let keyring = keyring.with_actor(
-            self.txn_manager.protocol_host().clone(),
-            self.txn_manager.protocol_actor().as_ref().clone(),
+            self.txn.protocol_host.clone(),
+            self.txn.protocol_actor.as_ref().clone(),
         );
         self.with_rjwt_token_verifier(Arc::new(keyring))
     }
@@ -199,48 +144,27 @@ impl KernelBuilder {
     }
 
     pub fn finish(self) -> Kernel {
+        let txn_server = crate::txn::TxnServer::new(
+            self.txn,
+            self.library_module.as_ref().map(Arc::clone),
+            self.txn_finalize.as_ref().map(Arc::clone),
+            Arc::clone(&self.token_verifier),
+        );
         Kernel {
-            lib_get_handler: self
-                .lib_get_handler
-                .unwrap_or_else(|| stub_handler("lib GET")),
-            lib_put_handler: self
-                .lib_put_handler
-                .unwrap_or_else(|| stub_handler("lib PUT")),
-            lib_route_handler: self.lib_route_handler,
-            service_handler: self
-                .service_handler
-                .unwrap_or_else(|| stub_handler("service")),
-            kernel_handler: self
-                .kernel_handler
-                .unwrap_or_else(|| stub_handler("host/metrics")),
-            health_handler: self
-                .health_handler
-                .unwrap_or_else(|| stub_handler("healthz")),
-            txn_manager: self.txn_manager,
-            txn_server: self.txn_server,
+            resources: self.resources,
+            txn_server,
             egress: self.egress,
             library_module: self.library_module,
             rpc_gateway: self.rpc_gateway,
             token_verifier: self.token_verifier,
-            txn_finalize_hook: self.txn_finalize_hook,
         }
     }
 }
 
-fn stub_handler(label: &str) -> Arc<dyn KernelHandler> {
-    let label = label.to_string();
-    Arc::new(move |_req: Request| {
-        let label = label.clone();
-        async move { panic!("stub handler {label} not implemented") }
-    })
-}
-
-fn default_rjwt_verifier(
-    txn_manager: &crate::txn::TxnManager,
-) -> Arc<dyn crate::auth::TokenVerifier> {
+fn default_rjwt_verifier(txn: &crate::txn::TxnConfig) -> Arc<dyn crate::auth::TokenVerifier> {
     let keyring = crate::auth::KeyringActorResolver::default().with_actor(
-        txn_manager.protocol_host().clone(),
-        txn_manager.protocol_actor().as_ref().clone(),
+        txn.protocol_host.clone(),
+        txn.protocol_actor.as_ref().clone(),
     );
     Arc::new(crate::auth::RjwtTokenVerifier::new(Arc::new(keyring)))
 }

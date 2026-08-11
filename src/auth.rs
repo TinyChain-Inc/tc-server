@@ -74,40 +74,40 @@ mod rjwt_token {
     use async_trait::async_trait;
     use futures::FutureExt;
     use parking_lot::RwLock;
-    use pathlink::Link;
+    use pathlink::{Link, PathBuf};
     use rjwt::{Actor, AlgKind, Error as RjwtError, Resolve, SignedToken, Token, VerifyingKey};
-    use serde::{Deserialize, Serialize};
     use tc_value::Value;
 
     use crate::auth::{TokenContext, TokenVerifier};
     use crate::txn::TxnError;
     use tc_ir::Claim;
 
-    pub type SignedTokenV1 = SignedToken<Link, String, Claim>;
-    pub type TokenV1 = Token<Link, String, Claim>;
-    pub type ActorV1 = Actor<String>;
-
-    #[derive(Clone, Debug, Deserialize, Serialize)]
+    /// JWT claim payload accepted at the Python/Rust boundary.
+    ///
+    /// Python `rjwt` encodes a segment as a map of path to mode, while older Rust callers
+    /// issue one `Claim` tuple per segment. Both normalize to the shared IR claim here.
+    #[derive(Clone, serde::Deserialize, serde::Serialize)]
     #[serde(untagged)]
-    pub enum RjwtClaims {
-        Legacy(Claim),
-        Paths(BTreeMap<String, u32>),
+    pub enum WireClaims {
+        Claim(Claim),
+        Map(BTreeMap<PathBuf, u32>),
     }
 
-    impl RjwtClaims {
-        fn flatten(&self) -> Result<Vec<Claim>, TxnError> {
+    impl WireClaims {
+        fn into_claims(self) -> Vec<Claim> {
             match self {
-                Self::Legacy(claim) => Ok(vec![claim.clone()]),
-                Self::Paths(paths) => paths
-                    .iter()
-                    .map(|(path, mode)| {
-                        let link = Link::from_str(path).map_err(|_| TxnError::Unauthorized)?;
-                        Ok(Claim::new(link, (*mode).into()))
-                    })
+                Self::Claim(claim) => vec![claim],
+                Self::Map(claims) => claims
+                    .into_iter()
+                    .map(|(path, mask)| Claim::new(Link::from(path), mask.into()))
                     .collect(),
             }
         }
     }
+
+    pub type SignedTokenV1 = SignedToken<Link, String, Claim>;
+    pub type TokenV1 = Token<Link, String, Claim>;
+    pub type ActorV1 = Actor<String>;
 
     #[derive(Clone, Default)]
     pub struct KeyringActorResolver {
@@ -202,7 +202,7 @@ mod rjwt_token {
                     // unverified bearer token to the lookup request; application dependency calls
                     // still propagate verified transaction tokens through the kernel gateway.
                     self.txn.without_bearer_token(),
-                    Value::String(actor_id.to_string()),
+                    tc_ir::Scalar::Value(Value::String(actor_id.to_string())),
                 )
                 .await
                 .map_err(|_| TxnError::Unauthorized)?;
@@ -240,7 +240,7 @@ mod rjwt_token {
     impl Resolve for RjwtTokenVerifier {
         type HostId = Link;
         type ActorId = String;
-        type Claims = RjwtClaims;
+        type Claims = WireClaims;
 
         fn resolve(
             &self,
@@ -279,12 +279,12 @@ mod rjwt_token {
                 let owner_id = format!("{owner_host}::{}", owner_actor_id.clone());
                 let mut ctx = TokenContext::new(owner_id, bearer_token);
 
-                for claim in owner_claims.flatten()? {
+                for claim in owner_claims.clone().into_claims() {
                     ctx = ctx.with_claim(owner_host.to_string(), owner_actor_id.clone(), claim);
                 }
 
                 for (host, actor_id, claims) in claims {
-                    for claim in claims.flatten()? {
+                    for claim in claims.clone().into_claims() {
                         ctx = ctx.with_claim(host.to_string(), actor_id.clone(), claim);
                     }
                 }

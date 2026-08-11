@@ -1,35 +1,29 @@
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, RwLock},
-};
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 use tc_error::{TCError, TCResult};
 use tc_ir::{Id, LibrarySchema, Map, TxnId};
 
-use crate::{
-    storage::{Artifact, LibraryStore},
-    txn::TxnHandle,
-    uri,
-};
-
-use super::LibraryFactory;
 use super::install::{CompiledLibraryPackage, InstallError};
 use super::runtime::LibraryRuntime;
 use super::util::{canonical_link, is_path_prefix, normalize_path, schemas_equivalent};
-use super::{HandlerArc, SchemaRoutes};
+use super::{CompiledLibrary, LibraryCompiler, LibraryExecution};
+use crate::storage::{Artifact, LibraryStore};
+use crate::txn::{ParticipantSet, TxnHandle};
+use crate::uri;
 
 #[derive(Clone)]
 pub struct LibraryRegistry {
     entries: Arc<RwLock<BTreeMap<String, Arc<LibraryRuntime>>>>,
     staged: Arc<RwLock<BTreeMap<TxnId, StagedTxn>>>,
     store: Option<LibraryStore>,
-    factories: BTreeMap<String, LibraryFactory>,
+    compilers: BTreeMap<String, LibraryCompiler>,
 }
 
 #[derive(Clone, Default)]
 struct StagedTxn {
     installs: Vec<StagedInstall>,
-    replication_participants: Vec<String>,
+    replication_participants: ParticipantSet<String>,
 }
 
 #[derive(Clone)]
@@ -41,21 +35,16 @@ struct StagedInstall {
 
 #[derive(Clone)]
 enum PreparedInstall {
-    Payload {
-        schema: LibrarySchema,
-        routes: SchemaRoutes,
-        handler: HandlerArc,
-        artifact: Artifact,
-    },
+    Payload(CompiledLibrary),
 }
 
 impl LibraryRegistry {
-    pub fn new(store: Option<LibraryStore>, factories: BTreeMap<String, LibraryFactory>) -> Self {
+    pub fn new(store: Option<LibraryStore>, compilers: BTreeMap<String, LibraryCompiler>) -> Self {
         Self {
             entries: Arc::new(RwLock::new(BTreeMap::new())),
             staged: Arc::new(RwLock::new(BTreeMap::new())),
             store,
-            factories,
+            compilers,
         }
     }
 
@@ -65,7 +54,7 @@ impl LibraryRegistry {
             Some(store) => Some(store.for_schema(&schema).await?),
             None => None,
         };
-        let runtime = Arc::new(LibraryRuntime::new(schema, store, self.factories.clone()));
+        let runtime = Arc::new(LibraryRuntime::new(schema, store));
         self.entries
             .write()
             .expect("library registry write lock")
@@ -133,6 +122,20 @@ impl LibraryRegistry {
         }
 
         best.map(|(id, runtime)| (runtime, id == &path))
+    }
+
+    pub(crate) fn resolve_native(
+        &self,
+        path: &str,
+    ) -> Option<(crate::ir::IrRoutes, Vec<pathlink::PathSegment>, bool)> {
+        let (runtime, is_root) = self.resolve_runtime_for_path(path)?;
+        let root = runtime.state.schema().id().to_string();
+        let relative = path.strip_prefix(&root)?;
+        let route = tc_ir::parse_route_path(relative).ok()?;
+        match runtime.execution()? {
+            LibraryExecution::Native(routes) => Some((routes, route, is_root)),
+            LibraryExecution::Transport => None,
+        }
     }
 
     pub fn has_route_root(&self, root: &str) -> bool {
@@ -217,15 +220,9 @@ impl LibraryRegistry {
         payload: CompiledLibraryPackage,
     ) -> Result<String, InstallError> {
         let prepared = self.prepare_compiled_package(payload).await?;
-        if let Err(err) = self.stage_prepared_storage(txn_id, &prepared).await {
-            if let Some(store) = prepared.runtime.store.as_ref() {
-                let _ = store.finalize_txn(txn_id, false).await;
-            }
-            return Err(err);
-        }
-
         let schema_path = prepared.schema_path.clone();
-        self.record_staged_install(txn_id, prepared);
+        self.record_staged_install(txn_id, prepared.clone());
+        self.stage_prepared_storage(txn_id, &prepared).await?;
         Ok(schema_path)
     }
 
@@ -239,10 +236,10 @@ impl LibraryRegistry {
     pub fn record_replication_participants(&self, txn_id: TxnId, participants: Vec<String>) {
         let mut staged = self.staged.write().expect("library staged write lock");
         let txn = staged.entry(txn_id).or_default();
-        txn.replication_participants = participants;
+        txn.replication_participants = participants.into_iter().collect();
     }
 
-    pub fn replication_participants(&self, txn_id: TxnId) -> Option<Vec<String>> {
+    pub(crate) fn replication_participants(&self, txn_id: TxnId) -> Option<ParticipantSet<String>> {
         self.staged
             .read()
             .expect("library staged read lock")
@@ -251,46 +248,24 @@ impl LibraryRegistry {
             .filter(|participants| !participants.is_empty())
     }
 
-    pub fn retain_unfinished_replication_participants(&self, txn_id: TxnId, delivered: &[String]) {
-        let delivered = delivered.iter().collect::<std::collections::HashSet<_>>();
+    pub(crate) fn retain_unfinished_replication_participants(
+        &self,
+        txn_id: TxnId,
+        delivered: &ParticipantSet<String>,
+    ) {
         let mut staged = self.staged.write().expect("library staged write lock");
         if let Some(txn) = staged.get_mut(&txn_id) {
-            txn.replication_participants
-                .retain(|peer| !delivered.contains(peer));
-        }
-    }
-
-    pub fn discard_txn(&self, txn_id: TxnId) {
-        let staged = self
-            .staged
-            .write()
-            .expect("library staged write lock")
-            .remove(&txn_id)
-            .map(|txn| txn.installs)
-            .unwrap_or_default();
-
-        if staged.is_empty() {
-            return;
-        }
-
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            for install in staged {
-                if let Some(store) = install.runtime.store.clone() {
-                    handle.spawn(async move {
-                        let _ = store.finalize_txn(txn_id, false).await;
-                    });
-                }
-            }
+            txn.replication_participants.retain_unresolved(delivered);
         }
     }
 
     pub async fn finalize_txn(&self, txn_id: TxnId, commit: bool) -> TCResult<()> {
         let staged = self
             .staged
-            .write()
-            .expect("library staged write lock")
-            .remove(&txn_id)
-            .map(|txn| txn.installs)
+            .read()
+            .expect("library staged read lock")
+            .get(&txn_id)
+            .map(|txn| txn.installs.clone())
             .unwrap_or_default();
 
         for install in &staged {
@@ -304,6 +279,11 @@ impl LibraryRegistry {
                 self.apply_prepared_runtime(install);
             }
         }
+
+        self.staged
+            .write()
+            .expect("library staged write lock")
+            .remove(&txn_id);
 
         Ok(())
     }
@@ -350,7 +330,7 @@ impl LibraryRegistry {
         let entries = store.discover_schemas().await?;
         for schema in entries {
             let runtime = self.runtime_for_schema(&schema).await?;
-            runtime.hydrate_from_storage().await?;
+            runtime.hydrate_from_storage(&self.compilers).await?;
         }
 
         Ok(())
@@ -379,51 +359,48 @@ impl LibraryRegistry {
             .await
             .map_err(|err| InstallError::internal(err.to_string()))?;
 
-        let artifact = payload
+        let mut artifacts = payload
             .artifacts
             .into_iter()
-            .find(|artifact| self.factories.contains_key(&artifact.content_type))
-            .ok_or_else(|| {
-                let supported = self
-                    .factories
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                InstallError::bad_request(format!(
-                    "missing supported artifact (expected one of: {supported})"
-                ))
-            })?;
+            .filter(|artifact| self.compilers.contains_key(&artifact.content_type));
+        let artifact = artifacts.next().ok_or_else(|| {
+            let supported = self
+                .compilers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            InstallError::bad_request(format!(
+                "missing supported artifact (expected one of: {supported})"
+            ))
+        })?;
+        if artifacts.next().is_some() {
+            return Err(InstallError::bad_request(
+                "package contains multiple executable artifacts",
+            ));
+        }
 
-        let factory = self
-            .factories
+        let compiler = self
+            .compilers
             .get(&artifact.content_type)
             .ok_or_else(|| InstallError::bad_request("unsupported artifact content type"))?;
 
-        let (manifest_schema, schema_routes, handler) = factory(artifact.bytes.clone())
+        let compiled = compiler(artifact.clone())
+            .await
             .map_err(|err| InstallError::internal(err.to_string()))?;
 
-        if !schemas_equivalent(&manifest_schema, &payload.schema) {
+        if !schemas_equivalent(&compiled.schema, &payload.schema) {
             return Err(InstallError::bad_request(
                 "manifest schema does not match descriptor",
             ));
         }
 
-        let schema_path = manifest_schema.id().to_string();
+        let schema_path = compiled.schema.id().to_string();
 
         Ok(StagedInstall {
             schema_path,
             runtime,
-            install: PreparedInstall::Payload {
-                schema: manifest_schema,
-                routes: schema_routes,
-                handler,
-                artifact: Artifact {
-                    content_type: artifact.content_type,
-                    bytes: artifact.bytes,
-                    path: artifact.path,
-                },
-            },
+            install: PreparedInstall::Payload(compiled),
         })
     }
 
@@ -436,17 +413,8 @@ impl LibraryRegistry {
 
     fn apply_prepared_runtime(&self, install: &StagedInstall) {
         match &install.install {
-            PreparedInstall::Payload {
-                schema,
-                routes,
-                handler,
-                ..
-            } => {
-                install
-                    .runtime
-                    .state
-                    .replace_with_routes(schema.clone(), routes.clone());
-                install.runtime.routes.replace_arc(handler.clone());
+            PreparedInstall::Payload(compiled) => {
+                install.runtime.replace_compiled(compiled.clone())
             }
         }
     }
@@ -457,10 +425,8 @@ impl LibraryRegistry {
         };
 
         match &install.install {
-            PreparedInstall::Payload {
-                schema, artifact, ..
-            } => store
-                .persist_artifact_immediate(schema, artifact)
+            PreparedInstall::Payload(compiled) => store
+                .persist_artifact_immediate(&compiled.schema, &compiled.artifact)
                 .await
                 .map_err(|err| InstallError::internal(err.to_string())),
         }
@@ -476,10 +442,8 @@ impl LibraryRegistry {
         };
 
         match &install.install {
-            PreparedInstall::Payload {
-                schema, artifact, ..
-            } => store
-                .stage_artifact(txn_id, schema, artifact)
+            PreparedInstall::Payload(compiled) => store
+                .stage_artifact(txn_id, &compiled.schema, &compiled.artifact)
                 .await
                 .map_err(|err| InstallError::internal(err.to_string())),
         }
@@ -517,11 +481,7 @@ impl LibraryRegistry {
             Some(store) => Some(store.for_schema(schema).await?),
             None => None,
         };
-        let runtime = Arc::new(LibraryRuntime::new(
-            schema.clone(),
-            store,
-            self.factories.clone(),
-        ));
+        let runtime = Arc::new(LibraryRuntime::new(schema.clone(), store));
 
         let mut entries = self.entries.write().expect("library registry write lock");
         let entry = entries.entry(key).or_insert_with(|| Arc::clone(&runtime));

@@ -94,29 +94,30 @@ setup instructions provided by the TinyChain Python client tooling you are using
 Use the curated builders so every adapter shares the same kernel wiring:
 
 ```rust
-use hyper::{Body, Request, Response};
-use std::convert::Infallible;
-use tc_server::http::{
-    HttpKernelConfig, HttpServer, build_http_kernel_with_config,
+use hyper::{Body, Response};
+use tinychain::{HostLimits, HostStorage};
+use tinychain::http::{
+    HttpKernelConfig, HttpServer, build_http_runtime_with_config,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Point at a library data dir if you ship persisted WASM installs.
-    let kernel = build_http_kernel_with_config(
-        HttpKernelConfig::default().with_data_dir("./data"),
-        |_req: Request<Body>| async {
-            Ok::<_, Infallible>(Response::new(Body::from("service ok")))
+    let storage = HostStorage::new(&HostLimits::default().storage);
+    let library_store = storage.library_store("./data").await?;
+    let workspace = storage.workspace("./workspace")?;
+    let runtime = build_http_runtime_with_config(
+        HttpKernelConfig::default()
+            .with_library_store(library_store)
+            .with_workspace(workspace),
+        |_req| async { Response::new(Body::from("service ok")) },
+        |_req| async { Response::new(Body::from("healthy")) },
+        |_registry| {
+            |_req| async { Response::new(Body::from("host metrics")) }
         },
-        |_req: Request<Body>| async {
-            Ok::<_, Infallible>(Response::new(Body::from("host metrics")))
-        },
-        |_req: Request<Body>| async {
-            Ok::<_, Infallible>(Response::new(Body::from("healthy")))
-        },
+        |_registry, builder| builder,
     ).await?;
 
-    HttpServer::new(kernel)
+    HttpServer::new(runtime.kernel, runtime.router)
         .serve(([127, 0, 0, 1], 8700).into())
         .await?;
 
@@ -171,74 +172,14 @@ Do not implement JWT parsing or signature handling in server adapters. HTTP,
 PyO3, replication, and WASM route context all flow through the kernel
 `TokenVerifier`.
 
-## Native `Library` example
+## Native Libraries
 
-`NativeLibrary` lets you publish in-process handlers without crossing the WASM
-ABI. Pair it with the HTTP kernel to expose `/lib/...` routes immediately:
-
-```rust
-use hyper::{Body, Request, Response};
-use pathlink::Link;
-use tc_ir::{HandleGet, LibraryModule, LibrarySchema, tc_library_routes};
-use tc_server::{
-    http::{HttpServer, build_http_kernel_with_native_library},
-    library::NativeLibrary,
-    txn::TxnHandle,
-    Value,
-};
-
-#[derive(Clone)]
-struct Hello;
-
-impl HandleGet<TxnHandle> for Hello {
-    type Request = Value;
-    type RequestContext = ();
-    type Response = Value;
-    type Error = tc_error::TCError;
-    type Fut<'a> =
-        futures::future::BoxFuture<'a, Result<Self::Response, Self::Error>>;
-
-    fn get<'a>(
-        &'a self,
-        _txn: &'a TxnHandle,
-        _request: Self::Request,
-    ) -> tc_error::TCResult<Self::Fut<'a>> {
-        Ok(Box::pin(async move { Ok(Value::from(42_u64)) }))
-    }
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    use std::str::FromStr;
-
-    let schema = LibrarySchema::new(
-        Link::from_str("/lib/examples/hello")?,
-        "0.1.0",
-        vec![],
-    );
-    let routes = tc_library_routes! { "/hello" => Hello }?;
-    let module = LibraryModule::new(schema, routes);
-    let library = NativeLibrary::new(module);
-
-    let kernel = build_http_kernel_with_native_library(
-        library,
-        |_req: Request<Body>| async { Ok(Response::new(Body::empty())) },
-        |_req: Request<Body>| async { Ok(Response::new(Body::empty())) },
-        |_req: Request<Body>| async { Ok(Response::new(Body::from("ok"))) },
-    );
-
-    HttpServer::new(kernel)
-        .serve(([127, 0, 0, 1], 8701).into())
-        .await?;
-    Ok(())
-}
-```
-
-- `tc_ir/examples/hello_library.rs` provides a standalone example of building a
-  `LibraryModule` and dispatching handlers without HTTP.
-- `tc-server/src/http.rs` includes the `serves_native_library_route` async test,
-  which exercises the `/lib/hello` path end-to-end and doubles as a reference
-  client/server exchange.
+Installed IR Libraries compile into the native `LibraryRegistry` and invoke one
+another through the kernel without HTTP or serialization. Their schemas and
+artifacts persist through the bootstrap-injected `LibraryStore`; collection
+arguments continue to use the independently injected `Workspace`. Use the HTTP
+bootstrap above for a transport host, or assemble `Kernel::builder` directly for
+an embedded native host.
 
 ## PyO3 adapter
 

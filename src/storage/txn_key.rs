@@ -1,42 +1,90 @@
-use std::{
-    cmp::Ordering,
-    fmt,
-    hash::{Hash, Hasher},
-    str::FromStr,
-    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
-};
+use std::{cmp::Ordering, fmt, str::FromStr};
 
 use freqfs::Name;
 use tc_ir::{NetworkTime, TxnId};
 
-static IMMEDIATE_TXN_NONCE: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct StorageTxnKey(pub(crate) TxnId);
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum StorageTxnKey {
+    Bootstrap,
+    Protocol(TxnId),
+    Maintenance(NetworkTime),
+}
 
 impl From<TxnId> for StorageTxnKey {
     fn from(txn_id: TxnId) -> Self {
-        Self(txn_id)
+        Self::Protocol(txn_id)
     }
 }
 
 impl fmt::Display for StorageTxnKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        match self {
+            Self::Bootstrap => f.write_str("00000000000000000000-0"),
+            Self::Protocol(txn_id) => write!(
+                f,
+                "{:020}-1-{:05}-{}",
+                txn_id.timestamp().as_nanos(),
+                txn_id.nonce(),
+                HexTrace(txn_id.trace_bytes())
+            ),
+            Self::Maintenance(timestamp) => write!(f, "{:020}-2", timestamp.as_nanos()),
+        }
     }
 }
 
-impl PartialEq for StorageTxnKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+struct HexTrace<'a>(&'a [u8; 32]);
+
+impl fmt::Display for HexTrace<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+
+        Ok(())
     }
 }
 
-impl Eq for StorageTxnKey {}
+impl FromStr for StorageTxnKey {
+    type Err = &'static str;
 
-impl Hash for StorageTxnKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "00000000000000000000-0" {
+            return Ok(Self::Bootstrap);
+        }
+
+        let mut parts = s.split('-');
+        let timestamp = parts.next().ok_or("missing storage version timestamp")?;
+        let kind = parts.next().ok_or("missing storage version kind")?;
+
+        match kind {
+            "1" => {
+                let nonce = parts.next().ok_or("missing protocol version nonce")?;
+                let trace = parts.next().ok_or("missing protocol version trace")?;
+                if parts.next().is_some() {
+                    return Err("invalid protocol storage version");
+                }
+
+                format!(
+                    "{timestamp}-{}-{trace}",
+                    nonce
+                        .parse::<u16>()
+                        .map_err(|_| "invalid protocol version nonce")?
+                )
+                .parse()
+                .map(Self::Protocol)
+            }
+            "2" => {
+                if parts.next().is_some() {
+                    return Err("invalid maintenance storage version");
+                }
+
+                timestamp
+                    .parse()
+                    .map(Self::Maintenance)
+                    .map_err(|_| "invalid maintenance storage version")
+            }
+            _ => Err("invalid storage version kind"),
+        }
     }
 }
 
@@ -48,15 +96,19 @@ impl PartialOrd for StorageTxnKey {
 
 impl Ord for StorageTxnKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-impl FromStr for StorageTxnKey {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        TxnId::from_str(s).map(Self)
+        match (self, other) {
+            (Self::Bootstrap, Self::Bootstrap) => Ordering::Equal,
+            (Self::Bootstrap, _) => Ordering::Less,
+            (_, Self::Bootstrap) => Ordering::Greater,
+            (Self::Protocol(left), Self::Protocol(right)) => left.cmp(right),
+            (Self::Maintenance(left), Self::Maintenance(right)) => left.cmp(right),
+            (Self::Protocol(left), Self::Maintenance(right)) => {
+                left.timestamp().cmp(right).then(Ordering::Less)
+            }
+            (Self::Maintenance(left), Self::Protocol(right)) => {
+                left.cmp(&right.timestamp()).then(Ordering::Greater)
+            }
+        }
     }
 }
 
@@ -78,16 +130,4 @@ impl PartialOrd<str> for StorageTxnKey {
         let other: StorageTxnKey = other.parse().ok()?;
         PartialOrd::partial_cmp(self, &other)
     }
-}
-
-pub(super) fn immediate_txn_id() -> StorageTxnKey {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(2);
-    let nonce = IMMEDIATE_TXN_NONCE.fetch_add(1, AtomicOrdering::Relaxed) as u16;
-    StorageTxnKey(TxnId::from_parts(
-        NetworkTime::from_nanos(nanos.max(2)),
-        nonce,
-    ))
 }

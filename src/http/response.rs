@@ -1,9 +1,5 @@
-use std::io;
-
-use futures::TryStreamExt;
 use hyper::StatusCode;
 use tc_error::{ErrorKind, TCError};
-use tc_ir::LibrarySchema;
 
 use super::{Body, Response};
 
@@ -62,27 +58,41 @@ pub(crate) fn tc_error_response(err: TCError) -> Response {
         ErrorKind::Conflict => StatusCode::CONFLICT,
         ErrorKind::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
         ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        ErrorKind::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        ErrorKind::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         ErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorKind::Timeout => StatusCode::REQUEST_TIMEOUT,
+        ErrorKind::Forbidden => StatusCode::FORBIDDEN,
+        ErrorKind::Internal | ErrorKind::NotImplemented => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
-    hyper::Response::builder()
+    let mut response = hyper::Response::builder()
         .status(status)
-        .header(hyper::header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(err.message().to_string()))
-        .expect("tc error response")
-}
-
-pub(crate) fn schema_response(schema: LibrarySchema) -> Response {
-    match destream_json::encode(schema) {
-        Ok(stream) => {
-            let body = Body::wrap_stream(stream.map_err(|err| io::Error::other(err.to_string())));
-            hyper::Response::builder()
-                .status(StatusCode::OK)
-                .header(hyper::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .expect("native schema response")
-        }
-        Err(err) => internal_error_response(&err.to_string()),
+        .header(hyper::header::CONTENT_TYPE, "application/json");
+    if let Some(retry_after_ms) = err
+        .pressure()
+        .and_then(|pressure| pressure.retry_after_ms())
+    {
+        let seconds = retry_after_ms.div_ceil(1000).max(1);
+        response = response.header(hyper::header::RETRY_AFTER, seconds.to_string());
     }
+    let pressure = err.pressure().map(|pressure| {
+        serde_json::json!({
+            "reason": pressure.reason().to_string(),
+            "resource": pressure.resource(),
+            "retry_after_ms": pressure.retry_after_ms(),
+            "reliability": pressure.reliability().to_string(),
+        })
+    });
+    let body = serde_json::json!({
+        err.code().to_string(): {
+            "message": err.message(),
+            "stack": [],
+            "pressure": pressure,
+        }
+    });
+    response
+        .body(Body::from(body.to_string()))
+        .expect("tc error response")
 }

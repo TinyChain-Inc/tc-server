@@ -8,8 +8,8 @@ use super::http_util::{
     bad_request, decode_encrypted_request, empty_response, json_ok, method_not_allowed,
 };
 use super::{PeerIdentity, PeerMembership, PeerRoutes, ReplicationIssuer, normalize_peer};
-use crate::KernelHandler;
 use crate::Response;
+use crate::http::HttpHandler;
 
 #[derive(Serialize)]
 struct PeerList {
@@ -27,7 +27,7 @@ pub fn peer_membership_handler(
     membership: PeerMembership,
     issuer: Arc<ReplicationIssuer>,
     routes: PeerRoutes,
-) -> impl KernelHandler {
+) -> impl HttpHandler {
     move |req: Request<Body>| {
         let membership = membership.clone();
         let issuer = issuer.clone();

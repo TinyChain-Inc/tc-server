@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper::{Body, StatusCode};
+use hyper::StatusCode;
 use pathlink::Link;
 use tc_ir::LibrarySchema;
 use tinychain::auth::{Actor, KeyringActorResolver, PublicKeyStore};
@@ -12,17 +12,17 @@ use tinychain::http::{HttpServer, host_handler_with_public_keys};
 use tinychain::kernel::Kernel;
 use tinychain::library::LibraryRegistry;
 use tinychain::library::default_library_schema;
-use tinychain::library::http::{build_http_library_module, http_library_handlers};
+use tinychain::library::http::build_http_library_module;
 use tinychain::replication::{
-    ReplicationIssuer, export_handler, parse_psk_keys, replicate_from_peers_targeted,
-    replication_token_handler,
+    HttpClusterGateway, ReplicationIssuer, export_handler, parse_psk_keys,
+    replicate_from_peers_targeted, replication_token_handler,
 };
 use umask::{USER_READ, USER_WRITE};
 
 mod support;
 
 use support::{
-    begin_transaction, combine_host_handlers, finalize_install, get_library_status,
+    combine_host_handlers, finalize_install, get_library_status, http_router, new_txn_id,
     put_library_definition, token_for_schema, token_for_schema_and_txn,
 };
 
@@ -71,12 +71,20 @@ async fn install_rejects_txn_hijack_by_different_authorized_actor() {
     let schema = sample_schema("/lib/example-devco/txn-hijack/0.1.0");
     let (server, attacker_actor) = start_server_with_secondary_actor("txn-hijack").await;
 
-    let owner_begin = token_for_schema(&server.actor, &schema, USER_WRITE);
-    let txn_id = begin_transaction(server.addr, owner_begin).await;
+    let txn_id = new_txn_id();
+    let owner_token = token_for_schema_and_txn(&server.actor, &schema, USER_WRITE, txn_id);
+    let definition = library_definition_for_schema(&schema);
+    let owner_put = put_library_definition(
+        server.addr,
+        Some(owner_token.clone()),
+        definition.clone(),
+        Some(txn_id),
+    )
+    .await;
+    assert_eq!(owner_put.status(), StatusCode::NO_CONTENT);
 
     // Attacker has a valid signer + write claim for the same schema, but does not own this txn.
     let attacker_token = token_for_schema_and_txn(&attacker_actor, &schema, USER_WRITE, txn_id);
-    let definition = library_definition_for_schema(&schema);
     let hijack_put = put_library_definition(
         server.addr,
         Some(attacker_token.clone()),
@@ -89,15 +97,6 @@ async fn install_rejects_txn_hijack_by_different_authorized_actor() {
     let hijack_finalize = finalize_install(server.addr, &attacker_token, txn_id, true).await;
     assert_eq!(hijack_finalize.status(), StatusCode::UNAUTHORIZED);
 
-    let owner_token = token_for_schema_and_txn(&server.actor, &schema, USER_WRITE, txn_id);
-    let owner_put = put_library_definition(
-        server.addr,
-        Some(owner_token.clone()),
-        definition,
-        Some(txn_id),
-    )
-    .await;
-    assert_eq!(owner_put.status(), StatusCode::NO_CONTENT);
     let owner_commit = finalize_install(server.addr, &owner_token, txn_id, true).await;
     assert_eq!(owner_commit.status(), StatusCode::NO_CONTENT);
 
@@ -120,16 +119,28 @@ async fn replication_bootstrap_propagates_library_across_three_hosts() {
 
     let keys = shared_replication_keys();
     let leader_peer = format!("http://{}", leader.addr);
-    let report =
-        replicate_from_peers_targeted(&replica_a.registry, &[leader_peer], &keys, None).await;
+    let report = replicate_from_peers_targeted(
+        &replica_a.registry,
+        &[leader_peer],
+        &keys,
+        None,
+        &HttpClusterGateway::new(),
+    )
+    .await;
     assert!(report.is_clean(), "replica_a bootstrap report: {report:?}");
 
     let replica_a_status = get_library_status(replica_a.addr, &schema.id().to_string()).await;
     assert_eq!(replica_a_status, StatusCode::OK);
 
     let replica_a_peer = format!("http://{}", replica_a.addr);
-    let report =
-        replicate_from_peers_targeted(&replica_b.registry, &[replica_a_peer], &keys, None).await;
+    let report = replicate_from_peers_targeted(
+        &replica_b.registry,
+        &[replica_a_peer],
+        &keys,
+        None,
+        &HttpClusterGateway::new(),
+    )
+    .await;
     assert!(report.is_clean(), "replica_b bootstrap report: {report:?}");
 
     let replica_b_status = get_library_status(replica_b.addr, &schema.id().to_string()).await;
@@ -146,7 +157,14 @@ async fn replication_bootstrap_tolerates_membership_churn_and_dead_peers() {
 
     let seed = start_server("churn-seed").await;
     let leader_peer = format!("http://{}", leader.addr);
-    let report = replicate_from_peers_targeted(&seed.registry, &[leader_peer], &keys, None).await;
+    let report = replicate_from_peers_targeted(
+        &seed.registry,
+        &[leader_peer],
+        &keys,
+        None,
+        &HttpClusterGateway::new(),
+    )
+    .await;
     assert!(report.is_clean(), "seed bootstrap report: {report:?}");
     let seed_status = get_library_status(seed.addr, &schema.id().to_string()).await;
     assert_eq!(seed_status, StatusCode::OK);
@@ -156,7 +174,14 @@ async fn replication_bootstrap_tolerates_membership_churn_and_dead_peers() {
         "http://127.0.0.1:1".to_string(),
         format!("http://{}", seed.addr),
     ];
-    let report = replicate_from_peers_targeted(&replacement.registry, &peers, &keys, None).await;
+    let report = replicate_from_peers_targeted(
+        &replacement.registry,
+        &peers,
+        &keys,
+        None,
+        &HttpClusterGateway::new(),
+    )
+    .await;
     assert_eq!(
         report.installed.len(),
         1,
@@ -188,6 +213,7 @@ async fn scale_out_joiner_catches_up_after_existing_member_reconciles() {
         std::slice::from_ref(&leader_peer),
         &keys,
         None,
+        &HttpClusterGateway::new(),
     )
     .await;
     assert!(report.is_clean(), "seed bootstrap report: {report:?}");
@@ -201,14 +227,28 @@ async fn scale_out_joiner_catches_up_after_existing_member_reconciles() {
     let seed_b_before = get_library_status(seed.addr, &schema_b.id().to_string()).await;
     assert_eq!(seed_b_before, StatusCode::NOT_FOUND);
 
-    let report = replicate_from_peers_targeted(&seed.registry, &[leader_peer], &keys, None).await;
+    let report = replicate_from_peers_targeted(
+        &seed.registry,
+        &[leader_peer],
+        &keys,
+        None,
+        &HttpClusterGateway::new(),
+    )
+    .await;
     assert!(report.is_clean(), "seed reconcile report: {report:?}");
     let seed_b_after = get_library_status(seed.addr, &schema_b.id().to_string()).await;
     assert_eq!(seed_b_after, StatusCode::OK);
 
     let joiner = start_server("scale-joiner").await;
     let seed_peer = format!("http://{}", seed.addr);
-    let report = replicate_from_peers_targeted(&joiner.registry, &[seed_peer], &keys, None).await;
+    let report = replicate_from_peers_targeted(
+        &joiner.registry,
+        &[seed_peer],
+        &keys,
+        None,
+        &HttpClusterGateway::new(),
+    )
+    .await;
     assert!(report.is_clean(), "joiner bootstrap report: {report:?}");
 
     let joiner_a = get_library_status(joiner.addr, &schema_a.id().to_string()).await;
@@ -233,6 +273,7 @@ async fn restart_rehydrates_and_catches_up_after_downtime() {
         std::slice::from_ref(&leader_peer),
         &keys,
         None,
+        &HttpClusterGateway::new(),
     )
     .await;
     assert!(report.is_clean(), "replica bootstrap report: {report:?}");
@@ -252,8 +293,14 @@ async fn restart_rehydrates_and_catches_up_after_downtime() {
     let replica_v1_before = get_library_status(replica.addr, &schema_v1.id().to_string()).await;
     assert_eq!(replica_v1_before, StatusCode::NOT_FOUND);
 
-    let report =
-        replicate_from_peers_targeted(&replica.registry, &[leader_peer], &keys, None).await;
+    let report = replicate_from_peers_targeted(
+        &replica.registry,
+        &[leader_peer],
+        &keys,
+        None,
+        &HttpClusterGateway::new(),
+    )
+    .await;
     assert!(report.is_clean(), "replica reconcile report: {report:?}");
     let replica_v1_after = get_library_status(replica.addr, &schema_v1.id().to_string()).await;
     assert_eq!(replica_v1_after, StatusCode::OK);
@@ -332,12 +379,19 @@ async fn start_server(label: &str) -> RunningServer {
 async fn start_server_with_secondary_actor(label: &str) -> (RunningServer, Actor) {
     let storage_dir = temp_storage_dir(label);
     let schema = default_library_schema();
-    let module = build_http_library_module(schema.clone(), Some(storage_dir.clone()))
-        .await
-        .expect("module");
+    let storage = tinychain::HostStorage::new(&tinychain::HostLimits::default().storage);
+    let module = build_http_library_module(
+        schema.clone(),
+        Some(
+            storage
+                .library_store(storage_dir.clone())
+                .await
+                .expect("library store"),
+        ),
+    )
+    .await
+    .expect("module");
     module.hydrate_from_storage().await.expect("hydrate");
-    let handlers = http_library_handlers(&module);
-
     let host = Link::from_str("/host").expect("host link");
     let actor =
         Actor::new_falcon512(format!("install-tester-{label}")).expect("generate Falcon-512 actor");
@@ -360,20 +414,21 @@ async fn start_server_with_secondary_actor(label: &str) -> (RunningServer, Actor
         .with_host_id(format!("test-install-security-{label}"))
         .with_http_rpc_gateway()
         .with_rjwt_keyring_token_verifier(keyring.clone())
-        .with_library_module(module.clone(), handlers)
-        .with_service_handler(|_req| async move { hyper::Response::new(Body::empty()) })
-        .with_kernel_handler(combine_host_handlers(
-            host_handler_with_public_keys(public_keys),
-            replication_token_handler(replication_issuer),
-            export_handler(module.clone()),
-        ))
-        .with_health_handler(|_req| async move { hyper::Response::new(Body::empty()) })
+        .with_library_module(module.clone())
         .finish();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let addr = listener.local_addr().expect("addr");
 
-    let server = HttpServer::new(kernel);
+    let router = http_router(
+        module.clone(),
+        combine_host_handlers(
+            host_handler_with_public_keys(public_keys),
+            replication_token_handler(replication_issuer),
+            export_handler(module.clone()),
+        ),
+    );
+    let server = HttpServer::new(kernel, router);
     let server_task = tokio::spawn(async move {
         let _ = server.serve_listener(listener).await;
     });
@@ -394,12 +449,19 @@ async fn start_server_with_secondary_actor(label: &str) -> (RunningServer, Actor
 
 async fn start_server_with_storage(label: &str, storage_dir: PathBuf) -> RunningServer {
     let schema = default_library_schema();
-    let module = build_http_library_module(schema.clone(), Some(storage_dir.clone()))
-        .await
-        .expect("module");
+    let storage = tinychain::HostStorage::new(&tinychain::HostLimits::default().storage);
+    let module = build_http_library_module(
+        schema.clone(),
+        Some(
+            storage
+                .library_store(storage_dir.clone())
+                .await
+                .expect("library store"),
+        ),
+    )
+    .await
+    .expect("module");
     module.hydrate_from_storage().await.expect("hydrate");
-    let handlers = http_library_handlers(&module);
-
     let host = Link::from_str("/host").expect("host link");
     let actor =
         Actor::new_falcon512(format!("install-tester-{label}")).expect("generate Falcon-512 actor");
@@ -418,20 +480,21 @@ async fn start_server_with_storage(label: &str, storage_dir: PathBuf) -> Running
         .with_host_id(format!("test-install-security-{label}"))
         .with_http_rpc_gateway()
         .with_rjwt_keyring_token_verifier(keyring.clone())
-        .with_library_module(module.clone(), handlers)
-        .with_service_handler(|_req| async move { hyper::Response::new(Body::empty()) })
-        .with_kernel_handler(combine_host_handlers(
-            host_handler_with_public_keys(public_keys),
-            replication_token_handler(replication_issuer),
-            export_handler(module.clone()),
-        ))
-        .with_health_handler(|_req| async move { hyper::Response::new(Body::empty()) })
+        .with_library_module(module.clone())
         .finish();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let addr = listener.local_addr().expect("addr");
 
-    let server = HttpServer::new(kernel);
+    let router = http_router(
+        module.clone(),
+        combine_host_handlers(
+            host_handler_with_public_keys(public_keys),
+            replication_token_handler(replication_issuer),
+            export_handler(module.clone()),
+        ),
+    );
+    let server = HttpServer::new(kernel, router);
     let server_task = tokio::spawn(async move {
         let _ = server.serve_listener(listener).await;
     });
@@ -448,8 +511,7 @@ async fn start_server_with_storage(label: &str, storage_dir: PathBuf) -> Running
 }
 
 async fn install_library_with_write_token(server: &RunningServer, schema: &LibrarySchema) {
-    let begin_token = token_for_schema(&server.actor, schema, USER_WRITE);
-    let txn_id = begin_transaction(server.addr, begin_token).await;
+    let txn_id = new_txn_id();
     let token = token_for_schema_and_txn(&server.actor, schema, USER_WRITE, txn_id);
     let definition = library_definition_for_schema(schema);
     let response =

@@ -1,9 +1,18 @@
-use std::{io, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    io,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
+use crate::Workspace;
 use crate::ir::{IR_ARTIFACT_CONTENT_TYPE, WASM_ARTIFACT_CONTENT_TYPE};
-use freqfs::Cache;
+use freqfs::{Cache, DirLock};
 use pathlink::Link;
 use serde::{Deserialize, Serialize};
+use tc_collection::PersistentFile;
 use tc_error::{TCError, TCResult};
 use tc_ir::{LibrarySchema, NetworkTime, TxnId};
 use txfs::{Dir as TxDir, Id as TxName};
@@ -13,16 +22,12 @@ mod txn_key;
 
 pub(crate) use file::LibraryFile;
 pub(crate) use txn_key::StorageTxnKey;
-use txn_key::immediate_txn_id;
 
 const LIB_ROOT: &str = "lib";
 const SCHEMA_FILE: &str = "schema.json";
 const WASM_FILE: &str = "library.wasm";
 const IR_FILE: &str = "library.ir.json";
-const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_CACHE_HANDLES: usize = 1024;
-const BOOTSTRAP_TXN: StorageTxnKey =
-    StorageTxnKey(TxnId::from_parts(NetworkTime::from_nanos(1), 0));
+const BOOTSTRAP_VERSION: StorageTxnKey = StorageTxnKey::Bootstrap;
 
 #[derive(Clone, Debug)]
 pub struct Artifact {
@@ -35,21 +40,85 @@ pub struct Artifact {
 pub struct LibraryStore {
     root: LibraryRoot,
     segments: Arc<Vec<TxName>>,
+    maintenance: Arc<AtomicU64>,
 }
 
 pub(crate) type LibraryRoot = TxDir<StorageTxnKey, LibraryFile>;
 
-impl LibraryStore {
-    pub async fn open(root: PathBuf) -> TCResult<Self> {
-        let root_dir = load_library_root(root).await?;
-        Ok(Self::from_root(root_dir))
+/// Bootstrap-owned storage caches, one for each host filesystem root.
+#[derive(Clone)]
+pub struct HostStorage {
+    workspace: Arc<Cache<PersistentFile>>,
+    data: Arc<Cache<LibraryFile>>,
+    library_maintenance: Arc<AtomicU64>,
+}
+
+impl HostStorage {
+    pub fn new(limits: &crate::StorageLimits) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(1);
+        Self {
+            workspace: Cache::new(
+                limits.collection_cache_bytes,
+                Some(limits.collection_file_handles),
+                limits.minimum_free_disk_bytes,
+                limits.cache_wait,
+            ),
+            data: Cache::new(
+                limits.library_cache_bytes,
+                Some(limits.library_file_handles),
+                limits.minimum_free_disk_bytes,
+                limits.cache_wait,
+            ),
+            library_maintenance: Arc::new(AtomicU64::new(now)),
+        }
     }
 
-    pub(crate) fn from_root(root: LibraryRoot) -> Self {
+    pub fn workspace(&self, path: impl AsRef<std::path::Path>) -> TCResult<Workspace> {
+        std::fs::create_dir_all(path.as_ref()).map_err(map_io)?;
+        let root = Arc::clone(&self.workspace)
+            .load(path.as_ref().to_path_buf())
+            .map_err(map_io)?;
+        Ok(Workspace::from_root(root))
+    }
+
+    pub async fn library_store(&self, path: impl AsRef<std::path::Path>) -> TCResult<LibraryStore> {
+        std::fs::create_dir_all(path.as_ref()).map_err(map_io)?;
+        let data = Arc::clone(&self.data)
+            .load(path.as_ref().to_path_buf())
+            .map_err(map_io)?;
+        let root = {
+            let mut data = data.write().await;
+            data.get_or_create_dir(LIB_ROOT.to_string())
+                .map_err(map_io)?
+        };
+        Ok(LibraryStore::from_root(
+            load_library_root(root).await?,
+            Arc::clone(&self.library_maintenance),
+        ))
+    }
+}
+
+impl LibraryStore {
+    pub(crate) fn from_root(root: LibraryRoot, maintenance: Arc<AtomicU64>) -> Self {
         Self {
             root,
             segments: Arc::new(Vec::new()),
+            maintenance,
         }
+    }
+
+    fn maintenance_key(&self) -> StorageTxnKey {
+        let timestamp = self.maintenance.fetch_add(1, Ordering::Relaxed) + 1;
+        StorageTxnKey::Maintenance(NetworkTime::from_nanos(timestamp))
+    }
+
+    fn protocol_key(&self, txn_id: TxnId) -> StorageTxnKey {
+        self.maintenance
+            .fetch_max(txn_id.timestamp().as_nanos(), Ordering::Relaxed);
+        StorageTxnKey::Protocol(txn_id)
     }
 
     pub async fn for_schema(&self, schema: &LibrarySchema) -> TCResult<Self> {
@@ -61,12 +130,13 @@ impl LibraryStore {
         Ok(Self {
             root: self.root.clone(),
             segments: Arc::new(segments),
+            maintenance: Arc::clone(&self.maintenance),
         })
     }
 
     pub async fn discover_schemas(&self) -> TCResult<Vec<LibrarySchema>> {
         let mut schemas = Vec::new();
-        let txn_id = immediate_txn_id();
+        let txn_id = self.maintenance_key();
         let discovered = discover_schemas(self.root.clone(), txn_id, &mut schemas).await;
         self.root.finalize(txn_id).await;
         discovered?;
@@ -78,7 +148,7 @@ impl LibraryStore {
     pub async fn persist_schema_immediate(&self, schema: &LibrarySchema) -> TCResult<()> {
         // Top-level immediate installs still stage through txfs so disk writes
         // commit atomically. Do not call this from inside an active kernel txn.
-        let txn_id = immediate_txn_id();
+        let txn_id = self.maintenance_key();
         let staged = self.persist_schema_at(txn_id, schema).await;
         match staged {
             Ok(()) => self.finalize_storage_txn(txn_id, true).await,
@@ -90,7 +160,8 @@ impl LibraryStore {
     }
 
     pub async fn stage_schema(&self, txn_id: TxnId, schema: &LibrarySchema) -> TCResult<()> {
-        self.persist_schema_at(txn_id.into(), schema).await
+        self.persist_schema_at(self.protocol_key(txn_id), schema)
+            .await
     }
 
     pub async fn persist_artifact_immediate(
@@ -100,7 +171,7 @@ impl LibraryStore {
     ) -> TCResult<()> {
         // Top-level immediate installs still stage through txfs so disk writes
         // commit atomically. Do not call this from inside an active kernel txn.
-        let txn_id = immediate_txn_id();
+        let txn_id = self.maintenance_key();
         let staged = self.persist_artifact_at(txn_id, schema, artifact).await;
         match staged {
             Ok(()) => self.finalize_storage_txn(txn_id, true).await,
@@ -117,16 +188,17 @@ impl LibraryStore {
         schema: &LibrarySchema,
         artifact: &Artifact,
     ) -> TCResult<()> {
-        self.persist_artifact_at(txn_id.into(), schema, artifact)
+        self.persist_artifact_at(self.protocol_key(txn_id), schema, artifact)
             .await
     }
 
     pub async fn finalize_txn(&self, txn_id: TxnId, commit: bool) -> TCResult<()> {
-        self.finalize_storage_txn(txn_id.into(), commit).await
+        self.finalize_storage_txn(self.protocol_key(txn_id), commit)
+            .await
     }
 
     pub async fn load_artifact(&self, schema: &LibrarySchema) -> TCResult<Option<Artifact>> {
-        let txn_id = immediate_txn_id();
+        let txn_id = self.maintenance_key();
         let loaded = self.load_artifact_at(txn_id, schema).await;
         self.root.finalize(txn_id).await;
         loaded
@@ -285,20 +357,15 @@ impl LibraryStore {
     }
 }
 
-pub(crate) async fn load_library_root(root: PathBuf) -> TCResult<LibraryRoot> {
-    let lib_root = root.join(LIB_ROOT);
-    tokio::fs::create_dir_all(&lib_root).await.map_err(map_io)?;
-
-    let cache = Cache::new(DEFAULT_CACHE_BYTES, Some(DEFAULT_CACHE_HANDLES));
-    let canonical = cache.load(lib_root).map_err(map_io)?;
-    let root = TxDir::load(BOOTSTRAP_TXN, canonical)
+pub(crate) async fn load_library_root(root: DirLock<LibraryFile>) -> TCResult<LibraryRoot> {
+    let root = TxDir::load(BOOTSTRAP_VERSION, root)
         .await
         .map_err(map_txfs)?;
 
     // Seal the loaded snapshot so subsequent transactions can stage writes without
     // conflicting against the bootstrap transaction.
-    root.commit(BOOTSTRAP_TXN, true).await;
-    root.finalize(BOOTSTRAP_TXN).await;
+    root.commit(BOOTSTRAP_VERSION, true).await;
+    root.finalize(BOOTSTRAP_VERSION).await;
 
     Ok(root)
 }
@@ -455,11 +522,12 @@ impl TryFrom<RawSchema> for LibrarySchema {
 mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::str::FromStr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use pathlink::Link;
+    use tc_ir::NetworkTime;
 
     use super::*;
 
@@ -473,8 +541,10 @@ mod tests {
             "0.1.0",
             vec![],
         );
-        let root_dir = load_library_root(root.clone()).await.expect("library root");
-        let store = LibraryStore::from_root(root_dir);
+        let store = HostStorage::new(&crate::HostLimits::default().storage)
+            .library_store(root.clone())
+            .await
+            .expect("library root");
         let store = store.for_schema(&schema).await.expect("schema store");
         store
             .persist_artifact_immediate(
@@ -503,12 +573,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn maintenance_versions_are_owned_by_one_host_storage() {
+        let root = unique_temp_dir("tc-storage-maintenance-version");
+        tokio::fs::create_dir_all(&root).await.expect("temp dir");
+
+        let storage = HostStorage::new(&crate::HostLimits::default().storage);
+        let store = storage
+            .library_store(root.clone())
+            .await
+            .expect("library root");
+        let schema = LibrarySchema::new(
+            Link::from_str("/lib/example-devco/maintenance/0.1.0").expect("schema link"),
+            "0.1.0",
+            vec![],
+        );
+        let child = store.for_schema(&schema).await.expect("schema store");
+
+        let first = store.maintenance_key();
+        let second = child.maintenance_key();
+        assert!(first < second);
+        assert_eq!(first.to_string().parse::<StorageTxnKey>(), Ok(first));
+        assert_eq!(second.to_string().parse::<StorageTxnKey>(), Ok(second));
+
+        let observed = match second {
+            StorageTxnKey::Maintenance(timestamp) => timestamp.as_nanos(),
+            _ => unreachable!("maintenance_key must return a maintenance version"),
+        };
+        let protocol = TxnId::from_parts(NetworkTime::from_nanos(observed + 10), 1);
+        let protocol_key = store.protocol_key(protocol);
+        let next = child.maintenance_key();
+        assert!(protocol_key < next);
+        assert_eq!(protocol_key, StorageTxnKey::Protocol(protocol));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn storage_txn_key_uses_full_txn_id_identity() {
-        let a =
-            StorageTxnKey(TxnId::from_parts(NetworkTime::from_nanos(42), 7).with_trace([1u8; 32]));
-        let b =
-            StorageTxnKey(TxnId::from_parts(NetworkTime::from_nanos(42), 7).with_trace([2u8; 32]));
+        let a = StorageTxnKey::Protocol(
+            TxnId::from_parts(NetworkTime::from_nanos(42), 7).with_trace([1u8; 32]),
+        );
+        let b = StorageTxnKey::Protocol(
+            TxnId::from_parts(NetworkTime::from_nanos(42), 7).with_trace([2u8; 32]),
+        );
 
         assert_ne!(
             a, b,
@@ -526,6 +634,70 @@ mod tests {
             hasher_b.finish(),
             "hash must include full TxnId identity"
         );
+    }
+
+    #[test]
+    fn storage_txn_key_text_preserves_version_order() {
+        let protocol = StorageTxnKey::Protocol(
+            TxnId::from_parts(NetworkTime::from_nanos(42), 7).with_trace([1u8; 32]),
+        );
+        let versions = [
+            StorageTxnKey::Maintenance(NetworkTime::from_nanos(42)),
+            StorageTxnKey::Bootstrap,
+            StorageTxnKey::Maintenance(NetworkTime::from_nanos(43)),
+            protocol,
+        ];
+
+        let mut semantic = versions;
+        semantic.sort();
+        let mut rendered = versions.map(|version| version.to_string());
+        rendered.sort();
+
+        assert_eq!(
+            rendered,
+            semantic.map(|version| version.to_string()),
+            "freqfs filename order must match StorageTxnKey order"
+        );
+        assert_eq!(protocol.to_string().parse(), Ok(protocol));
+    }
+
+    #[test]
+    fn production_cache_construction_is_bootstrap_owned() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for path in [
+            "src/workspace.rs",
+            "src/http/config.rs",
+            "src/library/http.rs",
+            "src/pyo3_runtime/kernel.rs",
+        ] {
+            let source = std::fs::read_to_string(manifest.join(path)).expect("read source");
+            let cache_constructor = ["Cache", "::new("].concat();
+            assert!(
+                !source.contains(&cache_constructor),
+                "{path} must receive bootstrap-owned storage, not construct a cache"
+            );
+        }
+
+        let source = std::fs::read_to_string(manifest.join("src/storage/mod.rs"))
+            .expect("read storage source");
+        let cache_constructor = ["Cache", "::new("].concat();
+        assert_eq!(
+            source.matches(&cache_constructor).count(),
+            2,
+            "HostStorage must remain the sole production cache owner"
+        );
+        assert!(source.contains("workspace: Arc<Cache<PersistentFile>>"));
+        assert!(source.contains("data: Arc<Cache<LibraryFile>>"));
+        assert!(source.contains("Arc::clone(&self.workspace)"));
+        assert!(source.contains("Arc::clone(&self.data)"));
+        assert!(source.contains("get_or_create_dir(LIB_ROOT.to_string())"));
+
+        let key_source = std::fs::read_to_string(manifest.join("src/storage/txn_key.rs"))
+            .expect("read storage key source");
+        assert!(!key_source.contains("static IMMEDIATE"));
+        assert!(!key_source.contains("Atomic"));
+        assert!(!key_source.contains("SystemTime"));
+        assert!(!key_source.contains("from_parts"));
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

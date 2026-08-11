@@ -22,7 +22,6 @@ pub(crate) struct TrustedInstaller {
     pub(crate) actor_id: String,
     pub(crate) public_key_b64: String,
     #[serde(default)]
-    #[serde(alias = "allowed_prefixes")]
     pub(crate) allowed_lib_prefixes: Vec<String>,
 }
 

@@ -1,29 +1,5 @@
 use super::*;
 
-pub(super) fn scalar_param<'a>(
-    params: &'a Map<Scalar>,
-    name: &str,
-    context: &str,
-) -> TCResult<Option<&'a Scalar>> {
-    let id: Id = name
-        .parse()
-        .map_err(|err| TCError::internal(format!("invalid {context} id: {err}")))?;
-
-    Ok(params.get(&id))
-}
-
-pub(super) fn required_scalar_param<'a>(
-    params: &'a Map<Scalar>,
-    name: &str,
-    context: &str,
-) -> TCResult<&'a Scalar> {
-    let Some(value) = scalar_param(params, name, context)? else {
-        return Err(TCError::bad_request(format!("missing {context} {name}")));
-    };
-
-    Ok(value)
-}
-
 pub(super) fn param_id(params: &Map<Scalar>, name: &str) -> TCResult<Id> {
     let id: Id = name
         .parse()
@@ -54,7 +30,7 @@ pub(super) async fn param_opdef(
     let Some(value) = params.get(&id) else {
         return Err(TCError::bad_request(format!("missing {name} parameter")));
     };
-    let state = scalar_to_state(value.clone(), values, txn, self_link).await?;
+    let state = resolve_scalar(value.clone(), values, txn, self_link).await?;
     state_to_opdef(state)
 }
 
@@ -71,7 +47,7 @@ pub(super) async fn param_state(
     let Some(value) = params.get(&id) else {
         return Err(TCError::bad_request(format!("missing {name} parameter")));
     };
-    scalar_to_state(value.clone(), values, txn, self_link).await
+    resolve_scalar(value.clone(), values, txn, self_link).await
 }
 
 pub(super) fn resolve_params(
@@ -86,7 +62,7 @@ pub(super) fn resolve_params(
     Box::pin(async move {
         let mut resolved = Map::new();
         for (key, value) in params {
-            let value = scalar_to_state(value, &values, &txn, self_link.as_ref()).await?;
+            let value = resolve_scalar(value, &values, &txn, self_link.as_ref()).await?;
             resolved.insert(key, value);
         }
         Ok(resolved)

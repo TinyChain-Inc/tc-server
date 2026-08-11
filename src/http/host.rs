@@ -1,9 +1,6 @@
-use std::str::FromStr;
-
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
-use pathlink::PathBuf as LinkPathBuf;
 use tc_value::Value;
 use url::form_urlencoded;
 
@@ -12,39 +9,26 @@ use super::{Body, Request, StatusCode};
 
 pub fn host_handler_with_public_keys(
     keys: crate::auth::PublicKeyStore,
-) -> impl crate::KernelHandler {
-    let reflect = crate::reflect::reflect_handler();
-    let state = crate::state::state_handler();
-
+) -> impl crate::http::HttpHandler {
     move |req: Request| {
         let keys = keys.clone();
-        let reflect = reflect.clone();
-        let state = state.clone();
 
         async move {
-            if req.uri().path().starts_with("/state/") {
-                return state.call(req).await;
-            }
-
             match req.uri().path() {
-                _ if req.method() == hyper::Method::POST && {
-                    let Ok(parsed) = LinkPathBuf::from_str(req.uri().path()) else {
-                        return not_found();
-                    };
-
-                    parsed == LinkPathBuf::from(tc_ir::SCALAR_REFLECT_CLASS)
-                        || parsed == LinkPathBuf::from(tc_ir::SCALAR_REFLECT_REF_PARTS)
-                        || parsed == LinkPathBuf::from(tc_ir::OPDEF_REFLECT_FORM)
-                        || parsed == LinkPathBuf::from(tc_ir::OPDEF_REFLECT_LAST_ID)
-                        || parsed == LinkPathBuf::from(tc_ir::OPDEF_REFLECT_SCALARS)
-                } =>
-                {
-                    reflect.call(req).await
+                crate::uri::HOST_METRICS => {
+                    let snapshots = req
+                        .extensions()
+                        .get::<crate::HostResources>()
+                        .map(crate::HostResources::snapshots)
+                        .unwrap_or_default();
+                    let body = serde_json::to_string(&snapshots)
+                        .expect("capacity snapshots must encode as JSON");
+                    hyper::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .expect("metrics response")
                 }
-                crate::uri::HOST_METRICS => hyper::Response::builder()
-                    .status(StatusCode::OK)
-                    .body(Body::empty())
-                    .expect("metrics response"),
                 crate::uri::HOST_AUTH_CONTEXT => {
                     let Some(txn) = req.extensions().get::<crate::txn::TxnHandle>() else {
                         return hyper::Response::builder()
@@ -52,43 +36,13 @@ pub fn host_handler_with_public_keys(
                             .body(Body::empty())
                             .expect("unauthorized auth context response");
                     };
-                    let Some(auth) = txn.auth_context() else {
-                        return hyper::Response::builder()
+                    match crate::host::auth_context(txn) {
+                        Ok(state) => crate::http::state_response(state),
+                        Err(_) => hyper::Response::builder()
                             .status(StatusCode::UNAUTHORIZED)
                             .body(Body::empty())
-                            .expect("unauthorized auth context response");
-                    };
-
-                    let claims = auth
-                        .claims
-                        .iter()
-                        .map(|entry| {
-                            serde_json::json!({
-                                "host": entry.host,
-                                "actor_id": entry.actor_id,
-                                "link": entry.claim.link.to_string(),
-                                "mode": u32::from(entry.claim.mask),
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    let payload = serde_json::json!({
-                        "principal": auth.principal,
-                        "txn_timestamp_nanos": txn.id().timestamp().as_nanos(),
-                        "token_verified_at_nanos": auth.verified_at_nanos,
-                        "token_hosts": auth.token_hosts(),
-                        "claims": claims,
-                    });
-
-                    let body = match serde_json::to_vec(&payload) {
-                        Ok(body) => body,
-                        Err(_) => return internal_error_response("failed to encode auth context"),
-                    };
-
-                    hyper::Response::builder()
-                        .status(StatusCode::OK)
-                        .header(hyper::header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body))
-                        .expect("auth context response")
+                            .expect("unauthorized auth context response"),
+                    }
                 }
                 crate::uri::HOST_PUBLIC_KEY => {
                     use base64::Engine as _;

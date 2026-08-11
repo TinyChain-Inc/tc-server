@@ -1,15 +1,35 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use futures::stream::{FuturesUnordered, StreamExt};
+use crate::State;
+use futures::stream::{self, StreamExt};
 use pathlink::Link;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Id, Scalar};
-use tc_state::State;
 
 use crate::op_plan::OpPlan;
 
 use super::resolve::resolve_scalar;
+
+tokio::task_local! {
+    static GRAPH_OPERATION: ();
+}
+
+async fn resolve_with_admission(
+    provider: Scalar,
+    values: &Arc<HashMap<Id, State>>,
+    txn: &crate::txn::TxnHandle,
+    self_link: Option<&Link>,
+) -> TCResult<State> {
+    if GRAPH_OPERATION.try_with(|()| ()).is_ok() {
+        return resolve_scalar(provider, values, txn, self_link).await;
+    }
+
+    let _permit = txn.resources().admit_graph_op(txn.deadline()).await?;
+    GRAPH_OPERATION
+        .scope((), resolve_scalar(provider, values, txn, self_link))
+        .await
+}
 
 struct Queue {
     order: VecDeque<Id>,
@@ -133,21 +153,29 @@ impl<'a> Executor<'a> {
             let mut resolved = HashMap::with_capacity(pending.len());
             {
                 let values = Arc::new(self.values.clone());
-                let mut futures = FuturesUnordered::new();
-                for id in pending.into_iter() {
-                    let provider = self.providers.get(&id).cloned().ok_or_else(|| {
-                        TCError::not_found(format!("missing provider for id {id}"))
-                    })?;
-
-                    let values = Arc::clone(&values);
-                    let txn = self.txn.clone();
-                    let self_link = self.self_link.clone();
-                    futures.push(async move {
-                        let state =
-                            resolve_scalar(provider, &values, &txn, self_link.as_ref()).await;
-                        (id, state)
-                    });
-                }
+                let pending = pending
+                    .into_iter()
+                    .map(|id| {
+                        let provider = self.providers.get(&id).cloned().ok_or_else(|| {
+                            TCError::not_found(format!("missing provider for id {id}"))
+                        })?;
+                        Ok((id, provider))
+                    })
+                    .collect::<TCResult<Vec<_>>>()?;
+                let limit = self.txn.resources().limits().execution.parallel_graph_ops;
+                let mut futures = stream::iter(pending)
+                    .map(|(id, provider)| {
+                        let values = Arc::clone(&values);
+                        let txn = self.txn.clone();
+                        let self_link = self.self_link.clone();
+                        async move {
+                            let state =
+                                resolve_with_admission(provider, &values, &txn, self_link.as_ref())
+                                    .await;
+                            (id, state)
+                        }
+                    })
+                    .buffer_unordered(limit);
 
                 while let Some((id, result)) = futures.next().await {
                     match result {

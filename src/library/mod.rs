@@ -1,33 +1,32 @@
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use tc_error::TCResult;
 use tc_ir::LibrarySchema;
 use umask::USER_WRITE;
 
-use crate::{Body, KernelHandler, Response, StatusCode};
+use crate::storage::Artifact;
 
 mod install;
 #[cfg(any(feature = "http-server", feature = "pyo3"))]
 mod native;
 mod registry;
 mod route_meta;
-mod routes;
 mod runtime;
 mod state;
 mod util;
+pub(crate) mod view;
 
 pub use install::{
     CompiledLibraryPackage, InstallError, decode_compiled_library_package,
     decode_install_request_bytes, encode_compiled_library_package,
 };
+#[cfg(any(feature = "http-server", feature = "pyo3"))]
+pub use native::NativeLibrary;
 pub use registry::LibraryRegistry;
 pub use route_meta::{RouteMetadata, SchemaRoutes};
-pub use routes::{LibraryHandlers, LibraryRoutes};
 pub use runtime::LibraryRuntime;
 pub use state::{LibraryState, default_library_schema};
-
-#[cfg(any(feature = "http-server", feature = "pyo3"))]
-pub use native::{NativeLibrary, NativeLibraryHandler};
 
 #[cfg(any(feature = "http-server", feature = "pyo3"))]
 pub mod http;
@@ -35,9 +34,25 @@ pub mod http;
 #[cfg(test)]
 mod registry_tests;
 
-type HandlerArc = Arc<dyn KernelHandler>;
-type LibraryFactory =
-    Arc<dyn Fn(Vec<u8>) -> TCResult<(LibrarySchema, SchemaRoutes, HandlerArc)> + Send + Sync>;
+/// A compiled library is either directly executable by the native kernel or is
+/// retained for a transport-specific ABI such as WASM. The registry owns this
+/// lifecycle, not HTTP handlers.
+#[derive(Clone)]
+pub struct CompiledLibrary {
+    pub schema: LibrarySchema,
+    pub routes: SchemaRoutes,
+    pub artifact: Artifact,
+    pub execution: LibraryExecution,
+}
+
+#[derive(Clone)]
+pub enum LibraryExecution {
+    Native(crate::ir::IrRoutes),
+    Transport,
+}
+
+pub type LibraryCompiler =
+    Arc<dyn Fn(Artifact) -> BoxFuture<'static, TCResult<CompiledLibrary>> + Send + Sync>;
 
 #[derive(Debug)]
 pub(crate) enum StageInstallError {
@@ -55,26 +70,6 @@ impl StageInstallError {
         match error {
             InstallError::BadRequest(message) => Self::BadRequest(message),
             InstallError::Internal(message) => Self::Internal(message),
-        }
-    }
-}
-
-pub(crate) fn stage_install_error_response(error: StageInstallError) -> Response {
-    match error {
-        StageInstallError::Unauthorized(message) => {
-            let mut response = Response::new(Body::from(message));
-            *response.status_mut() = StatusCode::UNAUTHORIZED;
-            response
-        }
-        StageInstallError::BadRequest(message) => {
-            let mut response = Response::new(Body::from(message));
-            *response.status_mut() = StatusCode::BAD_REQUEST;
-            response
-        }
-        StageInstallError::Internal(message) => {
-            let mut response = Response::new(Body::from(message));
-            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            response
         }
     }
 }

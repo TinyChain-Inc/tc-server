@@ -1,34 +1,64 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::{Arc, RwLock};
 
 use tc_error::{TCError, TCResult};
 use tc_ir::LibrarySchema;
 
-use crate::storage::LibraryStore;
+use crate::storage::{Artifact, LibraryStore};
 
-use super::{LibraryFactory, LibraryRoutes, LibraryState};
+use super::{CompiledLibrary, LibraryCompiler, LibraryExecution, LibraryState};
 
 pub struct LibraryRuntime {
     pub(crate) state: LibraryState,
-    pub(crate) routes: LibraryRoutes,
+    execution: Arc<RwLock<Option<LibraryExecution>>>,
+    artifact: Arc<RwLock<Option<Artifact>>>,
     pub(crate) store: Option<LibraryStore>,
-    pub(crate) factories: BTreeMap<String, LibraryFactory>,
 }
 
 impl LibraryRuntime {
-    pub fn new(
-        initial_schema: LibrarySchema,
-        store: Option<LibraryStore>,
-        factories: BTreeMap<String, LibraryFactory>,
-    ) -> Self {
+    pub fn new(initial_schema: LibrarySchema, store: Option<LibraryStore>) -> Self {
         Self {
             state: LibraryState::new(initial_schema),
-            routes: LibraryRoutes::new(),
+            execution: Arc::new(RwLock::new(None)),
+            artifact: Arc::new(RwLock::new(None)),
             store,
-            factories,
         }
     }
 
-    pub async fn hydrate_from_storage(&self) -> TCResult<()> {
+    pub fn replace_execution(&self, execution: LibraryExecution) {
+        self.execution
+            .write()
+            .expect("library execution write lock")
+            .replace(execution);
+    }
+
+    pub fn execution(&self) -> Option<LibraryExecution> {
+        self.execution
+            .read()
+            .expect("library execution read lock")
+            .clone()
+    }
+
+    pub fn replace_compiled(&self, compiled: CompiledLibrary) {
+        self.state
+            .replace_with_routes(compiled.schema, compiled.routes);
+        self.artifact
+            .write()
+            .expect("library artifact write lock")
+            .replace(compiled.artifact);
+        self.replace_execution(compiled.execution);
+    }
+
+    pub fn artifact(&self) -> Option<Artifact> {
+        self.artifact
+            .read()
+            .expect("library artifact read lock")
+            .clone()
+    }
+
+    pub async fn hydrate_from_storage(
+        &self,
+        compilers: &std::collections::BTreeMap<String, LibraryCompiler>,
+    ) -> TCResult<()> {
         let store = match &self.store {
             Some(store) => store,
             None => return Ok(()),
@@ -40,19 +70,17 @@ impl LibraryRuntime {
             None => return Ok(()),
         };
 
-        let factory = match self.factories.get(&artifact.content_type) {
-            Some(factory) => Arc::clone(factory),
+        let compiler = match compilers.get(&artifact.content_type) {
+            Some(compiler) => Arc::clone(compiler),
             None => return Ok(()),
         };
-        let (manifest_schema, schema_routes, handler) = factory(artifact.bytes)?;
+        let compiled = compiler(artifact).await?;
 
-        if manifest_schema != schema {
+        if compiled.schema != schema {
             return Err(TCError::internal("persisted schema mismatch"));
         }
 
-        self.state
-            .replace_with_routes(manifest_schema, schema_routes);
-        self.routes.replace_arc(handler);
+        self.replace_compiled(compiled);
 
         Ok(())
     }
@@ -62,9 +90,9 @@ impl Clone for LibraryRuntime {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
-            routes: self.routes.clone(),
+            execution: Arc::clone(&self.execution),
+            artifact: Arc::clone(&self.artifact),
             store: self.store.clone(),
-            factories: self.factories.clone(),
         }
     }
 }

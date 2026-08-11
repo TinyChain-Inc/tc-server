@@ -8,7 +8,7 @@ behavior of the upstream `host` crate.
 ## Current transaction flow (as implemented today)
 
 - **Begin:** Any HTTP or PyO3 request to a transactional endpoint which omits `txn_id` triggers
-  `TxnManager::begin` (`/host/...` and `/healthz` are non-transactional).
+  `TxnServer` allocation (`/host/...` and `/healthz` are non-transactional).
   The handler executes immediately within that transaction, then the adapter commits or rolls it
   back before returning. The transaction ID is not exposed in response headers.
 - **Continue:** Host-owned gateways and replication fanout continue an existing transaction by
@@ -31,30 +31,18 @@ behavior of the upstream `host` crate.
 
 The `Kernel` owns this state machine so every protocol stack (HTTP, PyO3, etc.) shares a single
 implementation: adapters identify the reserved wire transaction context and whether the body is
-empty, then delegate to `Kernel::route_request`, which decides whether to begin, continue, commit,
+empty, then delegate to `Kernel::bind_transaction + Kernel::execute`, which decides whether to begin, continue, commit,
 or roll back. Keeping this logic centralized is critical—moving begin/commit heuristics into a
 protocol adapter or public client would bypass shared tests and risks future regressions.
 
-## Tensor routing ownership boundary (planned)
+## Tensor routing ownership boundary (complete)
 
-Goal: align with v1 ownership by consuming canonical Tensor route semantics
-from `tc-collection` (the home of the transactional Tensor type), not from
-`tc-state`.
-
-- Keep `tc-server` as a thin dispatcher/orchestrator for Tensor operations.
-- During migration, allow `tc-state` Tensor facade usage only as transitional
-  compatibility scaffolding.
-- Move authoritative Tensor operation semantics (`dtype`, `shape`, `size`,
-  `reshape`, `broadcast`, `expand_dims`, `transpose`, `slice`, math/reductions)
-  behind `tc-collection` interfaces.
-- Remove duplicated/parallel Tensor behavior in `tc-server` once the
-  `tc-collection` route contract is in place.
-- Acceptance criteria:
-  - `tc-server` Tensor resolver paths call one canonical `tc-collection`
-    interface for route semantics.
-  - parity tests demonstrate no behavior regressions across HTTP/PyO3 adapters.
-  - `tc-state` Tensor routing dependency is deprecated and then removed from
-    canonical host routing paths.
+`tc-collection` owns Tensor representation, validation, operations, and wire
+encoding. `tc-state` exposes Tensor only as a `State` variant and delegates its
+four verbs; it contains no fallback route semantics. `tc-server` resolves,
+authorizes, and delegates without Tensor branches. HTTP encodes the generic
+State stream, while PyO3 carries the same canonical bytes without a Tensor
+wrapper or native execution lane.
 
 ### Minimal publisher kit (in progress)
 
@@ -74,23 +62,14 @@ publishers to pull in any adapters or the Wasmtime dependency. Actions:
   hardware-accelerated code paths) behind TinyChain’s transaction/auth surface without shipping
   any transport adapters they do not need.
 
-### PyO3 bridge trait-system migration (in progress)
+### PyO3 bridge boundary (complete)
 
-Goal: keep in-process Python integration scalable and fast by removing centralized per-type
-binding impls and avoiding unnecessary serialization on native request paths.
-
-- Introduce shared conversion traits (`PyExtract`, `PyProject`) and migrate adapter plumbing to
-  compose type-family conversions instead of monolithic per-variant impls.
-- Keep conversion ownership near each type family:
-  - `tc-value` owns value projection/extraction.
-  - `tc-state` owns collection/state family projection/extraction.
-  - `tc-server` composes those traits at adapter boundaries.
-- Add a native dispatch lane for PyO3 in-process calls which passes `State` handles directly
-  through kernel routing. Keep JSON/destream encode/decode only at HTTP/WASM boundaries.
-- Add regression tests proving native PyO3 dispatch avoids encode/decode on request/response
-  bodies while preserving error/status semantics.
-- Add perf gates (latency + allocation) for common in-process operations (scalar get/post,
-  map/tuple payloads, tensor metadata reads) and block regressions beyond defined budgets.
+PyO3 owns only Python-object and byte conversion. It forwards canonical request
+bytes through the same kernel/HTTP path as every other adapter and receives
+canonical response bytes. It has no per-type `State` subclass, collection
+wrapper, native collection dispatch lane, or transaction behavior. Future
+performance work must improve this shared path rather than reintroducing a
+type-specific bridge.
 
 ## 1. Transaction foundation
 
@@ -111,25 +90,23 @@ The L0/L1 governance `ARCHITECTURE.md` references `txn_lock` at the consensus le
 work here is the concrete host-facing transaction implementation which makes cross-host TinyChain
 ops atomic and deterministic.
 
-- Define a minimal `Txn` trait (exposed from `tc-ir`) with:
-  - `id()` returning a `TxnId`.
-  - `claim()` for authorization.
-  - `commit()` / `rollback()` async hooks.
-- Add a `TxnServer` façade that:
-  - Creates new `Txn` handles (wrapping `txn_lock::TxnMapLock` for per-resource staging).
-  - Tracks which transactions are pending commit.
-  - Owns leadership: the origin node becomes the owner, while resource clusters provide
-    `Leader` handles with `commit/rollback` callbacks.
-- Update `Kernel::dispatch` to:
-  1. Acquire (or receive) a `Txn` before invoking any handler.
-  2. Ensure the HTTP/PyO3 layers tie each request to a host-owned mode:
-     - `Begin`: create a transaction for ordinary caller requests which omit `txn_id`.
-     - `Continue`: host-owned gateway/replication calls pass `txn_id`; the server looks it up.
-     - `Finalize`: host-owned gateway/replication calls commit or roll back at the component root.
-  3. On ordinary caller success, finalize before returning; on error, roll back and surface the
-     failure.
+- `tc_ir::Transaction` exposes the immutable identity and authorization claim used by every native
+  handler. Resource owners implement `Transact` for recursive commit, rollback, and history cleanup.
+- `TxnServer` owns the complete host protocol record: identity allocation, pinned owner,
+  canonical component leaders, active phase, TTL, and delegated resource finalization.
+- The allocating host owns the protocol identity and signs `/txn/{id}`; caller bearer claims are
+  retained separately as application authorization and never substituted for ownership.
+- `Kernel::bind_transaction` recognizes begin/continue/finalize routing cues and delegates them to
+  `TxnServer`; `Kernel::execute` only runs native work under the returned handle.
+- Explicit finalize authorization and `Active -> Finalizing` are one awaited `TxnServer` operation;
+  participant owner/leader validation and record mutation occur under one lock.
+- HTTP and PyO3 report terminal `Succeeded` or `Failed` outcomes. They cannot select commit or
+  rollback, interpret claims, chain tokens, create participant records, or delete workspaces.
+- Distributed fanout follows the proven failure-free lower bound `W + P`: authority and
+  participation are carried by the `W` required work RPCs, followed by one parallel finalize RPC
+  for each of `P` recorded participants. See `docs/protocol/transactions.md`.
 
-### Transaction ownership + leadership claims (work needed)
+### Transaction ownership + leadership claims
 
 **Objective:** Make transaction ownership and per-component leadership enforceable so a host can:
 - reject any request for an active `txn_id` which is not authorized by the same owner identity, and
@@ -138,11 +115,16 @@ ops atomic and deterministic.
 This is required for cross-host transactions, and it is also required for safe on-disk workspace
 GC: a host must know who “owns” an active transaction before it can accept new work for it.
 
-**Scope note:** The current v2 `TxnManager` is a host-local handle registry. The work below adds
-the missing signed-token and claim validation layer. This must stay kernel-owned; adapters may
-only forward `txn_id`, request metadata, and an opaque bearer token.
+**Implemented shape:** `TxnServer` is the only active transaction registry and protocol state
+machine. It validates exact signed transaction authority, pins the immutable owner and one leader
+per canonical component root, continues the same inbound identity on participants, chains outbound
+claims, owns TTL, and performs the only finalization transition. Adapters only forward `txn_id`,
+verified transport context, and semantic terminal success or failure.
+Failed participant finalization retains staged state for retry; no resource owner performs an
+independent rollback outside this transition.
 
-**Current scaffolding:** This repo now has kernel-owned hooks for token verification and chaining:
+**Authority boundary:** token cryptography is verified through the bootstrap-injected verifier;
+transaction claim structure and state transitions are interpreted once by `TxnServer`:
 
 - `tc-server/src/auth.rs` (`TokenVerifier` + default opaque verifier) is the single entrypoint for
   mapping a bearer token to a stable owner identity, and (later) for extending tokens with
@@ -152,7 +134,7 @@ only forward `txn_id`, request metadata, and an opaque bearer token.
 - `tc-server` now wires in an RJWT-compatible verifier (same bearer token format as v1) once the
   host can resolve actor keys.
 
-**Work items**
+**Enforced invariants**
 
 1. **Define a signed transaction token type and verifier.**
    - Add a v2 equivalent of v1’s `SignedToken` plus a verifier which can validate signatures using
@@ -192,8 +174,12 @@ only forward `txn_id`, request metadata, and an opaque bearer token.
    - Track active transactions by expiry time.
    - When a txn expires, force rollback and delete its workspace state (idempotently).
    - Keep GC host-local and default-deny; it must not depend on any global registry.
-   - v2 status: a minimal in-memory TTL tracker exists (`tc-server/src/txn_server.rs`); txfs
-   workspace cleanup is deferred until txfs is integrated.
+   - Run one bootstrap-owned expiry worker; never create per-transaction or
+     adapter-drop cleanup tasks.
+   - v2 status: `txn::TxnServer` retains active handles and owns the shared explicit/
+     expiry finalization path. Failed finalization stays registered for retry,
+     and the delegated transaction workspace is removed only after resource
+     finalization succeeds.
 
 7. **Harden txn ergonomics + permission checks (v1 parity).**
    - Keep one transaction class only: kernel-owned top-level transactions. Do not introduce
@@ -233,6 +219,19 @@ Plan:
    `/service/...` is reachable with all four verbs (even if the handler returns
    `405 Method Not Allowed` for some).
 
+### State operation and streaming boundary (complete)
+
+**Objective:** make the executor and transport adapters independent of concrete `State`
+variants while preserving one execution path for HTTP and PyO3.
+
+`tc-server` resolves references, enforces transaction and authorization policy,
+then delegates `GET`/`PUT`/`POST`/`DELETE` to native handlers. Concrete BTree,
+Table, and Tensor behavior lives below this boundary. Native execution returns
+`State`; only the terminal adapter calls `IntoView`. HTTP encodes that view,
+PyO3 retains a native handle, and local Library/`OpDef` calls perform no
+serialization. Source guards reject concrete collection dispatch and codec use
+from native route modules.
+
 ### Root-only finalize (hardening)
 
 **Objective:** Avoid accidental commit/rollback triggered by empty `POST`/`DELETE` requests to
@@ -240,7 +239,8 @@ non-root paths.
 
 Implemented:
 
-- `Kernel::route_request` (not `TxnManager`) owns finalize detection.
+- `Kernel::bind_transaction` owns root-only finalize cue detection and delegates authority and
+  lifecycle transitions to `TxnServer`; `Kernel::execute` remains lifecycle-neutral.
 - “Component root” parsing is transport-agnostic and recognizes `/lib`,
   `/lib/<publisher>/<name>/<version>`, and `/service/<publisher>/<namespace>/<name>/<version>`.
 - Root-only finalize is enforced: empty-body `POST`/`DELETE` to subpaths is dispatched normally.
@@ -425,8 +425,9 @@ Cleanup status:
   logging and continuing, so unresolved participants keep the transaction visible for retry.
 - **Bootstrap reports are explicit.** Non-transactional peer bootstrap/reconcile returns a
   structured `ReplicationReport` instead of relying on best-effort logs.
-- **Document participant continuation.** `TxnManager::interpret_request(Some(txn_id), owner, token)`
-  may create a local pending handle for the same inbound `txn_id` on a participant host. This is
+- **Document participant continuation.** `TxnServer::bind(Some(txn_id), token, component)` may
+  create a local active record for the same inbound `txn_id` on a participant host after validating
+  exact owner and component-leader claims. This is
   transaction continuation, not a nested transaction, and must never allocate a different ID.
 - **Add regression tests for forbidden paths.** Cover: no `txn_id` in public client responses,
   no synthetic transaction for committed library reads, no finalize to live membership instead of
@@ -455,7 +456,7 @@ becomes visible after commit.
   }
   ```
   The install handler:
-  1. Receives the kernel-owned transaction handle from `Kernel::route_request`.
+  1. Receives the kernel-owned transaction handle from `Kernel::bind_transaction + Kernel::execute`.
   2. Streams the payload via destream, persisting artifacts to a transaction-scoped store
      (e.g., `txn_tmp/{txn_id}/artifact-id`).
   3. Registers staged handlers in the `Dir`.
@@ -549,7 +550,7 @@ We consider the transactional foundation “done” when:
 **Objective:** Loaded WASM libraries receive the same transaction context and capability claims as native Rust libraries.
 
 - Serialize `TxnId`, `NetworkTime`, and `Claim` using the existing `destream` request/response serialization stack so `tc-server` can hand that bundle to WASM modules without introducing a new binary format yet.
-- Teach `TxnManager`/`TxnHandle` to retain the caller's `Claim` (parsed from control-plane tokens) so the WASM adapter can include it when constructing the serialized payload.
+- Keep caller claims on the `TxnServer`-issued `TxnHandle` so the WASM adapter can include them when constructing the serialized payload without interpreting transaction authority.
 - Add a Wasmtime-backed adapter that:
   - Loads a WASM binary whose manifest points to a `tc_library_entry` export describing the schema/routes.
   - Maps each route to a WASM export (e.g., `/hello` → `hello`) and invokes it, passing pointers/lengths for the serialized transaction header + request body. Keep the `/lib` manifest layout aligned with existing TinyChain practice (`LibrarySchema` plus the `Library.__json__` body produced by the Python client): each method entry includes a `"wasm_export"` (or equivalent) field that names the exported function, so every adapter reads the same manifest.
