@@ -27,6 +27,17 @@ fn executor_and_codec_do_not_dispatch_concrete_collections() {
         assert!(!pyo3_adapter.contains(collection));
     }
     assert!(!pyo3_adapter.contains("block_on"));
+
+    for adapter in [
+        include_str!("../http/server.rs"),
+        include_str!("../wasm/http.rs"),
+        include_str!("../pyo3_runtime/types.rs"),
+    ] {
+        assert!(!adapter.contains("Collection::Table"));
+    }
+
+    assert!(include_str!("collection.rs").contains("Public::put"));
+    assert!(include_str!("resolve/mod.rs").contains("collection::put"));
 }
 
 #[test]

@@ -49,10 +49,20 @@ pub(super) fn apply_config_overrides(
 #[pyclass(name = "StateHandle")]
 #[derive(Clone)]
 pub struct PyStateHandle {
-    value: Option<Py<PyAny>>,
-    state: Option<crate::State>,
-    txn: Option<crate::TxnHandle>,
-    runtime: Option<Arc<tokio::runtime::Runtime>>,
+    inner: StateHandle,
+}
+
+#[derive(Clone)]
+enum StateHandle {
+    Python(Py<PyAny>),
+    Native(Box<NativeState>),
+}
+
+#[derive(Clone)]
+struct NativeState {
+    state: crate::State,
+    txn: crate::TxnHandle,
+    runtime: Arc<tokio::runtime::Runtime>,
     finalize: Option<Arc<PendingFinalize>>,
 }
 
@@ -100,11 +110,7 @@ impl PyStateHandle {
     #[new]
     pub fn new(value: Py<PyAny>) -> Self {
         Self {
-            value: Some(value),
-            state: None,
-            txn: None,
-            runtime: None,
-            finalize: None,
+            inner: StateHandle::Python(value),
         }
     }
 
@@ -113,37 +119,37 @@ impl PyStateHandle {
     }
 
     pub fn value(&self) -> PyResult<Py<PyAny>> {
-        if let Some(value) = &self.value {
-            return Ok(value.clone());
-        }
+        let native = match &self.inner {
+            StateHandle::Python(value) => return Ok(value.clone()),
+            StateHandle::Native(native) => native.as_ref(),
+        };
+        let NativeState {
+            state,
+            txn,
+            runtime,
+            finalize,
+        } = native;
 
-        if let Some(finalize) = &self.finalize {
+        if let Some(finalize) = finalize {
             finalize.ensure_active()?;
         }
-
-        let runtime = self.runtime.as_ref().map(Arc::clone).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("native state has no owning runtime")
-        })?;
-        let state = self
-            .state
-            .clone()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("state handle is empty"))?;
-        let txn = self.txn.clone().ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("state view has no transaction")
-        })?;
-        let bytes = super::wait(&runtime, async move {
-            let view = state.into_view(txn).await.map_err(|err| err.to_string())?;
-            let stream = destream_json::encode(view).map_err(|err| err.to_string())?;
-            stream
-                .try_fold(Vec::new(), |mut bytes, chunk| async move {
-                    bytes.extend_from_slice(&chunk);
-                    Ok(bytes)
-                })
-                .await
-                .map_err(|err| err.to_string())
+        let bytes = super::wait(runtime, {
+            let state = state.clone();
+            let txn = txn.clone();
+            async move {
+                let view = state.into_view(txn).await.map_err(|err| err.to_string())?;
+                let stream = destream_json::encode(view).map_err(|err| err.to_string())?;
+                stream
+                    .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                        bytes.extend_from_slice(&chunk);
+                        Ok(bytes)
+                    })
+                    .await
+                    .map_err(|err| err.to_string())
+            }
         })
         .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
-        if let Some(finalize) = &self.finalize {
+        if let Some(finalize) = finalize {
             finalize.finish()?;
         }
         Python::with_gil(|py| Ok(PyString::new_bound(py, &String::from_utf8_lossy(&bytes)).into()))
@@ -157,11 +163,12 @@ impl PyStateHandle {
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Self {
         Self {
-            value: None,
-            state: Some(state),
-            txn: Some(txn),
-            runtime: Some(runtime),
-            finalize: None,
+            inner: StateHandle::Native(Box::new(NativeState {
+                state,
+                txn,
+                runtime,
+                finalize: None,
+            })),
         }
     }
 
@@ -174,21 +181,25 @@ impl PyStateHandle {
     ) -> Self {
         let deadline = txn.deadline();
         Self {
-            value: None,
-            state: Some(state),
-            txn: Some(txn.clone()),
-            runtime: Some(Arc::clone(&runtime)),
-            finalize: Some(Arc::new(PendingFinalize {
-                runtime,
-                pending: Mutex::new(Some((kernel, txn))),
-                deadline,
-                _request: request,
+            inner: StateHandle::Native(Box::new(NativeState {
+                state,
+                txn: txn.clone(),
+                runtime: Arc::clone(&runtime),
+                finalize: Some(Arc::new(PendingFinalize {
+                    runtime,
+                    pending: Mutex::new(Some((kernel, txn))),
+                    deadline,
+                    _request: request,
+                })),
             })),
         }
     }
 
     pub(crate) fn state(&self) -> Option<crate::State> {
-        self.state.clone()
+        match &self.inner {
+            StateHandle::Native(native) => Some(native.state.clone()),
+            StateHandle::Python(_) => None,
+        }
     }
 }
 
