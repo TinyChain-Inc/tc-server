@@ -129,15 +129,16 @@ where
 }
 
 pub(crate) fn python_handler(callback: Py<PyAny>) -> impl KernelHandler {
+    let callback = Arc::new(callback);
     move |req: Request| {
-        let callback = callback.clone();
+        let callback = Arc::clone(&callback);
         async move {
             let py_req = match py_request_from_http(req).await {
                 Ok(req) => req,
                 Err(err) => return py_error_response(err),
             };
 
-            let py_response = match Python::with_gil(|py| -> PyResult<PyKernelResponse> {
+            let py_response = match Python::attach(|py| -> PyResult<PyKernelResponse> {
                 let callable = callback.bind(py);
                 let arg = Py::new(py, py_req.clone())?;
                 let raw = callable.call1((arg,))?;
@@ -170,21 +171,23 @@ pub(crate) fn python_health_handler() -> impl KernelHandler {
 }
 
 pub(crate) fn stub_py_handler() -> Py<PyAny> {
-    Python::with_gil(|py| {
-        let module = PyModule::from_code_bound(
+    Python::attach(|py| {
+        let module = PyModule::from_code(
             py,
-            r#"def _stub(_req):
+            pyo3::ffi::c_str!(
+                r#"def _stub(_req):
     raise RuntimeError("kernel handler not installed")
-"#,
-            "<kernel>",
-            "kernel_stub",
+"#
+            ),
+            pyo3::ffi::c_str!("<kernel>"),
+            pyo3::ffi::c_str!("kernel_stub"),
         )
         .expect("stub module");
-        module.getattr("_stub").expect("stub attr").into_py(py)
+        module.getattr("_stub").expect("stub attr").unbind()
     })
 }
 
-#[pyclass(name = "KernelHandle")]
+#[pyclass(name = "KernelHandle", from_py_object)]
 pub struct KernelHandle {
     inner: Arc<Kernel>,
     txn_manager: TxnManager,
@@ -260,10 +263,9 @@ impl KernelHandle {
         request_ttl_secs: Option<u64>,
         max_request_bytes_unauth: Option<usize>,
     ) -> Self {
-        let stub = stub_py_handler();
         Self::new(
-            stub.clone(),
-            stub,
+            stub_py_handler(),
+            stub_py_handler(),
             None,
             data_dir,
             request_ttl_secs,

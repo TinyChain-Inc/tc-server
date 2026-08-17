@@ -9,10 +9,10 @@ use super::state::PyState;
 use super::types::PyStateHandle;
 
 pub(crate) fn py_state_handle_from_state(state: State) -> PyResult<PyStateHandle> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let initializer = PyState::initializer_from_state(state);
         let py_state = Py::new(py, initializer)?;
-        Ok(PyStateHandle::new(py_state.into_py(py)))
+        Ok(PyStateHandle::new(py_state.into_any()))
     })
 }
 
@@ -22,8 +22,8 @@ pub(crate) fn request_body_state(body: Option<PyStateHandle>) -> PyResult<Option
         None => return Ok(None),
     };
 
-    Python::with_gil(|py| {
-        let value = handle.value();
+    Python::attach(|py| {
+        let value = handle.value(py);
         let any = value.bind(py);
         if any.is_instance_of::<PyState>() {
             extract_state(any).map(Some)
@@ -39,16 +39,16 @@ pub(crate) fn request_body_raw_bytes(body: Option<PyStateHandle>) -> PyResult<Op
         None => return Ok(None),
     };
 
-    Python::with_gil(|py| {
-        let value = handle.value();
+    Python::attach(|py| {
+        let value = handle.value(py);
         let any = value.bind(py);
         if any.is_instance_of::<PyState>() {
             return Ok(None);
         }
-        if let Ok(bytes) = any.downcast::<PyBytes>() {
+        if let Ok(bytes) = any.cast::<PyBytes>() {
             return Ok(Some(bytes.as_bytes().to_vec()));
         }
-        if let Ok(string) = any.downcast::<PyString>() {
+        if let Ok(string) = any.cast::<PyString>() {
             return Ok(Some(string.to_str()?.as_bytes().to_vec()));
         }
         Err(PyValueError::new_err(

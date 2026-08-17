@@ -117,7 +117,7 @@ impl<T> PyWrapper<T> {
     }
 }
 
-#[pyclass(name = "StateHandle")]
+#[pyclass(name = "StateHandle", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyStateHandle {
     handle: StateHandle<Py<PyAny>>,
@@ -136,8 +136,8 @@ impl PyStateHandle {
         self.clone()
     }
 
-    pub fn value(&self) -> Py<PyAny> {
-        self.handle.as_ref().clone()
+    pub fn value(&self, py: Python<'_>) -> Py<PyAny> {
+        self.handle.as_ref().clone_ref(py)
     }
 }
 
@@ -159,7 +159,7 @@ impl From<PyStateHandle> for StateHandle<Py<PyAny>> {
     }
 }
 
-#[pyclass(name = "KernelRequest")]
+#[pyclass(name = "KernelRequest", from_py_object)]
 #[derive(Clone)]
 pub struct PyKernelRequest {
     pub(super) method: Method,
@@ -226,7 +226,7 @@ impl PyKernelRequest {
     }
 }
 
-#[pyclass(name = "KernelResponse")]
+#[pyclass(name = "KernelResponse", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyKernelResponse {
     status: u16,

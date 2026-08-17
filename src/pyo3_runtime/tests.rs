@@ -361,7 +361,7 @@ mod tests {
         use super::state_handle_conversions::request_body_state;
         use super::wire::py_request_from_http;
 
-        pyo3::prepare_freethreaded_python();
+        Python::initialize();
 
         let mut request = http::Request::builder()
             .method(http::Method::POST)
@@ -391,7 +391,7 @@ mod tests {
         use super::state_handle_conversions::request_body_state;
         use super::wire::py_request_from_http;
 
-        pyo3::prepare_freethreaded_python();
+        Python::initialize();
 
         let cases = [
             (http::Method::GET, "GET"),
@@ -431,7 +431,7 @@ mod tests {
     async fn pyo3_request_rejects_non_native_non_empty_payload() {
         use super::wire::py_request_from_http;
 
-        pyo3::prepare_freethreaded_python();
+        Python::initialize();
 
         let request = http::Request::builder()
             .method(http::Method::POST)
@@ -454,7 +454,7 @@ mod tests {
         use super::wire::py_response_to_http;
         use super::PyKernelResponse;
 
-        pyo3::prepare_freethreaded_python();
+        Python::initialize();
 
         let native = crate::State::from(tc_value::Value::from("native-response"));
         let body = Some(py_state_handle_from_state(native.clone()).expect("state handle"));
@@ -477,7 +477,7 @@ mod tests {
         use super::state_handle_conversions::request_body_state;
         use super::wire::py_response_from_http;
 
-        pyo3::prepare_freethreaded_python();
+        Python::initialize();
 
         let mut response = http::Response::builder()
             .status(StatusCode::OK)
@@ -505,7 +505,7 @@ mod tests {
     async fn pyo3_response_preserves_non_native_success_payload() {
         use super::wire::py_response_from_http;
 
-        pyo3::prepare_freethreaded_python();
+        Python::initialize();
 
         let response = http::Response::builder()
             .status(StatusCode::OK)
@@ -516,10 +516,10 @@ mod tests {
             .await
             .expect("raw success response");
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let body = py_response.body().expect("body");
-            let value = body.value();
-            let bytes = value.bind(py).downcast::<pyo3::types::PyBytes>().expect("bytes");
+            let value = body.value(py);
+            let bytes = value.bind(py).cast::<pyo3::types::PyBytes>().expect("bytes");
             assert_eq!(bytes.as_bytes(), b"{\"ok\":true}");
         });
     }

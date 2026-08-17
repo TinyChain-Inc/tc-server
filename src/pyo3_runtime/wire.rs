@@ -120,12 +120,12 @@ pub(super) async fn py_response_from_http(response: Response) -> PyResult<PyKern
     let body = if body_bytes.is_empty() {
         None
     } else if status >= 400 {
-        Some(Python::with_gil(|py| {
-            PyStateHandle::new(PyBytes::new_bound(py, &body_bytes).into_py(py))
+        Some(Python::attach(|py| {
+            PyStateHandle::new(PyBytes::new(py, &body_bytes).into_any().unbind())
         }))
     } else {
-        Some(Python::with_gil(|py| {
-            PyStateHandle::new(PyBytes::new_bound(py, &body_bytes).into_py(py))
+        Some(Python::attach(|py| {
+            PyStateHandle::new(PyBytes::new(py, &body_bytes).into_any().unbind())
         }))
     };
 

@@ -42,7 +42,7 @@ default-features = false
 optional = true
 
 [dependencies.pyo3]
-version = "0.21"
+version = "0.29"
 features = ["macros"]
 optional = true
 

@@ -9,7 +9,7 @@ use crate::State;
 
 use super::conversions::state_to_json_string;
 use super::types::PyWrapper;
-#[pyclass(name = "State", subclass)]
+#[pyclass(name = "State", subclass, from_py_object)]
 #[derive(Clone)]
 pub struct PyState {
     inner: PyWrapper<State>,
@@ -108,22 +108,19 @@ impl PyTensor {
         PyTensor::with_tensor(slf, |tensor| Ok(tensor.shape().to_vec()))
     }
 
-    pub fn values<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<PyObject> {
+    pub fn values<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
         PyTensor::with_tensor(slf, |tensor| match tensor {
             Tensor::F32(_) => {
                 let values = tensor.flattened_f32().map_err(PyValueError::new_err)?;
-                let list = PyList::new_bound(py, &values);
-                Ok(list.into_py(py))
+                Ok(PyList::new(py, &values)?.into_any().unbind())
             }
             Tensor::F64(_) => {
                 let values = tensor.flattened_f64().map_err(PyValueError::new_err)?;
-                let list = PyList::new_bound(py, &values);
-                Ok(list.into_py(py))
+                Ok(PyList::new(py, &values)?.into_any().unbind())
             }
             Tensor::U64(_) => {
                 let values = tensor.flattened_u64().map_err(PyValueError::new_err)?;
-                let list = PyList::new_bound(py, &values);
-                Ok(list.into_py(py))
+                Ok(PyList::new(py, &values)?.into_any().unbind())
             }
         })
     }
