@@ -46,16 +46,24 @@ pub(super) fn apply_config_overrides(
     config
 }
 
-#[pyclass(name = "StateHandle")]
+#[pyclass(name = "StateHandle", from_py_object)]
 #[derive(Clone)]
 pub struct PyStateHandle {
     inner: StateHandle,
 }
 
-#[derive(Clone)]
 enum StateHandle {
     Python(Py<PyAny>),
     Native(Box<NativeState>),
+}
+
+impl Clone for StateHandle {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Python(value) => Python::attach(|py| Self::Python(value.clone_ref(py))),
+            Self::Native(native) => Self::Native(native.clone()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -120,7 +128,9 @@ impl PyStateHandle {
 
     pub fn value(&self) -> PyResult<Py<PyAny>> {
         let native = match &self.inner {
-            StateHandle::Python(value) => return Ok(value.clone()),
+            StateHandle::Python(value) => {
+                return Python::attach(|py| Ok(value.clone_ref(py)));
+            }
             StateHandle::Native(native) => native.as_ref(),
         };
         let NativeState {
@@ -152,7 +162,11 @@ impl PyStateHandle {
         if let Some(finalize) = finalize {
             finalize.finish()?;
         }
-        Python::with_gil(|py| Ok(PyString::new_bound(py, &String::from_utf8_lossy(&bytes)).into()))
+        Python::attach(|py| {
+            Ok(PyString::new(py, &String::from_utf8_lossy(&bytes))
+                .into_any()
+                .unbind())
+        })
     }
 }
 
@@ -203,7 +217,7 @@ impl PyStateHandle {
     }
 }
 
-#[pyclass(name = "KernelRequest")]
+#[pyclass(name = "KernelRequest", from_py_object)]
 #[derive(Clone)]
 pub struct PyKernelRequest {
     pub(super) method: Method,
@@ -270,7 +284,7 @@ impl PyKernelRequest {
     }
 }
 
-#[pyclass(name = "Response")]
+#[pyclass(name = "Response", from_py_object)]
 #[derive(Clone)]
 pub struct PyResponse {
     status: u16,

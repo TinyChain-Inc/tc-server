@@ -1,4 +1,4 @@
-// PyO3 0.21 macros emit Rust 2024 unsafe operations in generated FFI glue.
+// PyO3 macros emit Rust 2024 unsafe operations in generated FFI glue.
 // Handwritten unsafe code remains prohibited by the repository source guard.
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -11,8 +11,8 @@ mod wire;
 
 pub(super) fn tc_error(err: tc_error::TCError) -> pyo3::PyErr {
     let exception = pyo3::exceptions::PyRuntimeError::new_err(err.message().to_string());
-    pyo3::Python::with_gil(|py| {
-        let value = exception.value_bound(py);
+    pyo3::Python::attach(|py| {
+        let value = exception.value(py);
         let _ = value.setattr("code", err.code().to_string());
         if let Some(pressure) = err.pressure() {
             let _ = value.setattr("reason", pressure.reason().to_string());
@@ -45,7 +45,5 @@ where
     runtime.spawn(async move {
         let _ = send.send(future.await);
     });
-    pyo3::Python::with_gil(|py| {
-        py.allow_threads(move || receive.recv().expect("PyO3 runtime task"))
-    })
+    pyo3::Python::attach(|py| py.detach(move || receive.recv().expect("PyO3 runtime task")))
 }
