@@ -58,6 +58,7 @@ pub async fn build_http_library_module_with_store(
                 .collect();
             Ok(CompiledLibrary {
                 schema: wasm.schema().clone(),
+                classes: Vec::new(),
                 routes: SchemaRoutes::from_entries(routes)?,
                 artifact,
                 execution: LibraryExecution::Transport,
@@ -118,7 +119,7 @@ fn respond_with_schema(schema: LibrarySchema) -> Response {
     crate::http::state_response(state)
 }
 
-fn respond_with_listing(listing: Option<tc_ir::Map<bool>>) -> Response {
+pub(crate) fn respond_with_listing(listing: Option<tc_ir::Map<bool>>) -> Response {
     let Some(listing) = listing else {
         return http::Response::builder()
             .status(StatusCode::NOT_FOUND)

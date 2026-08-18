@@ -6,7 +6,8 @@ use bytes::Bytes;
 use pathlink::Link;
 use serde::Deserialize;
 use tc_error::{TCError, TCResult};
-use tc_ir::{Handler, Map, OpDef, OpRef, Route, Scalar, Subject, parse_route_path};
+use tc_ir::{Handler, Map, NativeClass, OpDef, OpRef, Route, Scalar, Subject, parse_route_path};
+use tc_state::{ClassDef, ClassParent, StateType};
 
 use crate::State;
 use crate::library::{CompiledLibrary, LibraryExecution, RouteMetadata, SchemaRoutes};
@@ -18,7 +19,17 @@ pub const WASM_ARTIFACT_CONTENT_TYPE: &str = "application/wasm";
 #[derive(Deserialize)]
 struct IrManifest {
     schema: serde_json::Value,
+    #[serde(default)]
+    classes: Vec<IrClass>,
     routes: Vec<IrRoute>,
+}
+
+#[derive(Deserialize)]
+struct IrClass {
+    id: String,
+    parent: String,
+    #[serde(default)]
+    prototype: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +153,45 @@ pub async fn compile_ir_library(artifact: Artifact) -> TCResult<CompiledLibrary>
         .map_err(|err| TCError::bad_request(format!("invalid ir schema: {err}")))?;
     let schema = decode_schema_bytes(&schema_bytes).map_err(TCError::bad_request)?;
 
+    let mut classes = Vec::with_capacity(manifest.classes.len());
+    for class in manifest.classes {
+        let identity = Link::from_str(&class.id)
+            .map_err(|err| TCError::bad_request(format!("invalid Class identity: {err}")))?;
+        if !class.id.starts_with("/class/") || class.id.trim_matches('/').split('/').count() < 3 {
+            return Err(TCError::bad_request(format!(
+                "Class identity must be a versioned canonical /class path: {}",
+                class.id
+            )));
+        }
+        let parent = if class.parent.starts_with("/class/") {
+            ClassParent::Class(Link::from_str(&class.parent).map_err(|err| {
+                TCError::bad_request(format!("invalid Class parent identity: {err}"))
+            })?)
+        } else {
+            let path = class.parent.parse::<pathlink::PathBuf>().map_err(|err| {
+                TCError::bad_request(format!("invalid native Class parent: {err}"))
+            })?;
+            ClassParent::Native(StateType::from_path(path.as_ref()).ok_or_else(|| {
+                TCError::bad_request(format!("unknown native Class parent: {}", class.parent))
+            })?)
+        };
+        let mut prototype = Map::new();
+        for (name, value) in class.prototype {
+            let name = name.parse().map_err(|err| {
+                TCError::bad_request(format!("invalid Class member name {name}: {err}"))
+            })?;
+            let bytes = serde_json::to_vec(&value)
+                .map_err(|err| TCError::bad_request(format!("invalid Class member: {err}")))?;
+            let stream =
+                futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+            let value = destream_json::try_decode((), stream)
+                .await
+                .map_err(|err| TCError::bad_request(format!("invalid Class member: {err}")))?;
+            prototype.insert(name, value);
+        }
+        classes.push(ClassDef::new(identity, parent, prototype));
+    }
+
     let mut route_entries = Vec::new();
     let mut routes = HashMap::new();
     for route in manifest.routes {
@@ -197,8 +247,63 @@ pub async fn compile_ir_library(artifact: Artifact) -> TCResult<CompiledLibrary>
 
     Ok(CompiledLibrary {
         schema,
+        classes,
         routes: SchemaRoutes::from_entries(route_entries)?,
         artifact,
         execution: LibraryExecution::Native(routes),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artifact(classes: serde_json::Value) -> Artifact {
+        Artifact {
+            path: "/lib/acme/classes/1.0.0".into(),
+            content_type: IR_ARTIFACT_CONTENT_TYPE.into(),
+            bytes: serde_json::to_vec(&serde_json::json!({
+                "schema": {
+                    "id": "/lib/acme/classes/1.0.0",
+                    "version": "1.0.0",
+                    "dependencies": []
+                },
+                "classes": classes,
+                "routes": []
+            }))
+            .expect("manifest json"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compiles_canonical_class_manifest() {
+        let compiled = compile_ir_library(artifact(serde_json::json!([{
+            "id": "/class/acme/counter/1.0.0",
+            "parent": "/state/scalar/value/number",
+            "prototype": {"initial": 0}
+        }])))
+        .await
+        .expect("compile Class manifest");
+
+        assert_eq!(compiled.classes.len(), 1);
+        assert_eq!(
+            compiled.classes[0].identity().to_string(),
+            "/class/acme/counter/1.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_noncanonical_class_identity() {
+        let result = compile_ir_library(artifact(serde_json::json!([{
+            "id": "/lib/acme/not-a-class/1.0.0",
+            "parent": "/state/scalar/value/number"
+        }])))
+        .await;
+        let err = match result {
+            Ok(_) => panic!("accepted non-Class identity"),
+            Err(err) => err,
+        };
+
+        assert!(err.message().contains("canonical /class path"));
+    }
 }

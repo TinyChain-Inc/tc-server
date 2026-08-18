@@ -46,6 +46,32 @@ impl Kernel {
             .library_module
             .as_ref()
             .ok_or_else(|| tc_error::TCError::not_found(path.clone()))?;
+        if path.starts_with("/class/") {
+            let (class, route) = registry
+                .resolve_class_path(&path)
+                .ok_or_else(|| tc_error::TCError::not_found(path.clone()))?;
+            if !route.is_empty() {
+                return Err(tc_error::TCError::not_found(path));
+            }
+            return match (request.method, request.body) {
+                (Method::Get, body) => Ok(crate::State::from(tc_state::Object::Instance(
+                    tc_state::ClassInstance::new(
+                        body.unwrap_or_default(),
+                        class,
+                        tc_ir::Map::new(),
+                    ),
+                ))),
+                (Method::Post, Some(crate::State::Map(members))) => {
+                    Ok(crate::State::from(tc_state::Object::Instance(
+                        tc_state::ClassInstance::new(crate::State::default(), class, members),
+                    )))
+                }
+                (Method::Post, _) => Err(tc_error::TCError::bad_request(
+                    "Class construction requires a map of instance members",
+                )),
+                (method, _) => Err(tc_error::TCError::method_not_allowed(method, path)),
+            };
+        }
         let (routes, route, is_root) = registry
             .resolve_native(&path)
             .ok_or_else(|| tc_error::TCError::not_found(path.clone()))?;

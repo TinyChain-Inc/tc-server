@@ -7,6 +7,7 @@ use umask::USER_WRITE;
 
 use crate::storage::Artifact;
 
+mod dir;
 mod install;
 #[cfg(any(feature = "http-server", feature = "pyo3"))]
 mod native;
@@ -40,6 +41,7 @@ mod registry_tests;
 #[derive(Clone)]
 pub struct CompiledLibrary {
     pub schema: LibrarySchema,
+    pub classes: Vec<tc_state::ClassDef<pathlink::Link>>,
     pub routes: SchemaRoutes,
     pub artifact: Artifact,
     pub execution: LibraryExecution,

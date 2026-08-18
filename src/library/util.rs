@@ -36,9 +36,3 @@ pub(super) fn canonical_link(link: &Link) -> String {
 pub(super) fn normalize_path(path: &str) -> String {
     uri::normalize_path(path).to_string()
 }
-
-pub(super) fn is_path_prefix(prefix: &str, path: &str) -> bool {
-    let prefix = normalize_path(prefix);
-    let path = normalize_path(path);
-    path == prefix || path.starts_with(&format!("{prefix}/"))
-}
