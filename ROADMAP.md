@@ -1,5 +1,26 @@
 # tc-server Roadmap
 
+## v1 Class port map
+
+| v1 concern | v2 owner |
+| --- | --- |
+| Public Class directory and construction | Kernel `/class` projection over the library registry |
+| Prototype and inheritance representation | `tc-state::ClassDef` and `ClassInstance` |
+| Durable Class files | Committed library IR artifacts in `LibraryStore` |
+| Cluster copy and retry | Existing library prepare/finalize replication |
+| Class-specific cluster/router abstractions | Removed; canonical kernel routing is reused |
+
+Class definitions are immutable manifest content. Instance collection state remains
+owned by its collection rather than being copied into the Class registry.
+The registry represents `/lib` and `/class` as separate structural directories;
+directory traversal owns listing and longest-component resolution, so routing never
+reconstructs hierarchy by scanning flat path maps.
+
+The server-local component directory is an interim compatibility layer. Consolidate
+it with `tc_ir::Dir` so handler and component traversal share one structural tree,
+then back its persistent leaves directly with `txfs::Dir`; remove the local type in
+that migration rather than retaining parallel directory implementations.
+
 This crate now has the skeleton required to serve `/lib`, `/service`, and `/host`
 endpoints, but it still lacks the transactional guarantees that the production TinyChain host
 offers. This roadmap tracks the work necessary to align the reference server with the

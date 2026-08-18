@@ -58,6 +58,7 @@ pub async fn build_http_library_module_with_store(
                 .collect();
             Ok(CompiledLibrary {
                 schema: wasm.schema().clone(),
+                classes: Vec::new(),
                 routes: SchemaRoutes::from_entries(routes)?,
                 artifact,
                 execution: LibraryExecution::Transport,

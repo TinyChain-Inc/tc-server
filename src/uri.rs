@@ -1,4 +1,6 @@
 pub(crate) const LIB_ROOT: &str = "/lib";
+pub(crate) const CLASS_ROOT: &str = "/class";
+pub(crate) const CLASS_ROOT_PREFIX: &str = "/class/";
 pub(crate) const LIB_ROOT_PREFIX: &str = "/lib/";
 pub(crate) const SERVICE_ROOT: &str = "/service";
 pub(crate) const SERVICE_ROOT_PREFIX: &str = "/service/";
@@ -43,6 +45,10 @@ pub(crate) fn component_root(path: &str) -> Option<&str> {
         return Some(path);
     }
 
+    if path == CLASS_ROOT {
+        return Some(path);
+    }
+
     if path == SERVICE_ROOT {
         return Some(path);
     }
@@ -53,6 +59,10 @@ pub(crate) fn component_root(path: &str) -> Option<&str> {
 
     if path.starts_with(LIB_ROOT_PREFIX) {
         return component_root_with_segments(path, 4).or(Some(LIB_ROOT));
+    }
+
+    if path.starts_with(CLASS_ROOT_PREFIX) {
+        return component_root_with_segments(path, 4).or(Some(CLASS_ROOT));
     }
 
     if path.starts_with(SERVICE_ROOT_PREFIX) {
@@ -92,4 +102,18 @@ fn component_root_with_segments(path: &str, segments: usize) -> Option<&str> {
     };
 
     Some(&path[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn class_component_root_includes_immutable_version() {
+        assert_eq!(
+            component_root("/class/acme/counter/1.0.0/increment"),
+            Some("/class/acme/counter/1.0.0")
+        );
+        assert_eq!(component_root("/class/acme"), Some(CLASS_ROOT));
+    }
 }

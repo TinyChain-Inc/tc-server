@@ -11,6 +11,7 @@ pub struct LibraryRuntime {
     pub(crate) state: LibraryState,
     execution: Arc<RwLock<Option<LibraryExecution>>>,
     artifact: Arc<RwLock<Option<Artifact>>>,
+    classes: Arc<RwLock<Vec<tc_state::ClassDef<pathlink::Link>>>>,
     pub(crate) store: Option<LibraryStore>,
 }
 
@@ -20,6 +21,7 @@ impl LibraryRuntime {
             state: LibraryState::new(initial_schema),
             execution: Arc::new(RwLock::new(None)),
             artifact: Arc::new(RwLock::new(None)),
+            classes: Arc::new(RwLock::new(Vec::new())),
             store,
         }
     }
@@ -39,6 +41,10 @@ impl LibraryRuntime {
     }
 
     pub fn replace_compiled(&self, compiled: CompiledLibrary) {
+        self.classes
+            .write()
+            .expect("library Classes write lock")
+            .clone_from(&compiled.classes);
         self.state
             .replace_with_routes(compiled.schema, compiled.routes);
         self.artifact
@@ -46,6 +52,13 @@ impl LibraryRuntime {
             .expect("library artifact write lock")
             .replace(compiled.artifact);
         self.replace_execution(compiled.execution);
+    }
+
+    pub(crate) fn classes(&self) -> Vec<tc_state::ClassDef<pathlink::Link>> {
+        self.classes
+            .read()
+            .expect("library Classes read lock")
+            .clone()
     }
 
     pub fn artifact(&self) -> Option<Artifact> {
@@ -92,6 +105,7 @@ impl Clone for LibraryRuntime {
             state: self.state.clone(),
             execution: Arc::clone(&self.execution),
             artifact: Arc::clone(&self.artifact),
+            classes: Arc::clone(&self.classes),
             store: self.store.clone(),
         }
     }

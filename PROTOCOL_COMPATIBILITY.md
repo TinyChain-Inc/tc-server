@@ -171,6 +171,26 @@ Do **not** introduce alternative top-level directories or bespoke response envel
 Everything the kernel serves must live under these paths, and `<data-dir>/<segments>`
 must match the URI segments exactly so HTTP, PyO3, and future adapters stay aligned.
 
+## Class replication contract
+
+Classes are immutable definitions embedded in a versioned library IR manifest. The
+canonical `/class/<publisher>/<name>/<version>` link is their identity; a second,
+different definition at that link is a conflict. A definition contains its native
+or canonical Class parent and scalar prototype. Persistent instance storage is not
+replicated by this mechanism—instances retain normal collection references, whose
+owners provide persistence and replication.
+
+The containing library package is the replication and idempotency unit. It is
+authenticated, dependency-checked, compiled, and staged through the existing
+library transaction path. Definitions become routable only when that transaction
+commits. Rollback and partial finalize failure cannot expose a Class early, and
+replaying the same package is harmless. Malformed parents, inheritance cycles,
+incompatible native parent paths, and identity conflicts are rejected before
+staging. Restart recovery recompiles the committed artifact and rebuilds the Class
+index. Peer authentication, retries, unresolved-participant retention, and cleanup
+use the same host replication protocol as the containing library; there is no
+Class-specific transport or active-active merge policy.
+
 ## TLS expectations
 
 - The reference HTTP adapter runs on Hyper. Enabling TLS simply wraps the

@@ -4,17 +4,18 @@ use std::sync::{Arc, RwLock};
 use tc_error::{TCError, TCResult};
 use tc_ir::{Id, LibrarySchema, Map, TxnId};
 
+use super::dir::Dir;
 use super::install::{CompiledLibraryPackage, InstallError};
 use super::runtime::LibraryRuntime;
-use super::util::{canonical_link, is_path_prefix, normalize_path, schemas_equivalent};
+use super::util::{canonical_link, normalize_path, schemas_equivalent};
 use super::{CompiledLibrary, LibraryCompiler, LibraryExecution};
 use crate::storage::{Artifact, LibraryStore};
 use crate::txn::{ParticipantSet, TxnHandle};
-use crate::uri;
 
 #[derive(Clone)]
 pub struct LibraryRegistry {
-    entries: Arc<RwLock<BTreeMap<String, Arc<LibraryRuntime>>>>,
+    libraries: Arc<RwLock<Dir<Arc<LibraryRuntime>>>>,
+    classes: Arc<RwLock<Dir<tc_state::ClassDef<pathlink::Link>>>>,
     staged: Arc<RwLock<BTreeMap<TxnId, StagedTxn>>>,
     store: Option<LibraryStore>,
     compilers: BTreeMap<String, LibraryCompiler>,
@@ -41,11 +42,26 @@ enum PreparedInstall {
 impl LibraryRegistry {
     pub fn new(store: Option<LibraryStore>, compilers: BTreeMap<String, LibraryCompiler>) -> Self {
         Self {
-            entries: Arc::new(RwLock::new(BTreeMap::new())),
+            libraries: Arc::new(RwLock::new(Dir::new())),
+            classes: Arc::new(RwLock::new(Dir::new())),
             staged: Arc::new(RwLock::new(BTreeMap::new())),
             store,
             compilers,
         }
+    }
+
+    pub fn resolve_class_path(
+        &self,
+        path: &str,
+    ) -> Option<(
+        tc_state::ClassDef<pathlink::Link>,
+        Vec<pathlink::PathSegment>,
+    )> {
+        let path = normalize_path(path);
+        let classes = self.classes.read().expect("Class registry read lock");
+        let (class, identity, _) = classes.resolve(&path)?;
+        let suffix = path.strip_prefix(&identity)?;
+        Some((class.clone(), tc_ir::parse_route_path(suffix).ok()?))
     }
 
     pub async fn insert_schema(&self, schema: LibrarySchema) -> TCResult<()> {
@@ -55,73 +71,32 @@ impl LibraryRegistry {
             None => None,
         };
         let runtime = Arc::new(LibraryRuntime::new(schema, store));
-        self.entries
+        self.libraries
             .write()
             .expect("library registry write lock")
-            .insert(key, runtime);
+            .insert(&key, runtime)?;
 
         Ok(())
     }
 
     pub fn list_dir(&self, path: &str) -> Option<Map<bool>> {
         let path = normalize_path(path);
-        let entries = self.entries.read().expect("library registry read lock");
-        let mut out = Map::new();
-        let mut has_match = path == uri::LIB_ROOT;
+        let libraries = self.libraries.read().expect("library registry read lock");
+        listing(&libraries, &path)
+    }
 
-        for id in entries.keys() {
-            if !is_path_prefix(&path, id) {
-                continue;
-            }
-
-            has_match = true;
-
-            if path == *id {
-                continue;
-            }
-
-            let rest = id.strip_prefix(&path).unwrap_or(id).trim_start_matches('/');
-
-            if rest.is_empty() {
-                continue;
-            }
-
-            let mut segments = rest.split('/');
-            let child = segments.next().expect("non-empty rest segment");
-            let is_dir = segments.next().is_some();
-            let Ok(child_id) = child.parse::<Id>() else {
-                continue;
-            };
-            let entry = out.entry(child_id).or_insert(is_dir);
-            if is_dir {
-                *entry = true;
-            }
-        }
-
-        if has_match { Some(out) } else { None }
+    pub fn list_class_dir(&self, path: &str) -> Option<Map<bool>> {
+        let path = normalize_path(path);
+        let classes = self.classes.read().expect("Class registry read lock");
+        listing(&classes, &path)
     }
 
     pub fn resolve_runtime_for_path(&self, path: &str) -> Option<(Arc<LibraryRuntime>, bool)> {
         let path = normalize_path(path);
-        let entries = self.entries.read().expect("library registry read lock");
-        let mut best: Option<(&String, Arc<LibraryRuntime>)> = None;
-
-        for (id, runtime) in entries.iter() {
-            if !is_path_prefix(id, &path) {
-                continue;
-            }
-
-            let replace = match &best {
-                Some((best_id, _)) => id.len() > best_id.len(),
-                None => true,
-            };
-
-            if replace {
-                best = Some((id, Arc::clone(runtime)));
-            }
-        }
-
-        best.map(|(id, runtime)| (runtime, id == &path))
+        let libraries = self.libraries.read().expect("library registry read lock");
+        libraries
+            .resolve(&path)
+            .map(|(runtime, _, is_root)| (Arc::clone(runtime), is_root))
     }
 
     pub(crate) fn resolve_native(
@@ -140,10 +115,11 @@ impl LibraryRegistry {
 
     pub fn has_route_root(&self, root: &str) -> bool {
         let root = normalize_path(root);
-        self.entries
+        self.libraries
             .read()
             .expect("library registry read lock")
-            .contains_key(&root)
+            .get(&root)
+            .is_some()
     }
 
     pub fn schema_for_txn(&self, txn: &TxnHandle) -> TCResult<LibrarySchema> {
@@ -165,10 +141,11 @@ impl LibraryRegistry {
             return Ok(schema);
         }
 
-        let entries = self.entries.read().expect("library registry read lock");
-        if entries.len() == 1 {
-            let schema = entries
+        let libraries = self.libraries.read().expect("library registry read lock");
+        if libraries.len() == 1 {
+            let schema = libraries
                 .values()
+                .into_iter()
                 .next()
                 .expect("single entry")
                 .state
@@ -293,8 +270,8 @@ impl LibraryRegistry {
         txn: &TxnHandle,
     ) -> Result<Option<CompiledLibraryPackage>, TCError> {
         let runtimes = {
-            let entries = self.entries.read().expect("library registry read lock");
-            entries.values().cloned().collect::<Vec<_>>()
+            let libraries = self.libraries.read().expect("library registry read lock");
+            libraries.values().into_iter().cloned().collect::<Vec<_>>()
         };
 
         for runtime in runtimes {
@@ -331,6 +308,19 @@ impl LibraryRegistry {
         for schema in entries {
             let runtime = self.runtime_for_schema(&schema).await?;
             runtime.hydrate_from_storage(&self.compilers).await?;
+            let mut classes = self.classes.write().expect("Class registry write lock");
+            for class in runtime.classes() {
+                if classes
+                    .get(&class.identity().to_string())
+                    .is_some_and(|existing| existing != &class)
+                {
+                    return Err(TCError::conflict(format!(
+                        "conflicting persisted Class definition {}",
+                        class.identity()
+                    )));
+                }
+                classes.insert(&class.identity().to_string(), class)?;
+            }
         }
 
         Ok(())
@@ -389,6 +379,37 @@ impl LibraryRegistry {
             .await
             .map_err(|err| InstallError::internal(err.to_string()))?;
 
+        {
+            let committed = self.classes.read().expect("Class registry read lock");
+            for class in &compiled.classes {
+                if committed
+                    .get(&class.identity().to_string())
+                    .is_some_and(|existing| existing != class)
+                {
+                    return Err(InstallError::bad_request(format!(
+                        "conflicting immutable Class definition {}",
+                        class.identity()
+                    )));
+                }
+            }
+            let candidates = committed
+                .values()
+                .into_iter()
+                .map(|class| (class.identity().clone(), class.clone()))
+                .chain(
+                    compiled
+                        .classes
+                        .iter()
+                        .map(|class| (class.identity().clone(), class.clone())),
+                )
+                .collect::<BTreeMap<_, _>>();
+            for class in &compiled.classes {
+                class.validate(&candidates).map_err(|err| {
+                    InstallError::bad_request(format!("invalid Class {}: {err}", class.identity()))
+                })?;
+            }
+        }
+
         if !schemas_equivalent(&compiled.schema, &payload.schema) {
             return Err(InstallError::bad_request(
                 "manifest schema does not match descriptor",
@@ -414,6 +435,12 @@ impl LibraryRegistry {
     fn apply_prepared_runtime(&self, install: &StagedInstall) {
         match &install.install {
             PreparedInstall::Payload(compiled) => {
+                let mut classes = self.classes.write().expect("Class registry write lock");
+                for class in &compiled.classes {
+                    classes
+                        .insert(&class.identity().to_string(), class.clone())
+                        .expect("validated canonical Class identity");
+                }
                 install.runtime.replace_compiled(compiled.clone())
             }
         }
@@ -468,7 +495,7 @@ impl LibraryRegistry {
     async fn runtime_for_schema(&self, schema: &LibrarySchema) -> TCResult<Arc<LibraryRuntime>> {
         let key = canonical_link(schema.id());
         if let Some(existing) = self
-            .entries
+            .libraries
             .read()
             .expect("library registry read lock")
             .get(&key)
@@ -483,8 +510,22 @@ impl LibraryRegistry {
         };
         let runtime = Arc::new(LibraryRuntime::new(schema.clone(), store));
 
-        let mut entries = self.entries.write().expect("library registry write lock");
-        let entry = entries.entry(key).or_insert_with(|| Arc::clone(&runtime));
-        Ok(Arc::clone(entry))
+        let mut libraries = self.libraries.write().expect("library registry write lock");
+        if let Some(existing) = libraries.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        libraries.insert(&key, Arc::clone(&runtime))?;
+        Ok(runtime)
     }
+}
+
+fn listing<T>(dir: &Dir<T>, path: &str) -> Option<Map<bool>> {
+    let mut out = Map::new();
+    for (child, is_dir) in dir.list(path)? {
+        let Ok(child) = child.parse::<Id>() else {
+            continue;
+        };
+        out.insert(child, is_dir);
+    }
+    Some(out)
 }

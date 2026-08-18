@@ -59,6 +59,8 @@ impl HttpRouter {
     pub fn is_native(&self, path: &str) -> bool {
         path.starts_with("/state/")
             || path == crate::uri::HOST_AUTH_CONTEXT
+            || path == crate::uri::CLASS_ROOT
+            || path.starts_with(crate::uri::CLASS_ROOT_PREFIX)
             || self
                 .registry
                 .resolve_native(path)
@@ -69,6 +71,8 @@ impl HttpRouter {
         self.is_native(path)
             || path == crate::uri::LIB_ROOT
             || path.starts_with(crate::uri::LIB_ROOT_PREFIX)
+            || path == crate::uri::CLASS_ROOT
+            || path.starts_with(crate::uri::CLASS_ROOT_PREFIX)
             || path == crate::uri::SERVICE_ROOT
             || path.starts_with(crate::uri::SERVICE_ROOT_PREFIX)
             || path == crate::uri::HOST_LIBRARY_EXPORT
