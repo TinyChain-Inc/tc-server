@@ -16,6 +16,11 @@ The registry represents `/lib` and `/class` as separate structural directories;
 directory traversal owns listing and longest-component resolution, so routing never
 reconstructs hierarchy by scanning flat path maps.
 
+The server-local component directory is an interim compatibility layer. Consolidate
+it with `tc_ir::Dir` so handler and component traversal share one structural tree,
+then back its persistent leaves directly with `txfs::Dir`; remove the local type in
+that migration rather than retaining parallel directory implementations.
+
 This crate now has the skeleton required to serve `/lib`, `/service`, and `/host`
 endpoints, but it still lacks the transactional guarantees that the production TinyChain host
 offers. This roadmap tracks the work necessary to align the reference server with the

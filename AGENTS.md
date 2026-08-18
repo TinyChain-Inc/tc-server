@@ -4,6 +4,9 @@
   `unsafe_op_in_unsafe_fn` allowance exists only for code emitted by PyO3 0.21
   macros; do not place unsafe blocks, functions, traits, or impls in the PyO3
   adapter or broaden that allowance.
+- Runtime and protocol code must not use `serde_json::Value`. Decode canonical
+  TinyChain types with `destream`; when an adapter must preserve an unexamined
+  JSON fragment, use bounded raw bytes rather than building a JSON value tree.
 
 This crate is intentionally thin: all business logic lives in the shared `Kernel`
 and its handlers, while the protocol layers (HTTP, PyO3, future bindings) simply

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use pathlink::Link;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Handler, Map, NativeClass, OpDef, OpRef, Route, Scalar, Subject, parse_route_path};
 use tc_state::{ClassDef, ClassParent, StateType};
@@ -18,7 +19,7 @@ pub const WASM_ARTIFACT_CONTENT_TYPE: &str = "application/wasm";
 
 #[derive(Deserialize)]
 struct IrManifest {
-    schema: serde_json::Value,
+    schema: Box<RawValue>,
     #[serde(default)]
     classes: Vec<IrClass>,
     routes: Vec<IrRoute>,
@@ -29,18 +30,18 @@ struct IrClass {
     id: String,
     parent: String,
     #[serde(default)]
-    prototype: serde_json::Map<String, serde_json::Value>,
+    prototype: HashMap<String, Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
 struct IrRoute {
     path: String,
     #[serde(default)]
-    value: Option<serde_json::Value>,
+    value: Option<Box<RawValue>>,
     #[serde(default)]
     op: Option<IrOp>,
     #[serde(default)]
-    opdef: Option<serde_json::Value>,
+    opdef: Option<Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
@@ -149,9 +150,8 @@ impl Handler<State> for IrHandler {
 pub async fn compile_ir_library(artifact: Artifact) -> TCResult<CompiledLibrary> {
     let manifest: IrManifest = serde_json::from_slice(&artifact.bytes)
         .map_err(|err| TCError::bad_request(format!("invalid ir manifest json: {err}")))?;
-    let schema_bytes = serde_json::to_vec(&manifest.schema)
-        .map_err(|err| TCError::bad_request(format!("invalid ir schema: {err}")))?;
-    let schema = decode_schema_bytes(&schema_bytes).map_err(TCError::bad_request)?;
+    let schema =
+        decode_schema_bytes(manifest.schema.get().as_bytes()).map_err(TCError::bad_request)?;
 
     let mut classes = Vec::with_capacity(manifest.classes.len());
     for class in manifest.classes {
@@ -180,10 +180,9 @@ pub async fn compile_ir_library(artifact: Artifact) -> TCResult<CompiledLibrary>
             let name = name.parse().map_err(|err| {
                 TCError::bad_request(format!("invalid Class member name {name}: {err}"))
             })?;
-            let bytes = serde_json::to_vec(&value)
-                .map_err(|err| TCError::bad_request(format!("invalid Class member: {err}")))?;
-            let stream =
-                futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+            let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(
+                Bytes::copy_from_slice(value.get().as_bytes()),
+            )]);
             let value = destream_json::try_decode((), stream)
                 .await
                 .map_err(|err| TCError::bad_request(format!("invalid Class member: {err}")))?;
@@ -200,10 +199,9 @@ pub async fn compile_ir_library(artifact: Artifact) -> TCResult<CompiledLibrary>
 
         let implementation =
             if let Some(value) = route.value {
-                let bytes = serde_json::to_vec(&value)
-                    .map_err(|err| TCError::bad_request(format!("invalid route value: {err}")))?;
-                let stream =
-                    futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+                let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(
+                    Bytes::copy_from_slice(value.get().as_bytes()),
+                )]);
                 let scalar: Scalar = destream_json::try_decode((), stream)
                     .await
                     .map_err(|err| TCError::bad_request(format!("invalid route value: {err}")))?;
@@ -221,10 +219,9 @@ pub async fn compile_ir_library(artifact: Artifact) -> TCResult<CompiledLibrary>
                     Scalar::default(),
                 ))))
             } else if let Some(opdef) = route.opdef {
-                let bytes = serde_json::to_vec(&opdef)
-                    .map_err(|err| TCError::bad_request(format!("invalid opdef route: {err}")))?;
-                let stream =
-                    futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+                let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(
+                    Bytes::copy_from_slice(opdef.get().as_bytes()),
+                )]);
                 RouteImpl::OpDef(destream_json::try_decode((), stream).await.map_err(|err| {
                     TCError::bad_request(format!("invalid opdef encoding: {err}"))
                 })?)
@@ -258,30 +255,22 @@ pub async fn compile_ir_library(artifact: Artifact) -> TCResult<CompiledLibrary>
 mod tests {
     use super::*;
 
-    fn artifact(classes: serde_json::Value) -> Artifact {
+    fn artifact(classes: &str) -> Artifact {
         Artifact {
             path: "/lib/acme/classes/1.0.0".into(),
             content_type: IR_ARTIFACT_CONTENT_TYPE.into(),
-            bytes: serde_json::to_vec(&serde_json::json!({
-                "schema": {
-                    "id": "/lib/acme/classes/1.0.0",
-                    "version": "1.0.0",
-                    "dependencies": []
-                },
-                "classes": classes,
-                "routes": []
-            }))
-            .expect("manifest json"),
+            bytes: format!(
+                r#"{{"schema":{{"id":"/lib/acme/classes/1.0.0","version":"1.0.0","dependencies":[]}},"classes":{classes},"routes":[]}}"#
+            )
+            .into_bytes(),
         }
     }
 
     #[tokio::test]
     async fn compiles_canonical_class_manifest() {
-        let compiled = compile_ir_library(artifact(serde_json::json!([{
-            "id": "/class/acme/counter/1.0.0",
-            "parent": "/state/scalar/value/number",
-            "prototype": {"initial": 0}
-        }])))
+        let compiled = compile_ir_library(artifact(
+            r#"[{"id":"/class/acme/counter/1.0.0","parent":"/state/scalar/value/number","prototype":{"initial":0}}]"#,
+        ))
         .await
         .expect("compile Class manifest");
 
@@ -294,10 +283,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_noncanonical_class_identity() {
-        let result = compile_ir_library(artifact(serde_json::json!([{
-            "id": "/lib/acme/not-a-class/1.0.0",
-            "parent": "/state/scalar/value/number"
-        }])))
+        let result = compile_ir_library(artifact(
+            r#"[{"id":"/lib/acme/not-a-class/1.0.0","parent":"/state/scalar/value/number"}]"#,
+        ))
         .await;
         let err = match result {
             Ok(_) => panic!("accepted non-Class identity"),

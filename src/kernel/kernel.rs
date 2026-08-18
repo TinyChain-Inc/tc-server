@@ -46,31 +46,8 @@ impl Kernel {
             .library_module
             .as_ref()
             .ok_or_else(|| tc_error::TCError::not_found(path.clone()))?;
-        if path.starts_with("/class/") {
-            let (class, route) = registry
-                .resolve_class_path(&path)
-                .ok_or_else(|| tc_error::TCError::not_found(path.clone()))?;
-            if !route.is_empty() {
-                return Err(tc_error::TCError::not_found(path));
-            }
-            return match (request.method, request.body) {
-                (Method::Get, body) => Ok(crate::State::from(tc_state::Object::Instance(
-                    tc_state::ClassInstance::new(
-                        body.unwrap_or_default(),
-                        class,
-                        tc_ir::Map::new(),
-                    ),
-                ))),
-                (Method::Post, Some(crate::State::Map(members))) => {
-                    Ok(crate::State::from(tc_state::Object::Instance(
-                        tc_state::ClassInstance::new(crate::State::default(), class, members),
-                    )))
-                }
-                (Method::Post, _) => Err(tc_error::TCError::bad_request(
-                    "Class construction requires a map of instance members",
-                )),
-                (method, _) => Err(tc_error::TCError::method_not_allowed(method, path)),
-            };
+        if path == crate::uri::CLASS_ROOT || path.starts_with(crate::uri::CLASS_ROOT_PREFIX) {
+            return execute_class(registry, &path, request).await;
         }
         let (routes, route, is_root) = registry
             .resolve_native(&path)
@@ -173,6 +150,40 @@ impl Kernel {
             txn,
             implicit: txn_id.is_none(),
         }))
+    }
+}
+
+async fn execute_class(
+    registry: &LibraryRegistry,
+    path: &str,
+    request: KernelRequest,
+) -> TCResult<crate::State> {
+    let Some((class, route)) = registry.resolve_class_path(path) else {
+        if request.method != Method::Get {
+            return Err(tc_error::TCError::method_not_allowed(request.method, path));
+        }
+        return registry
+            .list_class_dir(path)
+            .map(crate::library::view::listing)
+            .ok_or_else(|| tc_error::TCError::not_found(path));
+    };
+    if !route.is_empty() {
+        return Err(tc_error::TCError::not_found(path));
+    }
+
+    match (request.method, request.body) {
+        (Method::Get, body) => Ok(crate::State::from(tc_state::Object::Instance(
+            tc_state::ClassInstance::new(body.unwrap_or_default(), class, tc_ir::Map::new()),
+        ))),
+        (Method::Post, Some(crate::State::Map(members))) => {
+            Ok(crate::State::from(tc_state::Object::Instance(
+                tc_state::ClassInstance::new(crate::State::default(), class, members),
+            )))
+        }
+        (Method::Post, _) => Err(tc_error::TCError::bad_request(
+            "Class construction requires a map of instance members",
+        )),
+        (method, _) => Err(tc_error::TCError::method_not_allowed(method, path)),
     }
 }
 

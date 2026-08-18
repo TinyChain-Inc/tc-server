@@ -91,14 +91,6 @@ impl LibraryRegistry {
         listing(&classes, &path)
     }
 
-    pub fn has_class(&self, path: &str) -> bool {
-        self.classes
-            .read()
-            .expect("Class registry read lock")
-            .get(&normalize_path(path))
-            .is_some()
-    }
-
     pub fn resolve_runtime_for_path(&self, path: &str) -> Option<(Arc<LibraryRuntime>, bool)> {
         let path = normalize_path(path);
         let libraries = self.libraries.read().expect("library registry read lock");

@@ -404,38 +404,6 @@ impl KernelHandle {
                     return Ok(PyResponse::new(200, None, Some(body)));
                 }
 
-                if method == crate::Method::Get
-                    && (route_path == crate::uri::CLASS_ROOT
-                        || route_path.starts_with(crate::uri::CLASS_ROOT_PREFIX))
-                    && !self
-                        .inner
-                        .library_registry()
-                        .is_some_and(|registry| registry.has_class(&route_path))
-                {
-                    let registry = self
-                        .inner
-                        .library_registry()
-                        .ok_or_else(|| PyValueError::new_err("no Class registry configured"))?;
-                    let Some(state) = registry
-                        .list_class_dir(&route_path)
-                        .map(crate::library::view::listing)
-                    else {
-                        return Ok(PyResponse::new(404, None, None));
-                    };
-                    let body = if implicit {
-                        PyStateHandle::from_terminal_state(
-                            state,
-                            Arc::clone(&self.inner),
-                            txn,
-                            Arc::clone(&self.runtime),
-                            Arc::clone(&request_permit),
-                        )
-                    } else {
-                        PyStateHandle::from_state(state, txn, Arc::clone(&self.runtime))
-                    };
-                    return Ok(PyResponse::new(200, None, Some(body)));
-                }
-
                 if route_path == crate::uri::LIB_ROOT && method == crate::Method::Put {
                     let registry =
                         self.inner.library_registry().cloned().ok_or_else(|| {

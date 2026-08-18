@@ -119,7 +119,7 @@ fn respond_with_schema(schema: LibrarySchema) -> Response {
     crate::http::state_response(state)
 }
 
-pub(crate) fn respond_with_listing(listing: Option<tc_ir::Map<bool>>) -> Response {
+fn respond_with_listing(listing: Option<tc_ir::Map<bool>>) -> Response {
     let Some(listing) = listing else {
         return http::Response::builder()
             .status(StatusCode::NOT_FOUND)

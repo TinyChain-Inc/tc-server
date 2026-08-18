@@ -59,7 +59,8 @@ impl HttpRouter {
     pub fn is_native(&self, path: &str) -> bool {
         path.starts_with("/state/")
             || path == crate::uri::HOST_AUTH_CONTEXT
-            || self.registry.has_class(path)
+            || path == crate::uri::CLASS_ROOT
+            || path.starts_with(crate::uri::CLASS_ROOT_PREFIX)
             || self
                 .registry
                 .resolve_native(path)
@@ -119,14 +120,6 @@ impl HttpRouter {
             return crate::library::http::routes_handler(Arc::clone(&self.registry))
                 .call(request)
                 .await;
-        }
-        if path == crate::uri::CLASS_ROOT || path.starts_with(crate::uri::CLASS_ROOT_PREFIX) {
-            return match method {
-                Method::Get => {
-                    crate::library::http::respond_with_listing(self.registry.list_class_dir(path))
-                }
-                _ => method_not_allowed(),
-            };
         }
         if path == crate::uri::SERVICE_ROOT || path.starts_with(crate::uri::SERVICE_ROOT_PREFIX) {
             return self.service.call(request).await;
