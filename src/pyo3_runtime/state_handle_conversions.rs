@@ -11,13 +11,13 @@ pub(crate) fn request_body_bytes(body: Option<PyStateHandle>) -> PyResult<Vec<u8
         None => return Ok(Vec::new()),
     };
 
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let value = handle.value()?;
         let any = value.bind(py);
-        if let Ok(bytes) = any.downcast::<PyBytes>() {
+        if let Ok(bytes) = any.cast::<PyBytes>() {
             return Ok(bytes.as_bytes().to_vec());
         }
-        if let Ok(string) = any.downcast::<PyString>() {
+        if let Ok(string) = any.cast::<PyString>() {
             return Ok(string.to_str()?.as_bytes().to_vec());
         }
         Err(PyValueError::new_err("expected bytes or string body"))

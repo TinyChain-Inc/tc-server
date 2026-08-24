@@ -86,10 +86,10 @@ fn python_kernel_builder_with_config(
 }
 
 fn stub_py_handler() -> Py<PyAny> {
-    Python::with_gil(|py| py.None())
+    Python::attach(|py| py.None())
 }
 
-#[pyclass(name = "KernelHandle")]
+#[pyclass(name = "KernelHandle", from_py_object)]
 pub struct KernelHandle {
     inner: Arc<Kernel>,
     runtime: Arc<tokio::runtime::Runtime>,
@@ -169,10 +169,9 @@ impl KernelHandle {
         request_ttl_secs: Option<u64>,
         max_request_bytes_unauth: Option<usize>,
     ) -> Self {
-        let stub = stub_py_handler();
         Self::new(
-            stub.clone(),
-            stub,
+            stub_py_handler(),
+            stub_py_handler(),
             None,
             data_dir,
             workspace,
