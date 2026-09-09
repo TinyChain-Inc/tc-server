@@ -1,103 +1,563 @@
-use std::sync::Arc;
-
 use super::*;
+use tc_ir::Public;
+async fn manifest(identity: &pathlink::Link, value: &tc_ir::Scalar) -> std::sync::Arc<[u8]> {
+    crate::application::encode_definition(identity, value, crate::application::MAX_DEFINITION_BYTES)
+        .await
+        .expect("encode manifest")
+        .into()
+}
+async fn stage_service(
+    kernel: &Kernel,
+    txn: &crate::TxnHandle,
+    identity: pathlink::Link,
+    definition: tc_ir::Scalar,
+) {
+    kernel
+        .execute(
+            KernelTarget::Application("/service".parse().expect("application target")),
+            txn.clone(),
+            Method::Put,
+            Some(crate::State::Tuple(vec![
+                crate::State::from(tc_value::Value::Link(identity)),
+                crate::State::from_scalar(definition),
+            ])),
+            None,
+        )
+        .await
+        .expect("stage Service");
+}
+async fn kernel(name: &str) -> Kernel {
+    setup_with_ttl(name, std::time::Duration::from_secs(3))
+        .await
+        .0
+}
+async fn execute(
+    kernel: &Kernel,
+    method: Method,
+    path: &str,
+    body: Option<crate::State>,
+    txn: crate::TxnHandle,
+) -> tc_error::TCResult<crate::State> {
+    let target = KernelTarget::Application(path.parse().expect("application target"));
+    kernel
+        .execute(target, txn, method, body, None)
+        .await?
+        .ok_or_else(|| tc_error::TCError::internal("ordinary request returned no response"))
+}
+async fn bind(kernel: &Kernel) -> crate::TxnHandle {
+    kernel
+        .txn_server()
+        .bind(None, None, std::sync::Arc::clone(&kernel.runtime))
+        .await
+        .expect("bind transaction")
+        .with_deadline(kernel.resources().deadline())
+}
+async fn complete(txn: crate::TxnHandle, outcome: crate::txn::TransactionOutcome) {
+    txn.coordinator()
+        .expect("transaction coordinator")
+        .coordinate(&txn, outcome, false)
+        .await
+        .expect("complete transaction");
+}
 
 #[tokio::test]
-async fn binds_an_implicit_transaction_for_native_execution() {
-    let kernel = Kernel::builder().with_host_id("test-host").finish();
+async fn collection_type_routes_do_not_host_named_resources() {
+    let kernel = kernel("collection-types-only").await;
+    let txn = bind(&kernel).await;
+    let target = KernelTarget::State(
+        ["collection", "btree", "orders"]
+            .into_iter()
+            .map(|segment| segment.parse().expect("path segment"))
+            .collect(),
+    );
+    let error = kernel
+        .execute(target, txn, Method::Get, None, None)
+        .await
+        .expect_err("a deeper collection URI must not resolve as a hosted resource");
+    assert_eq!(error.code(), tc_error::ErrorKind::NotFound);
+}
+async fn setup(name: &str) -> (Kernel, std::sync::Arc<crate::ApplicationOwners>) {
+    setup_with_ttl(name, std::time::Duration::from_secs(3)).await
+}
+async fn setup_with_ttl(
+    name: &str,
+    ttl: std::time::Duration,
+) -> (Kernel, std::sync::Arc<crate::ApplicationOwners>) {
+    let workspace = crate::txn::test_workspace(name);
+    let host: pathlink::Link = crate::uri::HOST_ROOT.parse().expect("host link");
+    let (protocol, actor) = workspace
+        .load_or_create_protocol_authority("test-host", host.clone())
+        .await
+        .expect("protocol authority");
+    let applications = crate::txn::test_applications_with(name, protocol.clone()).await;
+    let verifier = crate::auth::RjwtTokenVerifier::new(std::sync::Arc::new(
+        crate::auth::KeyringActorResolver::default().with_actor(
+            host.clone(),
+            crate::auth::Actor::with_verifying_key(actor.id().clone(), actor.verifying_key()),
+        ),
+    ));
+    (
+        Kernel::new(
+            crate::HostServices {
+                applications: std::sync::Arc::clone(&applications),
+                rpc: std::sync::Arc::new(crate::gateway::LocalRpcGateway),
+                resources: crate::HostResources::default(),
+                protocol,
+                verifier: std::sync::Arc::new(verifier),
+                public_keys: crate::auth::PublicKeyStore::default(),
+            },
+            workspace,
+            ttl,
+        )
+        .await
+        .expect("construct kernel"),
+        applications,
+    )
+}
+#[tokio::test]
+async fn service_discovery_and_delete_use_the_native_owner_path() {
+    let (kernel, _applications) = setup("service-native").await;
+    let identity: pathlink::Link = "/service/example-devco/catalog/1.0.0"
+        .parse()
+        .expect("identity");
+    let manifest = tc_ir::Scalar::Map(tc_ir::Map::new());
+    let txn = bind(&kernel).await;
+    let txn = txn.with_claims(vec![tc_ir::Claim::new(
+        identity.clone(),
+        umask::Mode::all(),
+    )]);
+    stage_service(&kernel, &txn, identity.clone(), manifest).await;
+    complete(txn, crate::txn::TransactionOutcome::Commit).await;
+    let txn = bind(&kernel).await;
+    let state = execute(
+        &kernel,
+        Method::Get,
+        &identity.to_string(),
+        None,
+        txn.clone(),
+    )
+    .await
+    .expect("discover Service");
+    assert!(matches!(state, crate::State::Map(_)));
+    let execution = execute(
+        &kernel,
+        Method::Get,
+        &format!("{identity}/run"),
+        None,
+        txn.clone(),
+    )
+    .await
+    .expect_err("Service execution is reserved");
+    assert_eq!(execution.code(), tc_error::ErrorKind::MethodNotAllowed);
+    complete(txn, crate::txn::TransactionOutcome::Commit).await;
+    let txn = bind(&kernel).await;
+    let txn = txn.with_claims(vec![tc_ir::Claim::new(
+        identity.clone(),
+        umask::Mode::all(),
+    )]);
+    let error = execute(
+        &kernel,
+        Method::Delete,
+        &identity.to_string(),
+        Some(crate::State::from(number_general::Number::from(true))),
+        txn.clone(),
+    )
+    .await
+    .expect_err("a non-null deletion body must be rejected");
+    assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
+    execute(
+        &kernel,
+        Method::Delete,
+        &identity.to_string(),
+        Some(crate::State::None),
+        txn.clone(),
+    )
+    .await
+    .expect("delete Service");
+    complete(txn, crate::txn::TransactionOutcome::Commit).await;
+    let error = execute(
+        &kernel,
+        Method::Get,
+        &identity.to_string(),
+        None,
+        bind(&kernel).await,
+    )
+    .await
+    .expect_err("deleted Service must not resolve");
+    assert_eq!(error.code(), tc_error::ErrorKind::NotFound);
+}
+#[tokio::test]
+async fn class_instance_routes_bound_methods_with_concrete_self() {
+    let (kernel, _applications) = setup("class-self").await;
+    let identity: pathlink::Link = "/class/example-devco/named/1.0.0"
+        .parse()
+        .expect("identity");
+    let get_name = tc_ir::Scalar::Ref(Box::new(tc_ir::TCRef::Op(tc_ir::OpRef::Get((
+        tc_ir::Subject::Ref(
+            "$self".parse().expect("self ref"),
+            "name".parse().expect("member path"),
+        ),
+        tc_ir::Scalar::default(),
+    )))));
+    let prototype = tc_ir::Map::from_iter([(
+        "label".parse().expect("member"),
+        tc_ir::Scalar::Op(tc_ir::OpDef::Post(vec![(
+            "result".parse().expect("result"),
+            get_name,
+        )])),
+    )]);
+    let definition = tc_state::ClassBody::new(
+        tc_state::ClassParent::Native(tc_state::StateType::Tuple),
+        prototype,
+    );
+    let txn = bind(&kernel).await;
+    let txn = txn.with_claims(vec![tc_ir::Claim::new(
+        identity.clone(),
+        umask::Mode::all(),
+    )]);
+    let definition = definition.definition();
+    let _bytes = manifest(&identity, &definition).await;
+    execute(
+        &kernel,
+        Method::Put,
+        "/class",
+        Some(crate::State::Tuple(vec![
+            crate::State::from(tc_value::Value::Link(identity.clone())),
+            crate::State::from_scalar(definition),
+        ])),
+        txn.clone(),
+    )
+    .await
+    .expect("install Class");
+    complete(txn, crate::txn::TransactionOutcome::Commit).await;
+    let txn = bind(&kernel).await;
+    let members = tc_ir::Map::from_iter([(
+        "name".parse().expect("member"),
+        crate::State::from(tc_value::Value::from("Ada")),
+    )]);
+    let instance = execute(
+        &kernel,
+        Method::Post,
+        &identity.to_string(),
+        Some(crate::State::Map(members)),
+        txn.clone(),
+    )
+    .await
+    .expect("construct instance");
+    let label = instance
+        .post(
+            &txn,
+            &["label".parse().expect("method path")],
+            tc_ir::Map::new(),
+        )
+        .await
+        .expect("invoke bound method");
+    assert!(matches!(
+        label,
+        crate::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::String(value)))
+            if value == "Ada"
+    ));
+}
+#[tokio::test]
+async fn binds_an_ownerless_transaction_for_native_execution() {
+    let kernel = kernel("ownerless").await;
     let deadline = kernel.resources().deadline();
-    let binding = kernel
-        .bind_transaction(
+    let guard = kernel
+        .begin_request(
             Method::Get,
             "/state/scalar/value/number/add",
             false,
-            None,
             None,
             deadline,
         )
         .await
         .expect("bind transaction");
-
-    let Some(BoundTransaction {
-        txn,
-        implicit: true,
-    }) = binding
-    else {
-        panic!("expected implicit transaction");
-    };
-    assert_eq!(txn.deadline().instant(), deadline.instant());
+    assert_eq!(guard.txn().deadline().instant(), deadline.instant());
 }
-
 #[tokio::test]
-async fn ttl_worker_rolls_back_abandoned_transaction() {
-    let kernel = Kernel::builder()
-        .with_host_id("test-host")
-        .with_txn_ttl(std::time::Duration::from_millis(10))
-        .finish();
-    kernel.start_transaction_expiry(&tokio::runtime::Handle::current());
-    let Some(BoundTransaction { txn, .. }) = kernel
-        .bind_transaction(
-            Method::Get,
-            "/state/scalar/value/number/add",
-            false,
-            None,
-            None,
-            kernel.resources().deadline(),
-        )
+async fn ttl_worker_finalizes_an_abandoned_transaction() {
+    let kernel = setup_with_ttl("ttl", std::time::Duration::from_millis(10))
+        .await
+        .0;
+    let txn = kernel
+        .txn_server()
+        .bind(None, None, std::sync::Arc::clone(&kernel.runtime))
         .await
         .expect("bind transaction")
-    else {
-        panic!("expected executable transaction");
-    };
+        .with_deadline(kernel.resources().deadline());
     let txn_id = txn.id();
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
         while kernel.txn_server().contains(&txn_id) {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
-    .expect("TTL rollback");
+    .expect("TTL finalization");
 }
-
 #[tokio::test]
-async fn finalization_is_exactly_once() {
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let hook_calls = Arc::clone(&calls);
-    let kernel = Kernel::builder()
-        .with_host_id("test-host")
-        .with_txn_finalize_hook(move |_txn, _commit| {
-            let calls = Arc::clone(&hook_calls);
-            async move {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            }
-        })
-        .finish();
-    let Some(BoundTransaction { txn, .. }) = kernel
-        .bind_transaction(
-            Method::Get,
-            "/state/scalar/value/number/add",
+async fn decisions_delegate_repeatedly_until_time_based_finalization() {
+    let kernel = kernel("finalize").await;
+    let txn = kernel
+        .txn_server()
+        .bind(None, None, std::sync::Arc::clone(&kernel.runtime))
+        .await
+        .expect("bind transaction")
+        .with_deadline(kernel.resources().deadline());
+    let txn_id = txn.id();
+    kernel
+        .runtime
+        .applications
+        .libraries
+        .claim(&txn)
+        .await
+        .expect("claim resource");
+    txn.coordinator()
+        .expect("transaction coordinator")
+        .coordinate(&txn, crate::txn::TransactionOutcome::Rollback, false)
+        .await
+        .expect("first decision");
+    txn.coordinator()
+        .expect("transaction coordinator")
+        .coordinate(&txn, crate::txn::TransactionOutcome::Rollback, false)
+        .await
+        .expect("duplicate decision");
+    txn.coordinator()
+        .expect("transaction coordinator")
+        .coordinate(&txn, crate::txn::TransactionOutcome::Commit, false)
+        .await
+        .expect("opposite decision delegates to the idempotent resource lifecycle");
+    let error = kernel
+        .runtime
+        .applications
+        .classes
+        .claim(&txn)
+        .await
+        .expect_err("decided transactions cannot accept more work");
+    assert_eq!(error.code(), tc_error::ErrorKind::Conflict);
+    drop(txn);
+    assert!(kernel.txn_server().contains(&txn_id));
+}
+#[tokio::test]
+async fn a_locked_empty_put_decides_only_its_exact_resource() {
+    let (kernel, _applications) = setup("exact-resource-decision").await;
+    let identity: pathlink::Link = "/service/example-devco/nested/catalog/1.0.0"
+        .parse()
+        .expect("identity");
+    let txn = bind(&kernel).await;
+    let txn = txn.with_claims(vec![tc_ir::Claim::new(
+        identity.clone(),
+        umask::Mode::all(),
+    )]);
+    let definition = tc_ir::Scalar::Map(tc_ir::Map::new());
+    stage_service(&kernel, &txn, identity.clone(), definition).await;
+    let active_bearer = txn.raw_token().expect("protocol token").to_string();
+    let error = match kernel
+        .begin_request(
+            Method::Put,
+            &format!("{identity}?txn_id={}", txn.id()),
+            true,
+            Some(active_bearer),
+            kernel.resources().deadline(),
+        )
+        .await
+    {
+        Ok(_) => panic!("active work authority is not a decision lock"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
+    let bearer = kernel.txn_server().test_decision_bearer(&txn);
+    let resources = txn.claimed_paths();
+    let guard = kernel
+        .begin_request(
+            Method::Put,
+            &format!("{identity}/suffix?txn_id={}", txn.id()),
+            true,
+            Some(bearer.clone()),
+            kernel.resources().deadline(),
+        )
+        .await
+        .expect("bind suffix decision");
+    let error = guard
+        .execute(None)
+        .await
+        .expect_err("a suffix is not a resource decision target");
+    assert_eq!(error.code(), tc_error::ErrorKind::Conflict);
+    let guard = kernel
+        .begin_request(
+            Method::Put,
+            &format!("/service/example-devco/other/1.0.0?txn_id={}", txn.id()),
+            true,
+            Some(bearer.clone()),
+            kernel.resources().deadline(),
+        )
+        .await
+        .expect("bind missing decision");
+    let error = guard
+        .execute(None)
+        .await
+        .expect_err("an unenlisted resource cannot be decided");
+    assert_eq!(error.code(), tc_error::ErrorKind::Conflict);
+    let guard = kernel
+        .begin_request(
+            Method::Put,
+            &format!("{identity}?txn_id={}", txn.id()),
+            true,
+            Some(bearer.clone()),
+            kernel.resources().deadline(),
+        )
+        .await
+        .expect("bind resource decision");
+    assert!(
+        guard
+            .execute(None)
+            .await
+            .expect("resource decision")
+            .is_none()
+    );
+    let duplicate = kernel
+        .begin_request(
+            Method::Put,
+            &format!("{identity}?txn_id={}", txn.id()),
+            true,
+            Some(bearer.clone()),
+            kernel.resources().deadline(),
+        )
+        .await
+        .expect("bind duplicate resource decision");
+    assert!(
+        duplicate
+            .execute(None)
+            .await
+            .expect("duplicate decision")
+            .is_none()
+    );
+    let opposite = kernel
+        .begin_request(
+            Method::Delete,
+            &format!("{identity}?txn_id={}", txn.id()),
+            true,
+            Some(bearer.clone()),
+            kernel.resources().deadline(),
+        )
+        .await
+        .expect("bind opposite resource decision");
+    assert!(
+        opposite
+            .execute(None)
+            .await
+            .expect("opposite decision reaches the resource lifecycle")
+            .is_none()
+    );
+    for resource in resources.iter().filter(|path| *path != identity.path()) {
+        let guard = kernel
+            .begin_request(
+                Method::Put,
+                &format!("{resource}?txn_id={}", txn.id()),
+                true,
+                Some(bearer.clone()),
+                kernel.resources().deadline(),
+            )
+            .await
+            .expect("bind resource decision");
+        assert!(
+            guard
+                .execute(None)
+                .await
+                .expect("resource decision")
+                .is_none()
+        );
+    }
+    execute(
+        &kernel,
+        Method::Get,
+        &identity.to_string(),
+        None,
+        bind(&kernel).await,
+    )
+    .await
+    .expect("committed Service must resolve");
+}
+#[tokio::test]
+async fn an_unlocked_empty_mutation_is_ordinary_invalid_input() {
+    let kernel = kernel("unlocked-empty-mutation").await;
+    for method in [Method::Put, Method::Delete] {
+        let error = match kernel
+            .begin_request(
+                method,
+                "/service/example-devco/catalog/1.0.0",
+                true,
+                None,
+                kernel.resources().deadline(),
+            )
+            .await
+        {
+            Ok(_) => panic!("unlocked empty mutation must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
+    }
+    kernel
+        .begin_request(
+            Method::Delete,
+            "/service/example-devco/catalog/1.0.0",
             false,
-            None,
             None,
             kernel.resources().deadline(),
         )
         .await
-        .expect("bind transaction")
-    else {
-        panic!("expected executable transaction");
-    };
-
-    kernel
-        .complete_transaction(txn.clone(), crate::txn::TransactionOutcome::Failed)
+        .expect("explicit null body binds ordinary deletion");
+}
+#[tokio::test]
+async fn a_locked_decision_excludes_new_work() {
+    let (kernel, applications) = setup("decision-work-race").await;
+    let identity: pathlink::Link = "/service/example-devco/race/1.0.0"
+        .parse()
+        .expect("identity");
+    let txn = bind(&kernel).await;
+    let txn = txn.with_claims(vec![tc_ir::Claim::new(
+        identity.clone(),
+        umask::Mode::all(),
+    )]);
+    let definition = tc_ir::Scalar::Map(tc_ir::Map::new());
+    stage_service(&kernel, &txn, identity.clone(), definition).await;
+    let bearer = kernel.txn_server().test_decision_bearer(&txn);
+    let guard = kernel
+        .begin_request(
+            Method::Put,
+            &format!("{identity}?txn_id={}", txn.id()),
+            true,
+            Some(bearer),
+            crate::Deadline::after(std::time::Duration::from_secs(1)),
+        )
         .await
-        .expect("first finalize");
-    assert!(
-        kernel
-            .complete_transaction(txn, crate::txn::TransactionOutcome::Failed)
-            .await
-            .is_err()
-    );
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        .expect("bind decision");
+    assert!(guard.execute(None).await.expect("decision").is_none());
+    let error = applications
+        .classes
+        .claim(&txn)
+        .await
+        .expect_err("locked work must fail");
+    assert_eq!(error.code(), tc_error::ErrorKind::Conflict);
+}
+
+#[cfg(feature = "http-server")]
+#[tokio::test]
+async fn external_digest_metadata_does_not_quarantine_the_host() {
+    let kernel = kernel("external-digest").await;
+    assert!(kernel.is_ready());
+    let mut guard = kernel
+        .begin_request(
+            Method::Get,
+            "/lib/example-devco/missing/1.0.0",
+            false,
+            None,
+            kernel.resources().deadline(),
+        )
+        .await
+        .expect("bind request");
+    let error = guard
+        .set_expected_digest(<sha2::Sha256 as sha2::Digest>::digest(b"untrusted").into())
+        .expect_err("untrusted digest metadata must be rejected");
+    assert_eq!(error.code(), tc_error::ErrorKind::Unauthorized);
+    assert!(kernel.is_ready());
 }

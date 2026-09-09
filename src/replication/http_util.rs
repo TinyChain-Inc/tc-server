@@ -43,15 +43,15 @@ pub(crate) fn json_ok(body: Vec<u8>) -> Response {
 pub(crate) async fn decode_encrypted_request(
     req: Request<Body>,
     issuer: &ReplicationIssuer,
-) -> Result<(String, Key<Aes256GcmSiv>), Response> {
+) -> Result<(String, Key<Aes256GcmSiv>), Box<Response>> {
     let body = to_bytes(req.into_body())
         .await
-        .map_err(|err| bad_request(err.to_string()))?;
+        .map_err(|err| Box::new(bad_request(err.to_string())))?;
 
     let (nonce, ciphertext) =
-        decode_encrypted_payload(body).map_err(|err| bad_request(err.to_string()))?;
+        decode_encrypted_payload(body).map_err(|err| Box::new(bad_request(err.to_string())))?;
 
     issuer
         .decrypt_path_with_key(&nonce, &ciphertext)
-        .map_err(|err| bad_request(err.to_string()))
+        .map_err(|err| Box::new(bad_request(err.to_string())))
 }

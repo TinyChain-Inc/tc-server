@@ -5,6 +5,12 @@ use tc_ir::Claim;
 use crate::txn::TxnError;
 use futures::future::{BoxFuture, FutureExt};
 
+pub fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
 /// A kernel-owned verifier which maps an `Authorization: Bearer ...` token to a stable owner
 /// identity used to pin transaction ownership.
 ///
@@ -27,6 +33,7 @@ pub struct TokenContext {
     pub bearer_token: String,
     pub claims: Vec<(String, String, Claim)>,
     pub verified_at_nanos: u64,
+    pub(crate) signed: Option<Arc<SignedToken>>,
 }
 
 impl TokenContext {
@@ -40,6 +47,7 @@ impl TokenContext {
             bearer_token: bearer_token.into(),
             claims: Vec::new(),
             verified_at_nanos,
+            signed: None,
         }
     }
 
@@ -68,7 +76,6 @@ where
 
 mod rjwt_token {
     use std::collections::{BTreeMap, HashMap};
-    use std::str::FromStr;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -76,37 +83,26 @@ mod rjwt_token {
     use parking_lot::RwLock;
     use pathlink::{Link, PathBuf};
     use rjwt::{Actor, AlgKind, Error as RjwtError, Resolve, SignedToken, Token, VerifyingKey};
-    use tc_value::Value;
 
     use crate::auth::{TokenContext, TokenVerifier};
     use crate::txn::TxnError;
     use tc_ir::Claim;
 
-    /// JWT claim payload accepted at the Python/Rust boundary.
-    ///
-    /// Python `rjwt` encodes a segment as a map of path to mode, while older Rust callers
-    /// issue one `Claim` tuple per segment. Both normalize to the shared IR claim here.
-    #[derive(Clone, serde::Deserialize, serde::Serialize)]
-    #[serde(untagged)]
-    pub enum WireClaims {
-        Claim(Claim),
-        Map(BTreeMap<PathBuf, u32>),
+    pub type WireClaims = BTreeMap<PathBuf, u32>;
+
+    pub fn claims_from_wire(claims: WireClaims) -> Vec<Claim> {
+        claims
+            .into_iter()
+            .map(|(path, mask)| Claim::new(Link::from(path), mask.into()))
+            .collect()
     }
 
-    impl WireClaims {
-        fn into_claims(self) -> Vec<Claim> {
-            match self {
-                Self::Claim(claim) => vec![claim],
-                Self::Map(claims) => claims
-                    .into_iter()
-                    .map(|(path, mask)| Claim::new(Link::from(path), mask.into()))
-                    .collect(),
-            }
-        }
+    pub fn wire_claim(claim: Claim) -> WireClaims {
+        BTreeMap::from([(claim.link.path().clone(), claim.mask.into())])
     }
 
-    pub type SignedTokenV1 = SignedToken<Link, String, Claim>;
-    pub type TokenV1 = Token<Link, String, Claim>;
+    pub type SignedTokenV1 = SignedToken<Link, String, WireClaims>;
+    pub type TokenV1 = Token<Link, String, WireClaims>;
     pub type ActorV1 = Actor<String>;
 
     #[derive(Clone, Default)]
@@ -163,69 +159,6 @@ mod rjwt_token {
         }
     }
 
-    #[cfg(feature = "http-client")]
-    #[derive(Clone)]
-    pub struct RpcActorResolver {
-        gateway: Arc<dyn crate::gateway::RpcGateway>,
-        txn: crate::txn::TxnHandle,
-    }
-
-    #[cfg(feature = "http-client")]
-    impl RpcActorResolver {
-        pub fn new(
-            gateway: Arc<dyn crate::gateway::RpcGateway>,
-            txn: crate::txn::TxnHandle,
-        ) -> Self {
-            Self { gateway, txn }
-        }
-    }
-
-    #[cfg(feature = "http-client")]
-    #[async_trait]
-    impl ActorResolver for RpcActorResolver {
-        async fn resolve_actor(&self, host: &Link, actor_id: &str) -> Result<ActorV1, TxnError> {
-            use base64::Engine as _;
-
-            let target = {
-                let host_segment =
-                    pathlink::PathSegment::from_str("host").map_err(|_| TxnError::Unauthorized)?;
-                let key_segment = pathlink::PathSegment::from_str("public_key")
-                    .map_err(|_| TxnError::Unauthorized)?;
-                host.clone().append(host_segment).append(key_segment)
-            };
-
-            let response = self
-                .gateway
-                .get(
-                    target,
-                    // Public-key discovery bootstraps bearer verification. Do not attach the
-                    // unverified bearer token to the lookup request; application dependency calls
-                    // still propagate verified transaction tokens through the kernel gateway.
-                    self.txn.without_bearer_token(),
-                    tc_ir::Scalar::Value(Value::String(actor_id.to_string())),
-                )
-                .await
-                .map_err(|_| TxnError::Unauthorized)?;
-
-            let encoded = match response {
-                tc_state::State::Scalar(tc_ir::Scalar::Value(Value::String(s))) => s,
-                _ => return Err(TxnError::Unauthorized),
-            };
-
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|_| TxnError::Unauthorized)?;
-
-            let verifying_key =
-                verifying_key_from_bytes(bytes.as_slice()).map_err(|_| TxnError::Unauthorized)?;
-
-            Ok(Actor::with_verifying_key(
-                actor_id.to_string(),
-                verifying_key,
-            ))
-        }
-    }
-
     #[derive(Clone)]
     pub struct RjwtTokenVerifier {
         resolver: Arc<dyn ActorResolver>,
@@ -278,13 +211,14 @@ mod rjwt_token {
 
                 let owner_id = format!("{owner_host}::{}", owner_actor_id.clone());
                 let mut ctx = TokenContext::new(owner_id, bearer_token);
+                ctx.signed = Some(Arc::new(signed.clone()));
 
-                for claim in owner_claims.clone().into_claims() {
+                for claim in claims_from_wire(owner_claims.clone()) {
                     ctx = ctx.with_claim(owner_host.to_string(), owner_actor_id.clone(), claim);
                 }
 
                 for (host, actor_id, claims) in claims {
-                    for claim in claims.clone().into_claims() {
+                    for claim in claims_from_wire(claims.clone()) {
                         ctx = ctx.with_claim(host.to_string(), actor_id.clone(), claim);
                     }
                 }
@@ -318,8 +252,6 @@ mod rjwt_token {
 
 pub use rjwt_token::{
     ActorResolver as RjwtActorResolver, ActorV1 as Actor, KeyringActorResolver, PublicKeyStore,
-    RjwtTokenVerifier, SignedTokenV1 as SignedToken, TokenV1 as Token, verifying_key_from_bytes,
+    RjwtTokenVerifier, SignedTokenV1 as SignedToken, TokenV1 as Token, claims_from_wire,
+    verifying_key_from_bytes, wire_claim,
 };
-
-#[cfg(feature = "http-client")]
-pub use rjwt_token::RpcActorResolver;

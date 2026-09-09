@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use pathlink::Link;
 
@@ -21,33 +21,48 @@ impl From<TxnError> for tc_error::TCError {
 }
 
 #[derive(Clone)]
-pub(crate) struct TxnConfig {
+pub struct ProtocolAuthority {
     pub(crate) host_id: Arc<String>,
-    pub(crate) ttl: Duration,
-    pub(crate) protocol_host: Link,
-    pub(crate) protocol_actor: Arc<Actor>,
-    pub(crate) workspace: Option<Workspace>,
-    pub(crate) resources: crate::HostResources,
+    pub(crate) host: Link,
+    pub(crate) actor: Arc<Actor>,
 }
 
-impl Default for TxnConfig {
-    fn default() -> Self {
-        Self::with_host_id("tc-host-default")
+impl ProtocolAuthority {
+    pub fn new(host_id: impl Into<String>, host: Link, actor: Actor) -> Self {
+        Self {
+            host_id: Arc::new(host_id.into()),
+            host,
+            actor: Arc::new(actor),
+        }
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct TxnConfig {
+    pub(crate) host_id: Arc<String>,
+    pub(crate) ttl: Duration,
+    pub(crate) grace: Duration,
+    pub(crate) protocol_host: Link,
+    pub(crate) protocol_actor: Arc<Actor>,
+    pub(crate) workspace: Workspace,
+    pub(crate) resources: crate::HostResources,
+}
+
 impl TxnConfig {
-    pub(crate) fn with_host_id(host_id: impl Into<String>) -> Self {
-        let host_id = host_id.into();
-        let protocol_actor =
-            Actor::new_falcon512(host_id.clone()).expect("generate Falcon-512 transaction actor");
+    pub(crate) fn new(
+        authority: ProtocolAuthority,
+        workspace: Workspace,
+        resources: crate::HostResources,
+        ttl: Duration,
+    ) -> Self {
         Self {
-            host_id: Arc::new(host_id),
-            ttl: Duration::from_secs(3),
-            protocol_host: Link::from_str(crate::uri::HOST_ROOT).expect("host root link"),
-            protocol_actor: Arc::new(protocol_actor),
-            workspace: None,
-            resources: crate::HostResources::default(),
+            host_id: authority.host_id,
+            ttl,
+            grace: Duration::from_nanos(super::wire::MAX_INBOUND_TXN_CLOCK_SKEW_NANOS),
+            protocol_host: authority.host,
+            protocol_actor: authority.actor,
+            workspace,
+            resources,
         }
     }
 }

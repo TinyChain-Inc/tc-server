@@ -1,14 +1,17 @@
-mod builder;
 #[allow(clippy::module_inception)]
 mod kernel;
-mod resolver;
+pub(crate) mod resolver;
+mod services;
 mod types;
 
-pub use builder::KernelBuilder;
 pub use kernel::Kernel;
+pub(crate) use kernel::invoke_handler;
+pub(crate) use services::HostRuntime;
+pub use services::HostServices;
 pub use tc_ir::Method;
-pub(crate) use types::BoundTransaction;
-pub use types::KernelRequest;
+#[cfg(test)]
+pub(crate) use types::KernelTarget;
+pub use types::{BodyContract, KernelRequestGuard};
 
 #[cfg(test)]
 mod tests;

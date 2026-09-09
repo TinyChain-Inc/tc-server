@@ -25,9 +25,10 @@ pub struct HostLimits {
 #[derive(Clone, Debug)]
 pub struct IngressLimits {
     pub request_body_bytes: usize,
-    pub artifact_body_bytes: usize,
+    pub application_body_bytes: usize,
     pub in_flight_requests: usize,
     pub active_connections: usize,
+    pub application_install_memory_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -62,9 +63,10 @@ impl Default for HostLimits {
             transaction_ttl: Duration::from_secs(3),
             ingress: IngressLimits {
                 request_body_bytes: MIB,
-                artifact_body_bytes: 64 * MIB,
+                application_body_bytes: 64 * MIB,
                 in_flight_requests: 8.max(4 * cpus),
                 active_connections: 1024,
+                application_install_memory_bytes: 256 * MIB,
             },
             execution: ExecutionLimits {
                 request_deadline: Duration::from_secs(3),
@@ -153,6 +155,7 @@ struct HostResourcesInner {
     connections: Arc<Capacity>,
     graph: Arc<Capacity>,
     outbound: Arc<Capacity>,
+    application_memory: Arc<Semaphore>,
     devices: Mutex<BTreeMap<String, Arc<Capacity>>>,
 }
 
@@ -165,6 +168,9 @@ impl HostResources {
         );
         let graph = Capacity::new("/host/resource/graph", limits.execution.parallel_graph_ops);
         let outbound = Capacity::new("/host/resource/rpc", limits.execution.outbound_requests);
+        let application_memory = Arc::new(Semaphore::new(
+            limits.ingress.application_install_memory_bytes,
+        ));
         Self {
             inner: Arc::new(HostResourcesInner {
                 limits,
@@ -172,6 +178,7 @@ impl HostResources {
                 connections,
                 graph,
                 outbound,
+                application_memory,
                 devices: Mutex::new(BTreeMap::new()),
             }),
         }
@@ -199,6 +206,27 @@ impl HostResources {
 
     pub async fn admit_outbound(&self, deadline: Deadline) -> TCResult<CapacityPermit> {
         self.inner.outbound.clone().acquire(deadline).await
+    }
+
+    pub async fn admit_application_bytes(
+        &self,
+        bytes: usize,
+        deadline: Deadline,
+    ) -> TCResult<OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes)
+            .map_err(|_| TCError::bad_request("application body exceeds admission range"))?;
+        deadline
+            .wait(Arc::clone(&self.inner.application_memory).acquire_many_owned(bytes))
+            .await?
+            .map_err(|_| {
+                TCError::resource_unavailable(
+                    "application install memory is unavailable",
+                    Pressure::new(
+                        "/host/resource/application-memory",
+                        PressureReason::Saturated,
+                    ),
+                )
+            })
     }
 
     pub async fn admit_device(
@@ -368,6 +396,28 @@ mod tests {
         assert_eq!(err.code(), tc_error::ErrorKind::Unavailable);
         assert_eq!(err.pressure().unwrap().resource(), "/host/resource/test");
         assert_eq!(capacity.snapshot().rejection_count, 1);
+    }
+
+    #[tokio::test]
+    async fn application_byte_admission_is_shared_and_released() {
+        let mut limits = HostLimits::default();
+        limits.ingress.application_install_memory_bytes = 4;
+        let resources = HostResources::new(limits);
+        let first = resources
+            .admit_application_bytes(4, Deadline::after(Duration::from_secs(1)))
+            .await
+            .expect("first body");
+        assert!(
+            resources
+                .admit_application_bytes(1, Deadline::after(Duration::from_millis(1)))
+                .await
+                .is_err()
+        );
+        drop(first);
+        let _released = resources
+            .admit_application_bytes(4, Deadline::after(Duration::from_secs(1)))
+            .await
+            .expect("released body");
     }
 
     #[test]

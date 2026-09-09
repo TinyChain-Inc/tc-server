@@ -1,111 +1,40 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
-use std::str::FromStr;
 
-use crate::State;
 use bytes::Bytes;
 use hyper::{Body, Request, StatusCode};
-use number_general::Number;
-use pathlink::Link;
 use tc_error::{TCError, TCResult};
-use tc_ir::{Id, TxnId};
-use tc_value::Value;
+use tc_ir::TxnId;
 use url::Url;
 
-use crate::library::{CompiledLibraryPackage, decode_compiled_library_package};
-
-use super::crypto::{
-    decode_encrypted_payload, decrypt_token_with_key, encode_encrypted_payload,
-    encrypt_path_with_key,
-};
+use super::CanonicalBody;
+use super::crypto::{encode_encrypted_payload, encrypt_path_with_key};
 use super::gateway::ClusterGateway;
-use super::{FORWARDED_HEADER, LIBRARY_EXPORT_PATH, PeerIdentity, PeerRoutes, TOKEN_PATH};
-
-#[derive(Clone, Debug, Default)]
-pub struct PeerClusterListing {
-    pub peers: Vec<String>,
-    pub identities: Vec<PeerIdentity>,
-}
+use super::{PeerClusterListing, PeerIdentity, PeerRoutes, normalize_peer};
 
 type HttpClient = hyper::Client<hyper::client::HttpConnector, Body>;
 
 #[derive(Clone)]
 pub struct HttpClusterGateway {
     client: HttpClient,
+    membership: super::PeerMembership,
 }
 
 impl HttpClusterGateway {
-    pub fn new() -> Self {
+    pub fn new(membership: super::PeerMembership) -> Self {
         Self {
             client: hyper::Client::new(),
+            membership,
         }
-    }
-
-    pub async fn fetch_library_schema(
-        &self,
-        peer: &str,
-        path: &str,
-    ) -> TCResult<tc_ir::LibrarySchema> {
-        fetch_library_schema(&self.client, peer, path).await
-    }
-
-    pub async fn leave_peer_cluster(
-        &self,
-        seed: &str,
-        peer: &str,
-        routes: &PeerRoutes,
-        keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-    ) -> TCResult<()> {
-        leave_peer_cluster(&self.client, seed, peer, routes, keys).await
-    }
-
-    pub async fn heartbeat_peer(
-        &self,
-        seed: &str,
-        peer: &PeerIdentity,
-        routes: &PeerRoutes,
-        keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-    ) -> TCResult<()> {
-        heartbeat_peer(&self.client, seed, peer, routes, keys).await
-    }
-
-    pub async fn list_peer_cluster(
-        &self,
-        seed: &str,
-        routes: &PeerRoutes,
-        keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-    ) -> TCResult<PeerClusterListing> {
-        list_peer_cluster(&self.client, seed, routes, keys).await
-    }
-}
-
-impl Default for HttpClusterGateway {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 #[async_trait::async_trait]
 impl ClusterGateway for HttpClusterGateway {
-    async fn discover_library_paths(&self, peer: &str) -> TCResult<Vec<String>> {
-        discover_library_paths(&self.client, peer).await
-    }
-
-    async fn request_replication_token(
-        &self,
-        peer: &str,
-        path: &str,
-        keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-    ) -> TCResult<String> {
-        request_replication_token(&self.client, peer, path, keys).await
-    }
-
-    async fn fetch_compiled_library_package(
-        &self,
-        peer: &str,
-        token: &str,
-    ) -> TCResult<Option<CompiledLibraryPackage>> {
-        fetch_compiled_library_package(&self.client, peer, token).await
+    fn replicas(&self, _resource: &pathlink::PathBuf) -> BTreeSet<String> {
+        self.membership
+            .snapshot_active_peers()
+            .into_iter()
+            .collect()
     }
 
     async fn register_with_peer(
@@ -118,24 +47,47 @@ impl ClusterGateway for HttpClusterGateway {
         register_with_peer(&self.client, seed, joiner, routes, keys).await
     }
 
-    async fn push_install_compiled_package(
+    async fn put_application(
         &self,
         peer: &str,
         token: &str,
         txn_id: TxnId,
-        payload: Vec<u8>,
+        application: CanonicalBody,
+        deadline: crate::Deadline,
     ) -> TCResult<()> {
-        push_install_compiled_package(&self.client, peer, token, txn_id, payload).await
+        put_application(&self.client, peer, token, txn_id, application, deadline).await
     }
 
-    async fn finalize_install_txn(
+    async fn delete_application(
         &self,
         peer: &str,
         token: &str,
         txn_id: TxnId,
-        commit: bool,
+        identity: &pathlink::Link,
+        deadline: crate::Deadline,
     ) -> TCResult<()> {
-        finalize_install_txn(&self.client, peer, token, txn_id, commit).await
+        delete_application(&self.client, peer, token, txn_id, identity, deadline).await
+    }
+
+    async fn decide_resource(
+        &self,
+        peer: &str,
+        token: &str,
+        txn_id: TxnId,
+        resource: &pathlink::PathBuf,
+        commit: bool,
+        deadline: crate::Deadline,
+    ) -> TCResult<()> {
+        decide_resource(
+            &self.client,
+            peer,
+            token,
+            txn_id,
+            resource,
+            commit,
+            deadline,
+        )
+        .await
     }
 }
 
@@ -147,168 +99,12 @@ async fn send_peer_request(
     crate::outbound_http::send(client, req, deadline).await
 }
 
-async fn fetch_compiled_library_package(
+async fn send_peer_request_at(
     client: &HttpClient,
-    peer: &str,
-    token: &str,
-) -> TCResult<Option<CompiledLibraryPackage>> {
-    let mut url = peer_to_url(peer)?;
-    url.set_path(LIBRARY_EXPORT_PATH);
-
-    let req = build_export_request(url, token)?;
-    let (status, body_bytes) = send_peer_request(client, req).await?;
-
-    if status == StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-
-    if !status.is_success() {
-        return Err(TCError::bad_gateway(format!(
-            "peer {peer} export failed with status {status}: {}",
-            String::from_utf8_lossy(&body_bytes)
-        )));
-    }
-
-    let payload = decode_compiled_library_package(&body_bytes)
-        .map_err(|err| TCError::bad_gateway(err.message().to_string()))?;
-    Ok(Some(payload))
-}
-
-async fn fetch_library_schema(
-    client: &HttpClient,
-    peer: &str,
-    path: &str,
-) -> TCResult<tc_ir::LibrarySchema> {
-    let mut url = peer_to_url(peer)?;
-    url.set_path(path);
-
-    let req = Request::builder()
-        .method("GET")
-        .uri(url.as_str())
-        .body(Body::empty())
-        .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
-
-    let (status, body_bytes) = send_peer_request(client, req).await?;
-
-    if !status.is_success() {
-        return Err(TCError::bad_gateway(format!(
-            "peer {peer} schema request failed with status {status}: {}",
-            String::from_utf8_lossy(&body_bytes)
-        )));
-    }
-
-    decode_schema_body(body_bytes).await
-}
-
-async fn fetch_library_listing(
-    client: &HttpClient,
-    peer: &str,
-    path: &str,
-) -> TCResult<tc_ir::Map<bool>> {
-    let mut url = peer_to_url(peer)?;
-    url.set_path(path);
-
-    let req = Request::builder()
-        .method("GET")
-        .uri(url.as_str())
-        .body(Body::empty())
-        .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
-
-    let (status, body_bytes) = send_peer_request(client, req).await?;
-
-    if !status.is_success() {
-        return Err(TCError::bad_gateway(format!(
-            "peer {peer} listing request failed with status {status}: {}",
-            String::from_utf8_lossy(&body_bytes)
-        )));
-    }
-
-    decode_listing_body(body_bytes).await
-}
-
-async fn discover_library_paths(client: &HttpClient, peer: &str) -> TCResult<Vec<String>> {
-    let mut pending = vec![crate::uri::LIB_ROOT.to_string()];
-    let mut libraries = Vec::new();
-
-    while let Some(path) = pending.pop() {
-        let listing = fetch_library_listing(client, peer, &path).await?;
-        for (name, is_dir) in listing {
-            let next = if path == crate::uri::LIB_ROOT {
-                format!("{}/{}", crate::uri::LIB_ROOT, name)
-            } else {
-                format!("{path}/{name}")
-            };
-
-            if is_dir {
-                pending.push(next);
-            } else {
-                libraries.push(next);
-            }
-        }
-    }
-
-    Ok(libraries)
-}
-
-async fn request_replication_token(
-    client: &HttpClient,
-    peer: &str,
-    path: &str,
-    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-) -> TCResult<String> {
-    let mut url = peer_to_url(peer)?;
-    url.set_path(TOKEN_PATH);
-    with_psk_key_retries(
-        keys,
-        "no replication key succeeded: no keys configured",
-        "no replication key succeeded",
-        |idx, key| {
-            let url = url.clone();
-            async move {
-                let (nonce, encrypted_path) =
-                    encrypt_path_with_key(path, &key).map_err(|err| err.to_string())?;
-                let body = encode_encrypted_payload(&nonce, &encrypted_path)
-                    .map_err(|err| err.to_string())?;
-                let req = Request::builder()
-                    .method(hyper::Method::POST)
-                    .uri(url.as_str())
-                    .body(Body::from(body))
-                    .map_err(|err| format!("key[{idx}] invalid request: {err}"))?;
-
-                let (status, body_bytes) = send_peer_request(client, req)
-                    .await
-                    .map_err(|err| format!("key[{idx}] request failed: {err}"))?;
-
-                if !status.is_success() {
-                    let message = String::from_utf8_lossy(&body_bytes);
-                    return Err(format!("key[{idx}] status {status}: {message}"));
-                }
-
-                let (nonce, encrypted_token) = decode_encrypted_payload(body_bytes)
-                    .map_err(|err| format!("key[{idx}] invalid encrypted payload: {err}"))?;
-
-                if let Ok(token) = decrypt_token_with_key(&key, &nonce, &encrypted_token) {
-                    return Ok(Some(token));
-                }
-
-                Err(format!("key[{idx}] could not decrypt token"))
-            }
-        },
-    )
-    .await
-}
-
-pub fn normalize_peer(peer: &str) -> TCResult<String> {
-    let url = peer_to_url(peer)?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| TCError::bad_request("peer URL missing host"))?;
-    let mut normalized = format!("{}://{}", url.scheme(), host);
-    if let Some(port) = url.port() {
-        normalized.push(':');
-        normalized.push_str(&port.to_string());
-    }
-    Ok(normalized)
+    req: Request<Body>,
+    deadline: crate::Deadline,
+) -> TCResult<(StatusCode, Bytes)> {
+    crate::outbound_http::send(client, req, deadline).await
 }
 
 async fn register_with_peer(
@@ -318,10 +114,10 @@ async fn register_with_peer(
     routes: &PeerRoutes,
     keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
 ) -> TCResult<PeerClusterListing> {
-    post_encrypted_peer_action_with_listing(
+    let body = post_encrypted_peer_action(
         client,
         seed,
-        routes.join_path(),
+        &routes.join,
         PeerAnnouncement {
             peer: joiner.peer.clone(),
             actor_id: Some(joiner.actor_id.clone()),
@@ -329,116 +125,87 @@ async fn register_with_peer(
         },
         keys,
     )
-    .await
+    .await?;
+    decode_peer_cluster_listing(&body)
 }
 
-async fn leave_peer_cluster(
-    client: &HttpClient,
-    seed: &str,
-    peer: &str,
-    routes: &PeerRoutes,
-    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-) -> TCResult<()> {
-    post_encrypted_peer_action(
-        client,
-        seed,
-        routes.leave_path(),
-        PeerAnnouncement {
-            peer: peer.to_string(),
-            actor_id: None,
-            public_key_b64: None,
-        },
-        keys,
-    )
-    .await
-}
-
-async fn heartbeat_peer(
-    client: &HttpClient,
-    seed: &str,
-    peer: &PeerIdentity,
-    routes: &PeerRoutes,
-    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-) -> TCResult<()> {
-    post_encrypted_peer_action(
-        client,
-        seed,
-        routes.heartbeat_path(),
-        PeerAnnouncement {
-            peer: peer.peer.clone(),
-            actor_id: Some(peer.actor_id.clone()),
-            public_key_b64: Some(peer.public_key_b64.clone()),
-        },
-        keys,
-    )
-    .await
-}
-
-#[allow(clippy::collapsible_if)]
-async fn list_peer_cluster(
-    client: &HttpClient,
-    seed: &str,
-    routes: &PeerRoutes,
-    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-) -> TCResult<PeerClusterListing> {
-    post_encrypted_peer_action_with_listing(
-        client,
-        seed,
-        routes.peers_path(),
-        PeerAnnouncement {
-            peer: normalize_peer(seed)?,
-            actor_id: None,
-            public_key_b64: None,
-        },
-        keys,
-    )
-    .await
-}
-
-pub(crate) async fn push_install_compiled_package(
+pub(crate) async fn put_application(
     client: &HttpClient,
     peer: &str,
     token: &str,
     txn_id: TxnId,
-    payload: Vec<u8>,
+    application: CanonicalBody,
+    deadline: crate::Deadline,
 ) -> TCResult<()> {
     let mut url = peer_to_url(peer)?;
-    url.set_path(crate::uri::LIB_ROOT);
+    let root = application
+        .identity
+        .path()
+        .first()
+        .ok_or_else(|| TCError::bad_request("application identity is empty"))?;
+    url.set_path(&format!("/{root}"));
     let url = crate::uri::append_kernel_txn_id(&mut url, txn_id)?;
-
     let req = Request::builder()
         .method("PUT")
         .uri(url)
         .header(hyper::header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .header(FORWARDED_HEADER, "1")
-        .body(Body::from(payload))
+        .header(hyper::header::CONTENT_TYPE, application.content_type)
+        .body(Body::from(Bytes::from_owner(application.body)))
         .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
-
-    let (status, body) = send_peer_request(client, req).await?;
-
+    let (status, body) = send_peer_request_at(client, req, deadline).await?;
     if status.is_success() {
         Ok(())
     } else {
         Err(TCError::bad_gateway(format!(
-            "peer {peer} install failed with status {status}: {}",
+            "peer {peer} application work failed with status {status}: {}",
             String::from_utf8_lossy(&body)
         )))
     }
 }
 
-pub(crate) async fn finalize_install_txn(
+pub(crate) async fn delete_application(
     client: &HttpClient,
     peer: &str,
     token: &str,
     txn_id: TxnId,
-    commit: bool,
+    identity: &pathlink::Link,
+    deadline: crate::Deadline,
 ) -> TCResult<()> {
     let mut url = peer_to_url(peer)?;
-    url.set_path(crate::uri::LIB_ROOT);
+    url.set_path(&identity.to_string());
+    let url = crate::uri::append_kernel_txn_id(&mut url, txn_id)?;
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(url)
+        .header(hyper::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Body::from("null"))
+        .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
+    let (status, body) = send_peer_request_at(client, req, deadline).await?;
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(TCError::bad_gateway(format!(
+            "peer {peer} application deletion failed with status {status}: {}",
+            String::from_utf8_lossy(&body)
+        )))
+    }
+}
+
+pub(crate) async fn decide_resource(
+    client: &HttpClient,
+    peer: &str,
+    token: &str,
+    txn_id: TxnId,
+    resource: &pathlink::PathBuf,
+    commit: bool,
+    deadline: crate::Deadline,
+) -> TCResult<()> {
+    let mut url = peer_to_url(peer)?;
+    url.set_path(&resource.to_string());
     let url = crate::uri::append_kernel_txn_id(&mut url, txn_id)?;
 
-    let method = if commit { "POST" } else { "DELETE" };
+    let method = if commit { "PUT" } else { "DELETE" };
     let req = Request::builder()
         .method(method)
         .uri(url)
@@ -446,12 +213,12 @@ pub(crate) async fn finalize_install_txn(
         .body(Body::empty())
         .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))?;
 
-    let (status, body) = send_peer_request(client, req).await?;
+    let (status, body) = send_peer_request_at(client, req, deadline).await?;
     if status.is_success() {
         Ok(())
     } else {
         Err(TCError::bad_gateway(format!(
-            "peer {peer} finalize failed with status {status}: {}",
+            "peer {peer} transaction decision failed with status {status}: {}",
             String::from_utf8_lossy(&body)
         )))
     }
@@ -473,7 +240,7 @@ async fn post_encrypted_peer_action(
     path: &str,
     announcement: PeerAnnouncement,
     keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-) -> TCResult<()> {
+) -> TCResult<Bytes> {
     let peer = normalize_peer(&announcement.peer)?;
     let payload = serde_json::to_string(&PeerAnnouncement {
         peer,
@@ -484,120 +251,39 @@ async fn post_encrypted_peer_action(
     let mut url = peer_to_url(seed)?;
     url.set_path(path);
 
-    let failure_prefix = format!("peer action {path} failed");
-    with_psk_key_retries(
-        keys,
-        "peer action failed for all PSK keys",
-        &failure_prefix,
-        |idx, key| {
-            let payload = payload.clone();
-            let url = url.clone();
-            async move {
-                let (nonce, encrypted_peer) =
-                    encrypt_path_with_key(&payload, &key).map_err(|err| err.to_string())?;
-                let body = encode_encrypted_payload(&nonce, &encrypted_peer)
-                    .map_err(|err| err.to_string())?;
-                let req = Request::builder()
-                    .method(hyper::Method::POST)
-                    .uri(url.as_str())
-                    .body(Body::from(body))
-                    .map_err(|err| format!("key[{idx}] invalid request: {err}"))?;
-
-                let (status, body) = send_peer_request(client, req)
-                    .await
-                    .map_err(|err| format!("key[{idx}] request failed: {err}"))?;
-                if status.is_success() {
-                    return Ok(Some(()));
-                }
-
-                let message = String::from_utf8_lossy(&body);
-                Err(format!("key[{idx}] status {status}: {message}"))
-            }
-        },
-    )
-    .await
-}
-
-async fn post_encrypted_peer_action_with_listing(
-    client: &HttpClient,
-    seed: &str,
-    path: &str,
-    announcement: PeerAnnouncement,
-    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-) -> TCResult<PeerClusterListing> {
-    let peer = normalize_peer(&announcement.peer)?;
-    let payload = serde_json::to_string(&PeerAnnouncement {
-        peer,
-        actor_id: announcement.actor_id,
-        public_key_b64: announcement.public_key_b64,
-    })
-    .map_err(|err| TCError::bad_request(format!("invalid peer announcement: {err}")))?;
-    let mut url = peer_to_url(seed)?;
-    url.set_path(path);
-
-    let failure_prefix = format!("peer action {path} failed");
-    with_psk_key_retries(
-        keys,
-        "peer list action failed for all PSK keys",
-        &failure_prefix,
-        |idx, key| {
-            let payload = payload.clone();
-            let url = url.clone();
-            async move {
-                let (nonce, encrypted_peer) =
-                    encrypt_path_with_key(&payload, &key).map_err(|err| err.to_string())?;
-                let body = encode_encrypted_payload(&nonce, &encrypted_peer)
-                    .map_err(|err| err.to_string())?;
-                let req = Request::builder()
-                    .method(hyper::Method::POST)
-                    .uri(url.as_str())
-                    .body(Body::from(body))
-                    .map_err(|err| format!("key[{idx}] invalid request: {err}"))?;
-
-                let (status, body) = send_peer_request(client, req)
-                    .await
-                    .map_err(|err| format!("key[{idx}] request failed: {err}"))?;
-
-                if !status.is_success() {
-                    let message = String::from_utf8_lossy(&body);
-                    return Err(format!("key[{idx}] status {status}: {message}"));
-                }
-
-                let listing = decode_peer_cluster_listing(&body)
-                    .map_err(|err| format!("key[{idx}] invalid list response: {err}"))?;
-
-                Ok(Some(listing))
-            }
-        },
-    )
-    .await
-}
-
-async fn with_psk_key_retries<T, F, Fut>(
-    keys: &[aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>],
-    no_keys_message: &str,
-    failure_prefix: &str,
-    mut attempt: F,
-) -> TCResult<T>
-where
-    F: FnMut(usize, aes_gcm_siv::Key<aes_gcm_siv::Aes256GcmSiv>) -> Fut,
-    Fut: Future<Output = Result<Option<T>, String>>,
-{
     let mut last_error = String::new();
-
     for (idx, key) in keys.iter().enumerate() {
-        match attempt(idx, *key).await {
-            Ok(Some(value)) => return Ok(value),
-            Ok(None) => {}
-            Err(err) => last_error = err,
+        let attempt = async {
+            let (nonce, encrypted) = encrypt_path_with_key(&payload, key)?;
+            let body = encode_encrypted_payload(&nonce, &encrypted)?;
+            let request = Request::builder()
+                .method(hyper::Method::POST)
+                .uri(url.as_str())
+                .body(Body::from(body))
+                .map_err(|error| TCError::bad_request(format!("invalid request: {error}")))?;
+            let (status, body) = send_peer_request(client, request).await?;
+            if status.is_success() {
+                Ok(body)
+            } else {
+                Err(TCError::bad_gateway(format!(
+                    "status {status}: {}",
+                    String::from_utf8_lossy(&body)
+                )))
+            }
+        }
+        .await;
+        match attempt {
+            Ok(body) => return Ok(body),
+            Err(error) => last_error = format!("key[{idx}] {error}"),
         }
     }
-
     if last_error.is_empty() {
-        Err(TCError::bad_gateway(no_keys_message))
+        Err(TCError::bad_gateway(
+            "peer action has no configured PSK key",
+        ))
     } else {
         Err(TCError::bad_gateway(format!(
-            "{failure_prefix}: {last_error}"
+            "peer action {path} failed: {last_error}"
         )))
     }
 }
@@ -660,166 +346,4 @@ fn decode_peer_cluster_listing(body_bytes: &[u8]) -> TCResult<PeerClusterListing
         peers: peers.into_iter().collect(),
         identities: identities.into_values().collect(),
     })
-}
-
-fn build_export_request(url: Url, token: &str) -> TCResult<Request<Body>> {
-    let builder = Request::builder()
-        .method("GET")
-        .uri(url.as_str())
-        .header(hyper::header::AUTHORIZATION, format!("Bearer {token}"));
-
-    builder
-        .body(Body::empty())
-        .map_err(|err| TCError::bad_request(format!("invalid request: {err}")))
-}
-
-async fn decode_schema_body(body: hyper::body::Bytes) -> TCResult<tc_ir::LibrarySchema> {
-    let state = decode_state_body(body).await?;
-    schema_from_state(state)
-}
-
-async fn decode_listing_body(body: hyper::body::Bytes) -> TCResult<tc_ir::Map<bool>> {
-    let state = decode_state_body(body).await?;
-    listing_from_state(state)
-}
-
-async fn decode_state_body(body: hyper::body::Bytes) -> TCResult<State> {
-    use futures::stream;
-
-    if body.is_empty() || body.iter().all(|b| b.is_ascii_whitespace()) {
-        return Err(TCError::bad_request("empty response body"));
-    }
-
-    let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(body.clone())]);
-    let scalar = destream_json::try_decode((), stream)
-        .await
-        .map_err(|err| TCError::bad_request(err.to_string()))?;
-    Ok(State::from_scalar(scalar))
-}
-
-fn schema_from_state(state: State) -> TCResult<tc_ir::LibrarySchema> {
-    let State::Map(map) = state else {
-        return Err(TCError::bad_request("expected schema state map"));
-    };
-
-    let id_key: Id = "id".parse().expect("Id");
-    let version_key: Id = "version".parse().expect("Id");
-    let deps_key: Id = "dependencies".parse().expect("Id");
-
-    let id = match map.get(&id_key) {
-        Some(State::Scalar(tc_ir::Scalar::Value(Value::String(value)))) => value.clone(),
-        _ => return Err(TCError::bad_request("missing schema id")),
-    };
-    let version = match map.get(&version_key) {
-        Some(State::Scalar(tc_ir::Scalar::Value(Value::String(value)))) => value.clone(),
-        _ => return Err(TCError::bad_request("missing schema version")),
-    };
-    let dependencies = match map.get(&deps_key) {
-        Some(State::Map(deps)) => deps,
-        _ => return Err(TCError::bad_request("missing schema dependencies")),
-    };
-
-    let mut items = dependencies
-        .iter()
-        .filter_map(|(key, value)| {
-            let idx = key.as_str().parse::<usize>().ok()?;
-            let State::Scalar(tc_ir::Scalar::Value(Value::String(link))) = value else {
-                return None;
-            };
-            Some((idx, link.clone()))
-        })
-        .collect::<Vec<_>>();
-    items.sort_by_key(|(idx, _)| *idx);
-
-    let deps = items
-        .into_iter()
-        .map(|(_, link)| Link::from_str(&link).map_err(|err| TCError::bad_request(err.to_string())))
-        .collect::<TCResult<Vec<_>>>()?;
-
-    let schema_id = Link::from_str(&id).map_err(|err| TCError::bad_request(err.to_string()))?;
-    Ok(tc_ir::LibrarySchema::new(schema_id, version, deps))
-}
-
-fn listing_from_state(state: State) -> TCResult<tc_ir::Map<bool>> {
-    let map = unwrap_map_state(state)?;
-
-    let mut listing = tc_ir::Map::new();
-    for (name, value) in map {
-        if name.as_str() == "default" {
-            continue;
-        }
-
-        let Some(is_dir) = parse_listing_bool(value) else {
-            continue;
-        };
-
-        listing.insert(name, is_dir);
-    }
-
-    Ok(listing)
-}
-
-fn unwrap_map_state(state: State) -> TCResult<tc_ir::Map<State>> {
-    let State::Map(map) = state else {
-        return Err(TCError::bad_request("expected listing state map"));
-    };
-    Ok(map)
-}
-
-fn parse_listing_bool(value: State) -> Option<bool> {
-    match value {
-        State::Scalar(tc_ir::Scalar::Value(Value::Number(Number::Bool(value)))) => {
-            Some(bool::from(value))
-        }
-        State::Scalar(tc_ir::Scalar::Value(Value::String(value))) => {
-            Some(value.eq_ignore_ascii_case("true"))
-        }
-        State::Map(map) if map.len() == 1 => {
-            let (_, wrapped) = map.into_iter().next().expect("single-item map");
-            parse_listing_bool(wrapped)
-        }
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_listing_bool;
-    use crate::State;
-    use futures::stream;
-    use number_general::Number;
-
-    async fn decode_state(json: &str) -> State {
-        let bytes = hyper::body::Bytes::from(json.as_bytes().to_vec());
-        let stream = stream::iter(vec![Ok::<hyper::body::Bytes, std::io::Error>(bytes)]);
-        let scalar = destream_json::try_decode((), stream).await.expect("decode");
-        State::from_scalar(scalar)
-    }
-
-    #[tokio::test]
-    async fn parse_listing_bool_accepts_state_bool_values() {
-        let value = decode_state(r#"{"/state/scalar/value/number":true}"#).await;
-        assert_eq!(parse_listing_bool(value), Some(true));
-        assert_eq!(
-            parse_listing_bool(State::from(Number::from(true))),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn http_client_is_owned_by_the_gateway() {
-        let client = include_str!("client.rs");
-        let constructor = ["hyper::Client", "::new()"].concat();
-        assert_eq!(
-            client.matches(&constructor).count(),
-            1,
-            "the gateway constructor is the sole replication HTTP client owner"
-        );
-
-        let orchestration = include_str!("mod.rs");
-        let duplicate_api = ["_with", "_gateway"].concat();
-        let default_literal = ["&Http", "ClusterGateway"].concat();
-        assert!(!orchestration.contains(&duplicate_api));
-        assert!(!orchestration.contains(&default_literal));
-    }
 }

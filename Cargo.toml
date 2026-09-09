@@ -8,6 +8,7 @@ name = "tinychain"
 
 [dependencies]
 bytes = "1"
+async-hash = { path = "../deps/async-hash", version = "0.6" }
 futures = "0.3"
 pathlink = { path = "../deps/pathlink", features = ["serialize"] }
 tc-ir = { path = "../tc-ir" }
@@ -15,6 +16,7 @@ tc-error = { path = "../tc-error" }
 tc-value = { path = "../tc-value", features = ["serialize"] }
 tc-state = { path = "../tc-state" }
 tc-collection = { path = "../tc-collection" }
+txn_lock = { path = "../deps/txn_lock" }
 umask = "2.1"
 parking_lot = "0.12"
 url = "2"
@@ -26,9 +28,9 @@ serde_json = { version = "1", features = ["raw_value"] }
 base64 = "0.22"
 getrandom = "0.2"
 sha2 = "0.10"
+semver = "1"
 rjwt = { package = "rjwt", path = "../deps/rjwt/rjwt-core" }
 freqfs = { path = "../deps/freqfs", version = "0.13" }
-txfs = { path = "../deps/txfs", version = "0.5.2" }
 mdns-sd = { version = "0.11", optional = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 aes-gcm-siv = "0.11"
@@ -42,16 +44,9 @@ log = "0.4"
 version = "0.15"
 path = "../deps/destream_json"
 default-features = false
-optional = true
-
-[dependencies.pyo3]
-version = "0.29"
-features = ["macros"]
-optional = true
 
 [dependencies.http]
 version = "0.2"
-optional = true
 
 [dependencies.hyper]
 version = "0.14"
@@ -67,16 +62,13 @@ features = ["make"]
 optional = true
 
 [features]
-default = ["http-server", "wasm"]
+default = ["http-client", "http-server", "wasm"]
 # Outbound HTTP client support (for proxying requests to remote hosts).
-http-client = ["dep:http"]
+http-client = []
 # Inbound HTTP server support (Hyper server + tower make_service wiring).
-http-server = ["http-client", "dep:tower", "dep:destream_json"]
-pyo3 = ["http-server", "dep:pyo3", "dep:destream_json"]
-pyo3-extension = ["pyo3", "pyo3/extension-module"]
+http-server = ["dep:tower"]
 wasm = ["dep:wasmtime"]
 mdns = ["dep:mdns-sd"]
-k8s = []
 
 [dev-dependencies]
 serde_json = "1"
@@ -93,3 +85,4 @@ name = "rjwt_install_token"
 [[bin]]
 name = "tc-server"
 path = "src/main.rs"
+required-features = ["http-client", "http-server"]

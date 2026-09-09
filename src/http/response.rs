@@ -17,25 +17,11 @@ pub(crate) fn not_found() -> Response {
         .expect("not found response")
 }
 
-pub(crate) fn handle_finalize_result(result: tc_error::TCResult<()>) -> Response {
-    match result {
-        Ok(()) => no_content(),
-        Err(err) => tc_error_response(err),
-    }
-}
-
 pub(crate) fn bad_request_response(msg: &str) -> Response {
     hyper::Response::builder()
         .status(StatusCode::BAD_REQUEST)
         .body(Body::from(msg.to_string()))
         .expect("bad request response")
-}
-
-pub(crate) fn internal_error_response(msg: &str) -> Response {
-    hyper::Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(Body::from(msg.to_string()))
-        .expect("internal error response")
 }
 
 pub(crate) fn payload_too_large_response(msg: &str) -> Response {
@@ -59,6 +45,7 @@ pub(crate) fn tc_error_response(err: TCError) -> Response {
         ErrorKind::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
         ErrorKind::NotFound => StatusCode::NOT_FOUND,
         ErrorKind::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        ErrorKind::ReplicaDivergence => StatusCode::SERVICE_UNAVAILABLE,
         ErrorKind::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         ErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
         ErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -95,4 +82,26 @@ pub(crate) fn tc_error_response(err: TCError) -> Response {
     response
         .body(Body::from(body.to_string()))
         .expect("tc error response")
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn a_correct_resource_decision_is_an_empty_no_content_response() {
+        let response = super::no_content();
+        assert_eq!(response.status(), hyper::StatusCode::NO_CONTENT);
+        assert!(
+            hyper::body::to_bytes(response.into_body())
+                .await
+                .expect("response body")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decision_conflict_is_an_error_response() {
+        let response =
+            super::tc_error_response(tc_error::TCError::conflict("opposite transaction outcome"));
+        assert_eq!(response.status(), hyper::StatusCode::CONFLICT);
+    }
 }

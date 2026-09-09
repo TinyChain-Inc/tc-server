@@ -1,69 +1,16 @@
-use bytes::Bytes;
 use hyper::body::HttpBody;
-use hyper::header;
-use hyper::header::AUTHORIZATION;
+use hyper::header::{self, AUTHORIZATION};
 use tc_error::{TCError, TCResult};
 
-use super::response::{internal_error_response, payload_too_large_response};
-use super::{Request, Response};
-
-pub(crate) fn parse_txn_id(req: &Request) -> Result<Option<tc_ir::TxnId>, TxnParseError> {
-    crate::txn::wire::parse_txn_id_query(req.uri().query()).map_err(|_| TxnParseError::Invalid)
-}
-
-pub(crate) enum TxnParseError {
-    Invalid,
-}
+use super::Request;
 
 pub(crate) fn parse_bearer_token(req: &Request) -> Option<String> {
-    let header = req.headers().get(AUTHORIZATION)?;
-    let value = header.to_str().ok()?;
-    let (scheme, token) = value.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return None;
-    }
-
-    let token = token.trim();
-    if token.is_empty() {
-        return None;
-    }
-
-    Some(token.to_string())
-}
-
-#[allow(clippy::collapsible_if)]
-pub(crate) async fn parse_body(
-    req: Request,
-    max_request_bytes: usize,
-) -> Result<(Request, bool), Response> {
-    let (parts, mut body) = req.into_parts();
-    if let Some(len) = parts.headers.get(header::CONTENT_LENGTH) {
-        let len = len
-            .to_str()
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .ok_or_else(|| payload_too_large_response("invalid content-length header"))?;
-        if len > max_request_bytes {
-            return Err(payload_too_large_response("request payload too large"));
-        }
-    }
-
-    let mut body_bytes = Vec::new();
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk.map_err(|_| internal_error_response("failed to read request body"))?;
-        let next_len = body_bytes.len().saturating_add(chunk.len());
-        if next_len > max_request_bytes {
-            return Err(payload_too_large_response("request payload too large"));
-        }
-        body_bytes.extend_from_slice(&chunk);
-    }
-
-    let body_is_none = body_bytes.iter().all(|b| b.is_ascii_whitespace());
-    let body_bytes = Bytes::from(body_bytes);
-    Ok((
-        Request::from_parts(parts, hyper::Body::from(body_bytes)),
-        body_is_none,
-    ))
+    req.headers()
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()
+        .and_then(crate::auth::bearer_token)
+        .map(str::to_owned)
 }
 
 pub(crate) async fn decode_native_body(

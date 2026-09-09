@@ -1,16 +1,11 @@
-use std::str::FromStr;
-
 use aes_gcm_siv::{Aes256GcmSiv, Key, KeyInit};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use tc_error::TCError;
-use tc_ir::Claim;
-use umask::USER_READ;
 
-use crate::auth::{Actor, KeyringActorResolver, PublicKeyStore, SignedToken, Token};
+use crate::auth::{Actor, KeyringActorResolver, PublicKeyStore};
 
 use super::PeerIdentity;
-use super::REPLICATION_TTL;
 use super::crypto::decrypt_path;
 
 pub fn parse_psk_list(value: &str) -> Vec<String> {
@@ -70,18 +65,6 @@ impl ReplicationIssuer {
         }
     }
 
-    pub fn keyring(&self) -> KeyringActorResolver {
-        self.keyring.clone()
-    }
-
-    pub fn public_keys(&self) -> PublicKeyStore {
-        self.public_keys.clone()
-    }
-
-    pub fn keys(&self) -> &[Key<Aes256GcmSiv>] {
-        &self.keys
-    }
-
     pub fn self_identity(&self, peer: String) -> tc_error::TCResult<PeerIdentity> {
         let actor_id = self.signer.id().clone();
 
@@ -109,26 +92,6 @@ impl ReplicationIssuer {
         self.public_keys.insert_actor(&actor);
         let _ = self.keyring.clone().with_actor(self.host.clone(), actor);
         Ok(())
-    }
-
-    pub fn issue_token(&self, path: &str) -> tc_error::TCResult<SignedToken> {
-        let claim = Claim::new(
-            pathlink::Link::from_str(path)
-                .map_err(|err| TCError::bad_request(format!("invalid claim path: {err}")))?,
-            USER_READ,
-        );
-
-        let token = Token::new(
-            self.host.clone(),
-            std::time::SystemTime::now(),
-            REPLICATION_TTL,
-            self.signer.id().clone(),
-            claim,
-        );
-
-        self.signer
-            .sign_token(token)
-            .map_err(|err| TCError::internal(err.to_string()))
     }
 
     pub fn decrypt_path_with_key(

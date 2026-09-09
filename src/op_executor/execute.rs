@@ -1,5 +1,4 @@
 use crate::State;
-use pathlink::Link;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Map, OpDef, Scalar};
 
@@ -13,8 +12,9 @@ pub async fn execute_get_with_self(
     txn: &crate::txn::TxnHandle,
     op: OpDef,
     key: Scalar,
-    self_link: Option<Link>,
+    self_state: Option<State>,
 ) -> TCResult<State> {
+    op.validate()?;
     let OpDef::Get((key_name, form)) = op else {
         return Err(TCError::bad_request(
             "expected GET op definition".to_string(),
@@ -27,7 +27,7 @@ pub async fn execute_get_with_self(
         .unwrap_or_else(|| "_result".parse().expect("Id"));
 
     let data = [(key_name, State::from_scalar(key))];
-    Executor::new_with_self(txn, data, form, self_link)?
+    Executor::new_with_self(txn, data, form, self_state)?
         .capture(capture)
         .await
 }
@@ -46,8 +46,9 @@ pub async fn execute_put_with_self(
     op: OpDef,
     key: Scalar,
     value: State,
-    self_link: Option<Link>,
+    self_state: Option<State>,
 ) -> TCResult<()> {
+    op.validate()?;
     let OpDef::Put((key_name, value_name, form)) = op else {
         return Err(TCError::bad_request(
             "expected PUT op definition".to_string(),
@@ -60,7 +61,7 @@ pub async fn execute_put_with_self(
     };
 
     let data = [(key_name, State::from_scalar(key)), (value_name, value)];
-    Executor::new_with_self(txn, data, form, self_link)?
+    Executor::new_with_self(txn, data, form, self_state)?
         .capture(capture)
         .await?;
     Ok(())
@@ -78,8 +79,9 @@ pub async fn execute_post_with_self(
     txn: &crate::txn::TxnHandle,
     op: OpDef,
     params: Map<State>,
-    self_link: Option<Link>,
+    self_state: Option<State>,
 ) -> TCResult<State> {
+    op.validate()?;
     let OpDef::Post(form) = op else {
         return Err(TCError::bad_request(
             "expected POST op definition".to_string(),
@@ -95,7 +97,7 @@ pub async fn execute_post_with_self(
     for (key, value) in params {
         data.push((key, value));
     }
-    Executor::new_with_self(txn, data, form, self_link)?
+    Executor::new_with_self(txn, data, form, self_state)?
         .capture(capture)
         .await
 }
@@ -108,8 +110,9 @@ pub async fn execute_delete_with_self(
     txn: &crate::txn::TxnHandle,
     op: OpDef,
     key: Scalar,
-    self_link: Option<Link>,
+    self_state: Option<State>,
 ) -> TCResult<()> {
+    op.validate()?;
     let OpDef::Delete((key_name, form)) = op else {
         return Err(TCError::bad_request(
             "expected DELETE op definition".to_string(),
@@ -122,7 +125,7 @@ pub async fn execute_delete_with_self(
     };
 
     let data = [(key_name, State::from_scalar(key))];
-    Executor::new_with_self(txn, data, form, self_link)?
+    Executor::new_with_self(txn, data, form, self_state)?
         .capture(capture)
         .await?;
     Ok(())

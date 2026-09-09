@@ -37,7 +37,7 @@ pub fn peer_membership_handler(
                 Some(Route::List) => {
                     match decode_and_touch_peer(req, &membership, &issuer).await {
                         Ok(()) => {}
-                        Err(response) => return response,
+                        Err(response) => return *response,
                     }
 
                     let body = peer_list_body(&membership);
@@ -46,7 +46,7 @@ pub fn peer_membership_handler(
                 Some(Route::Join) => {
                     match decode_and_upsert_identity(req, &membership, &issuer).await {
                         Ok(()) => {}
-                        Err(response) => return response,
+                        Err(response) => return *response,
                     }
 
                     let body = peer_list_body(&membership);
@@ -55,7 +55,7 @@ pub fn peer_membership_handler(
                 Some(Route::Heartbeat) => {
                     match decode_and_upsert_identity(req, &membership, &issuer).await {
                         Ok(()) => {}
-                        Err(response) => return response,
+                        Err(response) => return *response,
                     }
 
                     empty_response(StatusCode::NO_CONTENT)
@@ -63,7 +63,7 @@ pub fn peer_membership_handler(
                 Some(Route::Leave) => {
                     let announcement = match decode_peer_announcement(req, &issuer).await {
                         Ok(announcement) => announcement,
-                        Err(response) => return response,
+                        Err(response) => return *response,
                     };
                     let peer = match normalize_peer(&announcement.peer) {
                         Ok(peer) => peer,
@@ -127,19 +127,19 @@ fn route(method: &str, path: &str, routes: &PeerRoutes) -> Option<Route> {
 }
 
 fn is_list_path(path: &str, routes: &PeerRoutes) -> bool {
-    path == routes.peers_path()
+    path == routes.peers
 }
 
 fn is_join_path(path: &str, routes: &PeerRoutes) -> bool {
-    path == routes.join_path()
+    path == routes.join
 }
 
 fn is_heartbeat_path(path: &str, routes: &PeerRoutes) -> bool {
-    path == routes.heartbeat_path()
+    path == routes.heartbeat
 }
 
 fn is_leave_path(path: &str, routes: &PeerRoutes) -> bool {
-    path == routes.leave_path()
+    path == routes.leave
 }
 
 fn peer_list_body(membership: &PeerMembership) -> Vec<u8> {
@@ -156,21 +156,22 @@ fn parse_announcement(raw: &str) -> Result<PeerAnnouncement, String> {
 async fn decode_peer_announcement(
     req: Request<Body>,
     issuer: &ReplicationIssuer,
-) -> Result<PeerAnnouncement, Response> {
+) -> Result<PeerAnnouncement, Box<Response>> {
     let (payload, _) = decode_encrypted_request(req, issuer).await?;
 
-    parse_announcement(&payload).map_err(bad_request)
+    parse_announcement(&payload).map_err(|error| Box::new(bad_request(error)))
 }
 
 async fn decode_identity_announcement(
     req: Request<Body>,
     issuer: &ReplicationIssuer,
-) -> Result<PeerIdentity, Response> {
+) -> Result<PeerIdentity, Box<Response>> {
     let announcement = decode_peer_announcement(req, issuer).await?;
-    let identity = normalize_identity(announcement).map_err(|err| bad_request(err.to_string()))?;
+    let identity =
+        normalize_identity(announcement).map_err(|err| Box::new(bad_request(err.to_string())))?;
     issuer
         .register_peer_identity(&identity)
-        .map_err(|err| bad_request(err.to_string()))?;
+        .map_err(|err| Box::new(bad_request(err.to_string())))?;
 
     Ok(identity)
 }
@@ -179,7 +180,7 @@ async fn decode_and_upsert_identity(
     req: Request<Body>,
     membership: &PeerMembership,
     issuer: &ReplicationIssuer,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let identity = decode_identity_announcement(req, issuer).await?;
     membership.upsert_identity(identity);
     Ok(())
@@ -189,11 +190,11 @@ async fn decode_and_touch_peer(
     req: Request<Body>,
     membership: &PeerMembership,
     issuer: &ReplicationIssuer,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let announcement = decode_peer_announcement(req, issuer).await?;
     let peer = match normalize_peer(&announcement.peer) {
         Ok(peer) => peer,
-        Err(err) => return Err(bad_request(err.to_string())),
+        Err(err) => return Err(Box::new(bad_request(err.to_string()))),
     };
 
     if announcement
@@ -205,11 +206,11 @@ async fn decode_and_touch_peer(
             .as_ref()
             .is_some_and(|key| !key.trim().is_empty())
     {
-        let identity =
-            normalize_identity(announcement).map_err(|err| bad_request(err.to_string()))?;
+        let identity = normalize_identity(announcement)
+            .map_err(|err| Box::new(bad_request(err.to_string())))?;
         issuer
             .register_peer_identity(&identity)
-            .map_err(|err| bad_request(err.to_string()))?;
+            .map_err(|err| Box::new(bad_request(err.to_string())))?;
         membership.upsert_identity(identity);
     } else {
         membership.upsert_active(peer);

@@ -1,48 +1,28 @@
 use crate::State;
 use bytes::Bytes;
 use futures::{FutureExt, future::BoxFuture};
-use pathlink::Link;
 use tc_error::{TCError, TCResult};
 use tc_ir::{IntoView, Map, Scalar, TxnId};
 use url::form_urlencoded;
 
-use crate::{Method, gateway::RpcGateway};
+use crate::{
+    Method,
+    gateway::{RpcGateway, RpcTarget},
+};
 
-#[derive(Clone)]
-pub struct HttpRpcGateway {
-    client: hyper::Client<hyper::client::HttpConnector, hyper::Body>,
-}
-
-impl HttpRpcGateway {
-    pub fn new() -> Self {
-        Self {
-            client: hyper::Client::new(),
-        }
-    }
-}
-
-impl Default for HttpRpcGateway {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub type HttpRpcGateway = hyper::Client<hyper::client::HttpConnector, hyper::Body>;
 
 impl RpcGateway for HttpRpcGateway {
     fn get(
         &self,
-        target: Link,
+        target: RpcTarget,
         txn: crate::txn::TxnHandle,
         key: Scalar,
     ) -> BoxFuture<'static, TCResult<State>> {
-        let client = self.client.clone();
+        let client = self.clone();
         async move {
-            let uri = append_kernel_txn_query(&target.to_string(), txn.id(), Some(&key)).await?;
-            let body = encode_state_body(State::from_scalar(key.clone()), txn.clone()).await?;
-            let request = build_request(Method::Get, uri, txn.authorization_header(), body)?;
-            let (status, body_bytes) =
-                crate::outbound_http::send(&client, request, txn.deadline()).await?;
-            let body_bytes = crate::outbound_http::ensure_success(status, body_bytes)?;
-
+            let body = encode_state_body(State::from_scalar(key), txn.clone()).await?;
+            let body_bytes = send_request(&client, Method::Get, target, &txn, body).await?;
             decode_state_body(body_bytes, &txn).await
         }
         .boxed()
@@ -50,44 +30,35 @@ impl RpcGateway for HttpRpcGateway {
 
     fn put(
         &self,
-        target: Link,
+        target: RpcTarget,
         txn: crate::txn::TxnHandle,
         key: Scalar,
         value: State,
     ) -> BoxFuture<'static, TCResult<()>> {
-        let client = self.client.clone();
+        let client = self.clone();
         async move {
-            let uri = append_kernel_txn_query(&target.to_string(), txn.id(), Some(&key)).await?;
-            let body = encode_state_body(value, txn.clone()).await?;
-            let request = build_request(Method::Put, uri, txn.authorization_header(), body)?;
-            let (status, body_bytes) =
-                crate::outbound_http::send(&client, request, txn.deadline()).await?;
-            let _ = crate::outbound_http::ensure_success(status, body_bytes)?;
-
-            Ok(())
+            let body = encode_state_body(
+                State::Tuple(vec![State::from_scalar(key), value]),
+                txn.clone(),
+            )
+            .await?;
+            send_request(&client, Method::Put, target, &txn, body)
+                .await
+                .map(drop)
         }
         .boxed()
     }
 
     fn post(
         &self,
-        target: Link,
+        target: RpcTarget,
         txn: crate::txn::TxnHandle,
         params: Map<State>,
     ) -> BoxFuture<'static, TCResult<State>> {
-        let client = self.client.clone();
+        let client = self.clone();
         async move {
-            let uri = append_kernel_txn_query(&target.to_string(), txn.id(), None).await?;
-            let body = if params.is_empty() {
-                Vec::new()
-            } else {
-                encode_state_body(State::Map(params), txn.clone()).await?
-            };
-            let request = build_request(Method::Post, uri, txn.authorization_header(), body)?;
-            let (status, body_bytes) =
-                crate::outbound_http::send(&client, request, txn.deadline()).await?;
-            let body_bytes = crate::outbound_http::ensure_success(status, body_bytes)?;
-
+            let body = encode_state_body(State::Map(params), txn.clone()).await?;
+            let body_bytes = send_request(&client, Method::Post, target, &txn, body).await?;
             decode_state_body(body_bytes, &txn).await
         }
         .boxed()
@@ -95,29 +66,46 @@ impl RpcGateway for HttpRpcGateway {
 
     fn delete(
         &self,
-        target: Link,
+        target: RpcTarget,
         txn: crate::txn::TxnHandle,
         key: Scalar,
     ) -> BoxFuture<'static, TCResult<()>> {
-        let client = self.client.clone();
+        let client = self.clone();
         async move {
-            let uri = append_kernel_txn_query(&target.to_string(), txn.id(), Some(&key)).await?;
-            let request =
-                build_request(Method::Delete, uri, txn.authorization_header(), Vec::new())?;
-            let (status, body_bytes) =
-                crate::outbound_http::send(&client, request, txn.deadline()).await?;
-            let _ = crate::outbound_http::ensure_success(status, body_bytes)?;
-
-            Ok(())
+            let body = encode_state_body(State::from_scalar(key), txn.clone()).await?;
+            send_request(&client, Method::Delete, target, &txn, body)
+                .await
+                .map(drop)
         }
         .boxed()
     }
+}
+
+async fn send_request(
+    client: &hyper::Client<hyper::client::HttpConnector, hyper::Body>,
+    method: Method,
+    target: RpcTarget,
+    txn: &crate::TxnHandle,
+    body: Vec<u8>,
+) -> TCResult<Bytes> {
+    let (target, expected_digest) = target.into_parts();
+    let uri = append_kernel_txn_query(&target.to_string(), txn.id())?;
+    let request = build_request(
+        method,
+        uri,
+        txn.authorization_header(),
+        expected_digest.as_ref(),
+        body,
+    )?;
+    let (status, body) = crate::outbound_http::send(client, request, txn.deadline()).await?;
+    crate::outbound_http::ensure_success(status, body)
 }
 
 fn build_request(
     method: Method,
     uri: String,
     authorization: Option<String>,
+    expected_digest: Option<&crate::application::Digest>,
     body: Vec<u8>,
 ) -> TCResult<http::Request<hyper::Body>> {
     use http::header::{AUTHORIZATION, HeaderValue};
@@ -130,6 +118,12 @@ fn build_request(
     };
 
     let mut builder = http::Request::builder().method(method).uri(uri);
+    if let Some(expected_digest) = expected_digest {
+        builder = builder.header(
+            crate::gateway::EXPECTED_DIGEST_HEADER,
+            hex::encode(expected_digest),
+        );
+    }
 
     if let Some(token) = authorization {
         let value = HeaderValue::from_str(&token)
@@ -145,10 +139,6 @@ fn build_request(
 async fn encode_state_body(state: State, txn: crate::TxnHandle) -> TCResult<Vec<u8>> {
     use futures::TryStreamExt;
 
-    if state.is_none() {
-        return Ok(Vec::new());
-    }
-
     let view = state.into_view(txn).await?;
     let stream =
         destream_json::encode(view).map_err(|err| TCError::bad_request(err.to_string()))?;
@@ -160,23 +150,6 @@ async fn encode_state_body(state: State, txn: crate::TxnHandle) -> TCResult<Vec<
         })
         .await
         .map_err(|err| TCError::bad_request(err.to_string()))
-}
-
-async fn encode_scalar_json(value: &Scalar) -> TCResult<String> {
-    use futures::TryStreamExt;
-
-    let stream = destream_json::encode(value.clone())
-        .map_err(|err| TCError::bad_request(err.to_string()))?;
-    let bytes = stream
-        .map_err(|err| std::io::Error::other(err.to_string()))
-        .try_fold(Vec::new(), |mut acc, chunk| async move {
-            acc.extend_from_slice(&chunk);
-            Ok(acc)
-        })
-        .await
-        .map_err(|err| TCError::bad_request(err.to_string()))?;
-
-    String::from_utf8(bytes).map_err(|err| TCError::bad_request(err.to_string()))
 }
 
 async fn decode_state_body(body: Bytes, _txn: &crate::txn::TxnHandle) -> TCResult<State> {
@@ -192,15 +165,11 @@ async fn decode_state_body(body: Bytes, _txn: &crate::txn::TxnHandle) -> TCResul
         .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
-/// Append the kernel-owned transaction query parameters for internal host-to-host RPC.
+/// Append the kernel-owned transaction identity for internal host-to-host RPC.
 ///
 /// Public clients must not construct these URLs. This helper rejects targets which already
 /// contain `txn_id` so callers cannot override the active transaction context.
-pub(crate) async fn append_kernel_txn_query(
-    uri: &str,
-    txn_id: TxnId,
-    key: Option<&Scalar>,
-) -> TCResult<String> {
+pub(crate) fn append_kernel_txn_query(uri: &str, txn_id: TxnId) -> TCResult<String> {
     let parsed: http::Uri = uri
         .parse()
         .map_err(|err| TCError::bad_request(format!("invalid URI: {err}")))?;
@@ -218,19 +187,11 @@ pub(crate) async fn append_kernel_txn_query(
         ));
     }
 
-    let key_json = match key.filter(|key| !matches!(key, Scalar::Value(tc_value::Value::None))) {
-        Some(key) => Some(encode_scalar_json(key).await?),
-        None => None,
-    };
-
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     for (key, value) in form_urlencoded::parse(query.as_bytes()).into_owned() {
         serializer.append_pair(&key, &value);
     }
     serializer.append_pair("txn_id", &txn_id.to_string());
-    if let Some(key_json) = key_json {
-        serializer.append_pair("key", &key_json);
-    }
     let query = serializer.finish();
 
     let mut parts = parsed.into_parts();
@@ -256,40 +217,52 @@ mod tests {
     use super::*;
     use tc_ir::{NetworkTime, TxnId};
 
-    #[tokio::test]
-    async fn appends_txn_id_query_param() {
+    #[test]
+    fn appends_txn_id_query_param() {
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(1), 1).with_trace([0_u8; 32]);
 
         let uri = "http://localhost:8702/lib?foo=bar";
-        let updated = append_kernel_txn_query(uri, txn_id, None)
-            .await
-            .expect("append txn_id");
+        let updated = append_kernel_txn_query(uri, txn_id).expect("append txn_id");
         assert!(updated.contains("foo=bar"));
         assert!(updated.contains("txn_id="));
     }
 
-    #[tokio::test]
-    async fn overwrites_existing_txn_id_query_param() {
+    #[test]
+    fn rejects_existing_txn_id_query_param() {
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(2), 2).with_trace([0_u8; 32]);
 
         let uri = "http://localhost:8702/lib?txn_id=old&foo=bar";
-        let err = append_kernel_txn_query(uri, txn_id, None)
-            .await
-            .expect_err("should reject existing txn_id");
+        let err = append_kernel_txn_query(uri, txn_id).expect_err("should reject existing txn_id");
         assert!(err.message().contains("must not include txn_id"));
     }
 
+    #[tokio::test]
+    async fn explicit_null_is_an_ordinary_request_body() {
+        let txn = crate::txn::test_txn("http-rpc-null").await;
+        let body = encode_state_body(State::None, txn)
+            .await
+            .expect("encode explicit null");
+        assert_eq!(body, b"null");
+    }
+
     #[test]
-    fn attaches_bearer_token_header() {
+    fn attaches_application_authority_headers() {
+        let digest: crate::application::Digest =
+            <sha2::Sha256 as sha2::Digest>::digest(b"definition").into();
         let request = build_request(
             Method::Get,
             "http://localhost:8702/lib?txn_id=1".to_string(),
             Some("Bearer abc.def".to_string()),
+            Some(&digest),
             Vec::new(),
         )
         .expect("request");
 
         let auth = request.headers().get("authorization").expect("auth header");
         assert_eq!(auth.to_str().expect("auth header str"), "Bearer abc.def");
+        assert_eq!(
+            request.headers()[crate::gateway::EXPECTED_DIGEST_HEADER],
+            hex::encode(digest)
+        );
     }
 }

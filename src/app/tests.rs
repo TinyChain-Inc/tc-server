@@ -1,19 +1,16 @@
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-
-use base64::Engine as _;
-use pathlink::Link;
-use tc_ir::Claim;
-use tinychain::auth::{Actor, KeyringActorResolver, RjwtTokenVerifier, TokenVerifier};
-use tinychain::replication::{PeerMembership, parse_psk_list};
-use umask::{USER_READ, USER_WRITE};
-
 use super::discovery::dedupe_peers;
 use super::trusted_installers::{
     TrustedInstaller, TrustedInstallerPolicy, TrustedInstallerTokenVerifier,
 };
-
+use base64::Engine as _;
+use pathlink::Link;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tc_ir::Claim;
+use tinychain::auth::{Actor, KeyringActorResolver, RjwtTokenVerifier, TokenVerifier};
+use tinychain::replication::{PeerMembership, parse_psk_list};
+use umask::{USER_READ, USER_WRITE};
 #[test]
 fn parses_psk_list() {
     let keys = parse_psk_list("a, b,,c");
@@ -81,7 +78,7 @@ async fn trusted_installer_verifier_still_enforces_claim_policy_for_signed_token
         SystemTime::now(),
         Duration::from_secs(30),
         actor.id().clone(),
-        denied_claim,
+        tinychain::auth::wire_claim(denied_claim),
     );
     let signed = actor.sign_token(token).expect("signed").into_jwt();
 
@@ -134,7 +131,7 @@ async fn trusted_installer_policy_rejects_unconfigured_external_actor() {
         SystemTime::now(),
         Duration::from_secs(30),
         actor.id().clone(),
-        claim,
+        tinychain::auth::wire_claim(claim),
     );
     let signed = actor.sign_token(token).expect("signed").into_jwt();
 
@@ -169,7 +166,7 @@ async fn trusted_installer_policy_allows_host_replication_actor() {
         SystemTime::now(),
         Duration::from_secs(30),
         actor.id().clone(),
-        claim,
+        tinychain::auth::wire_claim(claim),
     );
     let signed = actor.sign_token(token).expect("signed").into_jwt();
 
@@ -208,7 +205,7 @@ async fn trusted_installer_policy_allows_known_peer_replication_actor() {
         SystemTime::now(),
         Duration::from_secs(30),
         actor.id().clone(),
-        claim,
+        tinychain::auth::wire_claim(claim),
     );
     let signed = actor.sign_token(token).expect("signed").into_jwt();
 
@@ -240,7 +237,7 @@ async fn trusted_installer_policy_rejects_host_replication_outside_cluster_root(
         SystemTime::now(),
         Duration::from_secs(30),
         actor.id().clone(),
-        claim,
+        tinychain::auth::wire_claim(claim),
     );
     let signed = actor.sign_token(token).expect("signed").into_jwt();
 

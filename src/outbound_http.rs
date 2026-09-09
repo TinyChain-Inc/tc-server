@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use serde::Deserialize;
 use tc_error::{TCError, TCResult};
 
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -72,40 +73,44 @@ pub(crate) fn error_from_status(status: hyper::StatusCode, body: Bytes) -> TCErr
 }
 
 fn decode_error_body(body: &[u8]) -> (String, Option<tc_error::Pressure>) {
+    #[derive(Deserialize)]
+    struct ErrorData {
+        message: Option<String>,
+        pressure: Option<PressureData>,
+    }
+
+    #[derive(Deserialize)]
+    struct PressureData {
+        resource: String,
+        reason: String,
+        retry_after_ms: Option<u64>,
+        reliability: Option<String>,
+    }
+
     let body_text = String::from_utf8_lossy(body).to_string();
-    let Ok(serde_json::Value::Object(error)) = serde_json::from_slice(body) else {
+    let Ok(error) = serde_json::from_slice::<std::collections::BTreeMap<String, ErrorData>>(body)
+    else {
         return (body_text, None);
     };
-    let Some(serde_json::Value::Object(data)) = error.values().next() else {
+    let Some(data) = error.values().next() else {
         return (body_text, None);
     };
-    let message = data
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(&body_text)
-        .to_string();
-    let pressure = data
-        .get("pressure")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|pressure| {
-            let resource = pressure.get("resource")?.as_str()?;
-            let reason = pressure.get("reason")?.as_str()?.parse().ok()?;
-            let mut decoded = tc_error::Pressure::new(resource, reason);
-            if let Some(retry_after_ms) = pressure
-                .get("retry_after_ms")
-                .and_then(serde_json::Value::as_u64)
-            {
-                decoded = decoded.with_retry_after_ms(retry_after_ms);
-            }
-            if let Some(reliability) = pressure
-                .get("reliability")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|value| value.parse().ok())
-            {
-                decoded = decoded.with_reliability(reliability);
-            }
-            Some(decoded)
-        });
+    let message = data.message.clone().unwrap_or(body_text);
+    let pressure = data.pressure.as_ref().and_then(|pressure| {
+        let reason = pressure.reason.parse().ok()?;
+        let mut decoded = tc_error::Pressure::new(&pressure.resource, reason);
+        if let Some(retry_after_ms) = pressure.retry_after_ms {
+            decoded = decoded.with_retry_after_ms(retry_after_ms);
+        }
+        if let Some(reliability) = pressure
+            .reliability
+            .as_deref()
+            .and_then(|value| value.parse().ok())
+        {
+            decoded = decoded.with_reliability(reliability);
+        }
+        Some(decoded)
+    });
     (message, pressure)
 }
 

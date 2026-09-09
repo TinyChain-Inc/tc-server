@@ -1,7 +1,7 @@
 use std::io;
 
 use bytes::Bytes;
-use futures::{FutureExt, Stream, TryStreamExt, future::BoxFuture, stream, stream::BoxStream};
+use futures::{Stream, TryStreamExt, stream, stream::BoxStream};
 use safecast::TryCastFrom;
 use tc_error::{TCError, TCResult};
 use tc_ir::{IntoView, Scalar};
@@ -10,37 +10,25 @@ use crate::{State, txn::TxnHandle};
 
 use super::{Body, Response, StatusCode, header};
 
-pub(crate) async fn decode_state_bytes_with_context(
-    body: Bytes,
-    txn: TxnHandle,
-) -> TCResult<State> {
-    if body.is_empty() || body.iter().all(|b| b.is_ascii_whitespace()) {
-        return Ok(State::None);
-    }
-
-    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(body)]);
-    destream_json::try_decode(txn, stream)
-        .await
-        .map_err(|err| TCError::bad_request(err.to_string()))
-}
-
 /// Project a native result at the HTTP boundary.
 pub(crate) async fn native_state_response(
     state: State,
     txn: TxnHandle,
-    finalize: Option<(crate::Kernel, crate::resources::CapacityPermit)>,
+    request: Option<crate::KernelRequestGuard>,
 ) -> TCResult<Response> {
     let view = state.into_view(txn.clone()).await?;
     let stream = json_stream(view);
-    let stream: BoxStream<'static, Result<Bytes, io::Error>> = match finalize {
-        Some((kernel, request)) => Box::pin(FinalizingStream::new(stream, kernel, txn, request)),
+    let stream: BoxStream<'static, Result<Bytes, io::Error>> = match request {
+        Some(request) => Box::pin(CompletionStream::new(stream, request)),
         None => stream,
     };
     Ok(json_stream_response(stream))
 }
 
 /// Encode bounded transport-only state which cannot contain persistent collections.
-pub(crate) fn state_response<Txn>(state: tc_state::State<Txn>) -> Response {
+pub(crate) fn state_response<Txn: tc_collection::StorageContext>(
+    state: tc_state::State<Txn>,
+) -> Response {
     match Scalar::try_cast_from(state, |_| {
         TCError::bad_request("transport endpoint returned non-scalar state")
     }) {
@@ -64,53 +52,29 @@ fn json_stream_response(stream: BoxStream<'static, Result<Bytes, io::Error>>) ->
         .expect("state response")
 }
 
-struct FinalizingStream {
+struct CompletionStream {
     stream: BoxStream<'static, Result<Bytes, io::Error>>,
-    finalize: Option<(crate::Kernel, TxnHandle)>,
-    future: Option<BoxFuture<'static, TCResult<()>>>,
+    request: Option<crate::KernelRequestGuard>,
     deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
     timed_out: bool,
-    _request: crate::resources::CapacityPermit,
 }
 
-impl FinalizingStream {
+impl CompletionStream {
     fn new(
         stream: BoxStream<'static, Result<Bytes, io::Error>>,
-        kernel: crate::Kernel,
-        txn: TxnHandle,
-        request: crate::resources::CapacityPermit,
+        request: crate::KernelRequestGuard,
     ) -> Self {
-        let deadline = txn.deadline();
+        let deadline = request.deadline();
         Self {
             stream,
-            finalize: Some((kernel, txn)),
-            future: None,
+            request: Some(request),
             deadline: Box::pin(tokio::time::sleep_until(deadline.instant())),
             timed_out: false,
-            _request: request,
         }
-    }
-
-    fn begin_finalize(&mut self) {
-        if self.future.is_some() {
-            return;
-        }
-
-        let Some((kernel, txn)) = self.finalize.take() else {
-            return;
-        };
-        self.future = Some(
-            async move {
-                kernel
-                    .complete_transaction(txn, crate::txn::TransactionOutcome::Succeeded)
-                    .await
-            }
-            .boxed(),
-        );
     }
 }
 
-impl Stream for FinalizingStream {
+impl Stream for CompletionStream {
     type Item = Result<Bytes, io::Error>;
 
     fn poll_next(
@@ -118,10 +82,10 @@ impl Stream for FinalizingStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
-        if !this.timed_out && this.future.is_none() && this.deadline.as_mut().poll(cx).is_ready() {
+        if !this.timed_out && this.deadline.as_mut().poll(cx).is_ready() {
             this.timed_out = true;
-            if let Some((_kernel, txn)) = this.finalize.take() {
-                let err = txn.deadline().exceeded();
+            if let Some(request) = this.request.take() {
+                let err = request.deadline().exceeded();
                 return std::task::Poll::Ready(Some(Err(io::Error::other(err.to_string()))));
             }
         }
@@ -130,26 +94,14 @@ impl Stream for FinalizingStream {
             return std::task::Poll::Ready(None);
         }
 
-        if let Some(future) = &mut this.future {
-            return match std::pin::Pin::new(future).poll(cx) {
-                std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(None),
-                std::task::Poll::Ready(Err(err)) => {
-                    std::task::Poll::Ready(Some(Err(io::Error::other(err.to_string()))))
-                }
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            };
-        }
-
         match this.stream.as_mut().poll_next(cx) {
             std::task::Poll::Ready(Some(Err(err))) => {
-                // An abandoned implicit transaction is rolled back by the one
-                // transaction TTL worker; adapters only release the view.
-                this.finalize.take();
+                this.request.take();
                 std::task::Poll::Ready(Some(Err(err)))
             }
             std::task::Poll::Ready(None) => {
-                this.begin_finalize();
-                self.poll_next(cx)
+                this.request.take();
+                std::task::Poll::Ready(None)
             }
             poll => poll,
         }

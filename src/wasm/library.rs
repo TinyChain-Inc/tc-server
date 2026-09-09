@@ -1,11 +1,11 @@
-use std::collections::HashMap;
-
+use bytes::Bytes;
+use futures::stream;
 use pathlink::PathSegment;
 use tc_error::{TCError, TCResult};
-use tc_ir::{LibrarySchema, TxnHeader};
+use tc_ir::{IntoView, Scalar};
 use wasmtime::{Engine, Func, Instance, Memory, Module, Store};
 
-use super::manifest::{RouteBinding, decode_manifest, format_path};
+use super::manifest::{RouteBinding, decode_entry, format_path};
 
 /// Loads a TinyChain-compatible Library embedded in a WASM module.
 pub struct WasmLibrary {
@@ -13,13 +13,49 @@ pub struct WasmLibrary {
     memory: Memory,
     alloc: Func,
     free: Func,
-    schema: LibrarySchema,
-    routes: HashMap<Vec<PathSegment>, Func>,
-    bindings: Vec<RouteBinding>,
+    identity: pathlink::Link,
+    definition: Scalar,
+    routes: Vec<(RouteBinding, Func)>,
+}
+
+pub(crate) struct WasmRoute {
+    library: std::sync::Arc<tokio::sync::Mutex<WasmLibrary>>,
+    path: Vec<PathSegment>,
+}
+
+impl WasmRoute {
+    pub(crate) fn new(
+        library: std::sync::Arc<tokio::sync::Mutex<WasmLibrary>>,
+        path: Vec<PathSegment>,
+    ) -> Self {
+        Self { library, path }
+    }
+}
+
+impl<'a> tc_ir::Handler<'a, crate::State> for WasmRoute {
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, crate::State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, key| {
+            let library = std::sync::Arc::clone(&self.library);
+            let path = self.path;
+            Box::pin(async move {
+                invoke(
+                    library,
+                    &path,
+                    txn,
+                    crate::Method::Get,
+                    Some(crate::State::from_scalar(key)),
+                )
+                .await
+            })
+        }))
+    }
 }
 
 impl WasmLibrary {
-    pub fn from_bytes(engine: &Engine, bytes: &[u8]) -> TCResult<Self> {
+    pub async fn from_bytes(engine: &Engine, bytes: &[u8]) -> TCResult<Self> {
         let module = Module::new(engine, bytes).map_err(map_wasm_error)?;
         let mut store = Store::new(engine, ());
         let instance = Instance::new(&mut store, &module, &[]).map_err(map_wasm_error)?;
@@ -34,10 +70,11 @@ impl WasmLibrary {
             .get_func(&mut store, "free")
             .ok_or_else(|| TCError::internal("WASM module must export free"))?;
 
-        let (schema, bindings) = Self::load_manifest(&mut store, &instance, &memory)?;
+        let (identity, definition, bindings) =
+            Self::load_entry(&mut store, &instance, &memory).await?;
 
-        let mut route_map = HashMap::new();
-        for binding in &bindings {
+        let mut routes = Vec::with_capacity(bindings.len());
+        for binding in bindings {
             let func = instance
                 .get_func(&mut store, &binding.export)
                 .ok_or_else(|| {
@@ -47,7 +84,7 @@ impl WasmLibrary {
                         format_path(&binding.path)
                     ))
                 })?;
-            route_map.insert(binding.path.clone(), func);
+            routes.push((binding, func));
         }
 
         Ok(Self {
@@ -55,38 +92,42 @@ impl WasmLibrary {
             memory,
             alloc,
             free,
-            schema,
-            routes: route_map,
-            bindings,
+            identity,
+            definition,
+            routes,
         })
     }
 
-    pub fn schema(&self) -> &LibrarySchema {
-        &self.schema
+    pub fn identity(&self) -> &pathlink::Link {
+        &self.identity
+    }
+
+    pub fn definition(&self) -> &Scalar {
+        &self.definition
     }
 
     pub fn routes(&self) -> impl Iterator<Item = &Vec<PathSegment>> {
-        self.routes.keys()
+        self.routes.iter().map(|(binding, _)| &binding.path)
     }
 
-    pub(crate) fn bindings(&self) -> &[RouteBinding] {
-        &self.bindings
+    pub(crate) fn bindings(&self) -> impl ExactSizeIterator<Item = &RouteBinding> {
+        self.routes.iter().map(|(binding, _)| binding)
     }
 
     pub fn call_route(
         &mut self,
         path: &[PathSegment],
-        header: &TxnHeader,
+        txn_id: &[u8],
         body: &[u8],
     ) -> TCResult<Vec<u8>> {
         let func = self
             .routes
-            .get(path)
-            .cloned()
+            .iter()
+            .find(|(binding, _)| binding.path == path)
+            .map(|(_, func)| *func)
             .ok_or_else(|| TCError::not_found(format_path(path)))?;
 
-        let header_bytes = encode_json(header)?;
-        let (header_ptr, header_len) = self.write_buffer(&header_bytes)?;
+        let (txn_ptr, txn_len) = self.write_buffer(txn_id)?;
         let (body_ptr, body_len) = if body.is_empty() {
             (0, 0)
         } else {
@@ -97,16 +138,13 @@ impl WasmLibrary {
             .typed::<(i32, i32, i32, i32), i64>(&self.store)
             .map_err(map_wasm_error)?;
         let packed = typed
-            .call(
-                &mut self.store,
-                (header_ptr, header_len, body_ptr, body_len),
-            )
+            .call(&mut self.store, (txn_ptr, txn_len, body_ptr, body_len))
             .map_err(map_wasm_error)?;
         let (result_ptr, result_len) = unpack_wasm_pair(packed);
 
         let bytes = self.read_buffer(result_ptr, result_len)?;
-        if header_len > 0 {
-            self.free_buffer(header_ptr, header_len)?;
+        if txn_len > 0 {
+            self.free_buffer(txn_ptr, txn_len)?;
         }
         if body_len > 0 {
             self.free_buffer(body_ptr, body_len)?;
@@ -116,11 +154,11 @@ impl WasmLibrary {
         Ok(bytes)
     }
 
-    fn load_manifest(
+    async fn load_entry(
         store: &mut Store<()>,
         instance: &Instance,
         memory: &Memory,
-    ) -> TCResult<(LibrarySchema, Vec<RouteBinding>)> {
+    ) -> TCResult<(pathlink::Link, Scalar, Vec<RouteBinding>)> {
         let func = instance
             .get_func(&mut *store, "tc_library_entry")
             .ok_or_else(|| TCError::internal("missing tc_library_entry export"))?;
@@ -128,8 +166,8 @@ impl WasmLibrary {
         let packed = typed.call(&mut *store, ()).map_err(map_wasm_error)?;
         let (ptr, len) = unpack_wasm_pair(packed);
         let bytes = read_memory(store, memory, ptr, len)?;
-        let manifest = decode_manifest(bytes)?;
-        Ok((manifest.schema, manifest.routes))
+        let entry = decode_entry(bytes).await?;
+        Ok((entry.identity, entry.definition, entry.routes))
     }
 
     fn write_buffer(&mut self, data: &[u8]) -> TCResult<(i32, i32)> {
@@ -171,6 +209,39 @@ impl WasmLibrary {
     }
 }
 
+/// Cross the WASM ABI once while keeping routing and transaction ownership native.
+pub(crate) async fn invoke(
+    wasm: std::sync::Arc<tokio::sync::Mutex<WasmLibrary>>,
+    path: &[PathSegment],
+    txn: &crate::TxnHandle,
+    method: crate::Method,
+    body: Option<crate::State>,
+) -> TCResult<crate::State> {
+    if method != crate::Method::Get {
+        return Err(TCError::method_not_allowed(method, "WASM Library route"));
+    }
+    let body = match body {
+        Some(body) => {
+            let view = body.into_view(txn.clone()).await?;
+            crate::application::encode_json(
+                view,
+                txn.resources().limits().ingress.request_body_bytes,
+            )
+            .await?
+        }
+        None => Vec::new(),
+    };
+    let txn_id = txn.id().to_string();
+    let bytes = {
+        let mut wasm = wasm.lock().await;
+        wasm.call_route(path, txn_id.as_bytes(), &body)?
+    };
+    let input = stream::iter([Ok::<_, std::io::Error>(Bytes::from(bytes))]);
+    destream_json::try_decode(txn.clone(), input)
+        .await
+        .map_err(|err| TCError::bad_request(format!("invalid WASM response: {err}")))
+}
+
 fn read_memory(store: &mut Store<()>, memory: &Memory, ptr: i32, len: i32) -> TCResult<Vec<u8>> {
     let mut buf = vec![0u8; len as usize];
     memory
@@ -190,7 +261,47 @@ fn unpack_wasm_pair(value: i64) -> (i32, i32) {
     (ptr, len)
 }
 
-fn encode_json(header: &TxnHeader) -> TCResult<Vec<u8>> {
-    serde_json::to_vec(header)
-        .map_err(|err| TCError::internal(format!("failed to encode txn header: {err}")))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wat_bytes(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("\\{byte:02x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn loads_literal_definition_and_executes_its_bound_export() {
+        let entry = br#"{"definition":{"/lib/example-devco/wasm/1.0.0":{"answer":42}},"routes":[{"path":"/answer","export":"answer"}]}"#;
+        let response = b"42";
+        let entry_result = (entry.len() as i64) << 32;
+        let response_ptr = 2048_i64;
+        let response_result = ((response.len() as i64) << 32) | response_ptr;
+        let wat = format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{}")
+                (data (i32.const {response_ptr}) "{}")
+                (func (export "alloc") (param i32) (result i32) i32.const 4096)
+                (func (export "free") (param i32 i32))
+                (func (export "tc_library_entry") (result i64) i64.const {entry_result})
+                (func (export "answer") (param i32 i32 i32 i32) (result i64)
+                    i64.const {response_result}))"#,
+            wat_bytes(entry),
+            wat_bytes(response),
+        );
+
+        let mut library = WasmLibrary::from_bytes(&Engine::default(), wat.as_bytes())
+            .await
+            .expect("load literal WASM Library");
+        assert_eq!(
+            library.identity().to_string(),
+            "/lib/example-devco/wasm/1.0.0"
+        );
+        let txn = crate::txn::test_txn("wasm-literal").await;
+        let txn_id = txn.id().to_string();
+        let output = library
+            .call_route(&["answer".parse().unwrap()], txn_id.as_bytes(), &[])
+            .expect("execute bound export");
+        assert_eq!(output, response);
+    }
 }

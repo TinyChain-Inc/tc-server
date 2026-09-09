@@ -1,8 +1,4 @@
-pub use hyper::Method as HttpMethod;
-pub use hyper::{Body, StatusCode, header};
-
-pub type Request = hyper::Request<hyper::Body>;
-pub type Response = hyper::Response<hyper::Body>;
+pub use crate::{Body, HttpMethod, Request, Response, StatusCode, header};
 
 /// HTTP-only endpoint contract. Native kernel execution never depends on this trait.
 pub trait HttpHandler: Send + Sync + 'static {
@@ -19,16 +15,23 @@ where
     }
 }
 
+#[cfg(feature = "http-server")]
 mod codec;
+#[cfg(feature = "http-server")]
 mod config;
+#[cfg(feature = "http-server")]
 mod host;
+#[cfg(feature = "http-server")]
 mod parse;
+#[cfg(feature = "http-server")]
 mod response;
+#[cfg(feature = "http-server")]
 mod server;
 
+#[cfg(feature = "http-server")]
 pub use config::{HttpKernelConfig, HttpRuntime, build_http_runtime_with_config};
-pub use host::host_handler_with_public_keys;
+#[cfg(feature = "http-server")]
 pub use server::{HttpRouter, HttpServer};
 
-pub(crate) use codec::{decode_state_bytes_with_context, native_state_response, state_response};
-pub(crate) use response::tc_error_response;
+#[cfg(feature = "http-server")]
+pub(crate) use codec::{native_state_response, state_response};

@@ -1,71 +1,86 @@
-use std::sync::Arc;
+use tc_error::{TCError, TCResult};
+use tc_ir::{Handler, Scalar};
 
-use tc_error::TCResult;
-use tc_ir::{Public, Scalar, TxnId};
-
-use super::resolver::KernelTxnResolver;
-use super::{BoundTransaction, KernelRequest, Method};
-use crate::egress::EgressPolicy;
-use crate::library::LibraryRegistry;
+use super::Method;
+use super::types::KernelTarget;
 use crate::txn::TxnServer;
-use crate::uri::{component_root, normalize_path};
 
+#[derive(Clone)]
 pub struct Kernel {
-    pub(crate) resources: crate::HostResources,
     pub(crate) txn_server: TxnServer,
-    pub(crate) egress: EgressPolicy,
-    pub(crate) library_module: Option<Arc<LibraryRegistry>>,
-    pub(crate) rpc_gateway: Option<Arc<dyn crate::gateway::RpcGateway>>,
-    pub(crate) token_verifier: Arc<dyn crate::auth::TokenVerifier>,
+    pub(crate) runtime: std::sync::Arc<super::HostRuntime>,
 }
 
 impl Kernel {
-    pub fn builder() -> super::KernelBuilder {
-        super::KernelBuilder::new()
+    pub async fn new(
+        services: super::HostServices,
+        workspace: crate::Workspace,
+        ttl: std::time::Duration,
+    ) -> TCResult<Self> {
+        let txn = crate::txn::TxnConfig::new(
+            services.protocol,
+            workspace,
+            services.resources.clone(),
+            ttl,
+        );
+        let runtime = std::sync::Arc::new(super::HostRuntime::new(
+            services.applications,
+            services.rpc,
+            services.resources.clone(),
+            services.public_keys,
+        ));
+        let txn_server = crate::txn::TxnServer::new(txn, services.verifier);
+        let kernel = Self {
+            txn_server,
+            runtime,
+        };
+        kernel.txn_server.recover().await?;
+        kernel.txn_server.start_expiry(
+            &tokio::runtime::Handle::current(),
+            std::sync::Arc::clone(&kernel.runtime),
+        );
+        Ok(kernel)
     }
 
-    /// Execute a decoded local route without constructing a transport request
-    /// or response.
-    pub async fn execute(&self, request: KernelRequest) -> TCResult<crate::State> {
-        let path = request.path.to_string();
-        if path == crate::uri::HOST_AUTH_CONTEXT {
-            if request.method != Method::Get {
-                return Err(tc_error::TCError::method_not_allowed(
-                    request.method.as_str(),
-                    &path,
-                ));
+    pub(crate) async fn execute(
+        &self,
+        target: KernelTarget,
+        txn: crate::TxnHandle,
+        method: Method,
+        body: Option<crate::State>,
+        expected_digest: Option<crate::application::Digest>,
+    ) -> TCResult<Option<crate::State>> {
+        match &target {
+            KernelTarget::Application(application) => {
+                self.runtime
+                    .applications
+                    .dispatch(&txn, application, expected_digest.as_ref(), method, body)
+                    .await
             }
-            return crate::host::auth_context(&request.txn);
+            _ if txn.is_locked() => Err(TCError::conflict(
+                "a transaction decision must target an exact transactional resource",
+            )),
+            KernelTarget::State(state_target) => {
+                self.runtime
+                    .dispatch_state(&txn, state_target, method, body)
+                    .await
+            }
+            KernelTarget::Health => self.health(method).map(Some),
+            KernelTarget::AuthContext => {
+                if method != Method::Get {
+                    return Err(tc_error::TCError::method_not_allowed(
+                        method.as_str(),
+                        crate::uri::HOST_AUTH_CONTEXT,
+                    ));
+                }
+                crate::host::auth_context(&txn).map(Some)
+            }
+            KernelTarget::External(external) => Err(TCError::not_found(external.to_string())),
         }
-        if path.starts_with("/state/") {
-            return crate::state::execute(request)
-                .await?
-                .ok_or_else(|| tc_error::TCError::not_found(path));
-        }
-        let registry = self
-            .library_module
-            .as_ref()
-            .ok_or_else(|| tc_error::TCError::not_found(path.clone()))?;
-        if path == crate::uri::CLASS_ROOT || path.starts_with(crate::uri::CLASS_ROOT_PREFIX) {
-            return execute_class(registry, &path, request).await;
-        }
-        let (routes, route, is_root) = registry
-            .resolve_native(&path)
-            .ok_or_else(|| tc_error::TCError::not_found(path.clone()))?;
-        if is_root {
-            return Err(tc_error::TCError::not_found(path));
-        }
-
-        execute_native(&routes, &route, request).await
     }
 
     pub fn resources(&self) -> &crate::HostResources {
-        &self.resources
-    }
-
-    /// Start the single host-owned transaction expiry worker.
-    pub fn start_transaction_expiry(&self, runtime: &tokio::runtime::Handle) {
-        self.txn_server.start_expiry(runtime);
+        self.txn_server.resources()
     }
 
     #[cfg(test)]
@@ -73,147 +88,159 @@ impl Kernel {
         &self.txn_server
     }
 
-    pub fn rpc_gateway(&self) -> Option<&Arc<dyn crate::gateway::RpcGateway>> {
-        self.rpc_gateway.as_ref()
+    #[cfg(test)]
+    pub(crate) async fn test_txn(&self) -> crate::TxnHandle {
+        self.txn_server
+            .bind(None, None, std::sync::Arc::clone(&self.runtime))
+            .await
+            .expect("begin test transaction")
     }
 
-    pub fn token_verifier(&self) -> &Arc<dyn crate::auth::TokenVerifier> {
-        &self.token_verifier
+    pub fn is_ready(&self) -> bool {
+        self.txn_server.is_ready()
     }
 
-    pub fn library_registry(&self) -> Option<&Arc<LibraryRegistry>> {
-        self.library_module.as_ref()
+    pub fn health(&self, method: Method) -> TCResult<crate::State> {
+        if method != Method::Get {
+            return Err(TCError::method_not_allowed(method, crate::uri::HOST_HEALTH));
+        }
+        use tc_ir::{Id, Map};
+
+        Ok(crate::State::Map(Map::from_iter([
+            (
+                "status".parse::<Id>().expect("health field"),
+                crate::State::from(tc_value::Value::from("ok")),
+            ),
+            (
+                "resources".parse::<Id>().expect("health field"),
+                self.runtime.metrics(),
+            ),
+        ])))
     }
 
-    pub fn with_resolver(&self, handle: crate::txn::TxnHandle) -> crate::txn::TxnHandle {
-        handle.with_resolver(self.build_txn_resolver())
+    pub fn metrics(&self, method: Method) -> TCResult<crate::State> {
+        (method == Method::Get)
+            .then(|| self.runtime.metrics())
+            .ok_or_else(|| TCError::method_not_allowed(method, crate::uri::HOST_METRICS))
     }
 
-    fn build_txn_resolver(&self) -> Arc<dyn crate::gateway::RpcGateway> {
-        Arc::new(KernelTxnResolver {
-            gateway: self.rpc_gateway.as_ref().map(Arc::clone),
-            library_registry: self.library_module.as_ref().map(Arc::clone),
-            egress: self.egress.clone(),
-            txn_server: self.txn_server.clone(),
-        })
+    pub fn public_key(&self, method: Method, actor_id: &str) -> TCResult<crate::State> {
+        if method != Method::Get {
+            return Err(TCError::method_not_allowed(
+                method,
+                crate::uri::HOST_PUBLIC_KEY,
+            ));
+        }
+        self.runtime.public_key(actor_id)
     }
 
-    pub(crate) async fn complete_transaction(
-        &self,
-        txn: crate::txn::TxnHandle,
-        outcome: crate::txn::TransactionOutcome,
-    ) -> TCResult<()> {
-        self.txn_server.complete(txn, outcome).await
-    }
-
-    /// Bind the only transaction context used by native execution. Adapters
-    /// authenticate and decode transport data, but cannot begin, reuse, or
-    /// finalize transactions themselves.
-    pub(crate) async fn bind_transaction(
+    pub async fn begin_request(
         &self,
         method: Method,
-        path: &str,
+        raw_path: &str,
         body_is_none: bool,
-        txn_id: Option<TxnId>,
-        token: Option<&crate::auth::TokenContext>,
+        bearer: Option<String>,
         deadline: crate::Deadline,
-    ) -> TCResult<Option<BoundTransaction>> {
-        let path = normalize_path(path);
-        let is_component_root =
-            component_root(path).is_some_and(|component_root| component_root == path);
-
-        #[allow(clippy::collapsible_if)]
-        if body_is_none && is_component_root && matches!(method, Method::Post | Method::Delete) {
-            if let Some(txn_id) = txn_id {
-                let required = if method == Method::Post {
-                    umask::USER_EXEC
-                } else {
-                    umask::USER_WRITE
-                };
-                let component = component_root(path).filter(|root| *root != path);
-                let outcome = if method == Method::Post {
-                    crate::txn::TransactionOutcome::ExplicitCommit
-                } else {
-                    crate::txn::TransactionOutcome::ExplicitRollback
-                };
-                self.txn_server
-                    .finish_authorized(txn_id, token, component, required, outcome)
-                    .await?;
-                return Ok(None);
+    ) -> TCResult<Box<super::KernelRequestGuard>> {
+        let (path, txn_id) = crate::txn::wire::split_path_and_txn_id(raw_path)?;
+        let link: pathlink::Link = path
+            .parse()
+            .map_err(|error| TCError::bad_request(format!("invalid request target: {error}")))?;
+        let target = match link.path().first() {
+            Some(root) if matches!(root.as_str(), "lib" | "class" | "service") => {
+                KernelTarget::Application(link)
             }
+            _ if path == crate::uri::HOST_HEALTH => KernelTarget::Health,
+            _ if path == crate::uri::HOST_AUTH_CONTEXT => KernelTarget::AuthContext,
+            _ if link
+                .path()
+                .first()
+                .is_some_and(|root| root.as_str() == "state") =>
+            {
+                KernelTarget::State(link.path()[1..].into())
+            }
+            _ => KernelTarget::External(link),
+        };
+        let permit = self.resources().admit_request(deadline).await?;
+        let token = match bearer {
+            Some(bearer) => Some(
+                deadline
+                    .wait(self.txn_server.verifier().verify(bearer))
+                    .await?
+                    .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?,
+            ),
+            None => None,
+        };
+        let txn = self
+            .txn_server
+            .bind(txn_id, token.as_ref(), std::sync::Arc::clone(&self.runtime))
+            .await?
+            .with_deadline(deadline);
+        if body_is_none && matches!(method, Method::Put | Method::Delete) && !txn.is_locked() {
+            return Err(TCError::bad_request(
+                "an ordinary PUT or DELETE request requires an explicit body",
+            ));
         }
-
-        let component = component_root(path).filter(|root| *root != path);
-        let handle = self.txn_server.bind(txn_id, token, component)?;
-        let txn = self.with_resolver(handle).with_deadline(deadline);
-        Ok(Some(BoundTransaction {
+        Ok(Box::new(super::KernelRequestGuard {
+            kernel: self.clone(),
+            method,
+            target,
             txn,
-            implicit: txn_id.is_none(),
+            expected_digest: None,
+            _permit: permit,
         }))
     }
 }
 
-async fn execute_class(
-    registry: &LibraryRegistry,
-    path: &str,
-    request: KernelRequest,
-) -> TCResult<crate::State> {
-    let Some((class, route)) = registry.resolve_class_path(path) else {
-        if request.method != Method::Get {
-            return Err(tc_error::TCError::method_not_allowed(request.method, path));
-        }
-        return registry
-            .list_class_dir(path)
-            .map(crate::library::view::listing)
-            .ok_or_else(|| tc_error::TCError::not_found(path));
-    };
-    if !route.is_empty() {
-        return Err(tc_error::TCError::not_found(path));
-    }
-
-    match (request.method, request.body) {
-        (Method::Get, body) => Ok(crate::State::from(tc_state::Object::Instance(
-            tc_state::ClassInstance::new(body.unwrap_or_default(), class, tc_ir::Map::new()),
-        ))),
-        (Method::Post, Some(crate::State::Map(members))) => {
-            Ok(crate::State::from(tc_state::Object::Instance(
-                tc_state::ClassInstance::new(crate::State::default(), class, members),
-            )))
-        }
-        (Method::Post, _) => Err(tc_error::TCError::bad_request(
-            "Class construction requires a map of instance members",
-        )),
-        (method, _) => Err(tc_error::TCError::method_not_allowed(method, path)),
-    }
-}
-
-pub(crate) async fn execute_native(
-    routes: &crate::ir::IrRoutes,
-    route: &[pathlink::PathSegment],
-    request: KernelRequest,
-) -> TCResult<crate::State> {
-    match request.method {
+pub(crate) async fn invoke_handler<'handler, 'txn>(
+    handler: Box<dyn Handler<'handler, crate::State> + 'handler>,
+    txn: &'txn crate::TxnHandle,
+    method: Method,
+    body: Option<crate::State>,
+) -> TCResult<crate::State>
+where
+    'txn: 'handler,
+{
+    match method {
         Method::Get => {
-            let key = scalar_body(request.body)?;
-            routes.get(&request.txn, route, key).await
+            handler
+                .get()
+                .ok_or_else(|| TCError::method_not_allowed(method, "native handler"))?(
+                txn,
+                scalar_body(body)?,
+            )
+            .await
         }
         Method::Put => {
-            let (key, value) = put_body(request.body)?;
-            routes.put(&request.txn, route, key, value).await?;
-            Ok(crate::State::None)
+            let (key, value) = put_body(body)?;
+            handler
+                .put()
+                .ok_or_else(|| TCError::method_not_allowed(method, "native handler"))?(
+                txn, key, value,
+            )
+            .await?;
+            Ok(crate::State::default())
         }
         Method::Post => {
-            let Some(crate::State::Map(params)) = request.body else {
-                return Err(tc_error::TCError::bad_request(
-                    "POST route requires a map request",
-                ));
+            let Some(crate::State::Map(params)) = body else {
+                return Err(TCError::bad_request("POST route requires a map request"));
             };
-            routes.post(&request.txn, route, params).await
+            handler
+                .post()
+                .ok_or_else(|| TCError::method_not_allowed(method, "native handler"))?(
+                txn, params
+            )
+            .await
         }
         Method::Delete => {
-            let key = scalar_body(request.body)?;
-            routes.delete(&request.txn, route, key).await?;
-            Ok(crate::State::None)
+            handler
+                .delete()
+                .ok_or_else(|| TCError::method_not_allowed(method, "native handler"))?(
+                txn,
+                scalar_body(body)?,
+            )
+            .await?;
+            Ok(crate::State::default())
         }
     }
 }
@@ -240,17 +267,4 @@ fn put_body(body: Option<crate::State>) -> TCResult<(Scalar, crate::State)> {
     let value = values.pop().expect("tuple length checked");
     let key = scalar_body(Some(values.pop().expect("tuple length checked")))?;
     Ok((key, value))
-}
-
-impl Clone for Kernel {
-    fn clone(&self) -> Self {
-        Self {
-            resources: self.resources.clone(),
-            txn_server: self.txn_server.clone(),
-            egress: self.egress.clone(),
-            library_module: self.library_module.as_ref().map(Arc::clone),
-            rpc_gateway: self.rpc_gateway.as_ref().map(Arc::clone),
-            token_verifier: Arc::clone(&self.token_verifier),
-        }
-    }
 }

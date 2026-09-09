@@ -80,18 +80,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SystemTime::now(),
         Duration::from_secs(ttl_secs),
         actor.id().clone(),
-        claims.first().cloned().ok_or("missing --lib claim")?,
+        tinychain::auth::wire_claim(claims.first().cloned().ok_or("missing --lib claim")?),
     );
     let mut signed = actor.sign_token(token)?;
     for claim in claims.iter().skip(1).cloned() {
-        signed = actor.consume_and_sign(signed, host.clone(), claim, SystemTime::now())?;
+        signed = actor.consume_and_sign(
+            signed,
+            host.clone(),
+            tinychain::auth::wire_claim(claim),
+            SystemTime::now(),
+        )?;
     }
     if let Some(txn_id) = txn_id {
         let txn_claim = Claim::new(
-            Link::from_str(&format!("/txn/{txn_id}"))?,
+            Link::from_str(&format!("/host/txn/{txn_id}"))?,
             USER_EXEC | USER_WRITE,
         );
-        signed = actor.consume_and_sign(signed, host.clone(), txn_claim, SystemTime::now())?;
+        signed = actor.consume_and_sign(
+            signed,
+            host.clone(),
+            tinychain::auth::wire_claim(txn_claim),
+            SystemTime::now(),
+        )?;
     }
 
     let public_key_b64 = STANDARD.encode(actor.verifying_key().to_bytes());

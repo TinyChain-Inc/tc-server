@@ -1,68 +1,76 @@
+#[cfg(feature = "http-client")]
 mod client;
 mod crypto;
 mod gateway;
-mod handler;
+#[cfg(feature = "http-server")]
 mod http_util;
 mod issuer;
 mod membership;
+#[cfg(feature = "http-server")]
 mod peers;
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
-use crate::library::{LibraryRegistry, StageInstallError, decode_authorize_and_stage_install};
-use crate::txn::ParticipantSet;
 use aes_gcm_siv::{Aes256GcmSiv, Key};
-use futures::future::{FutureExt, join_all};
-use hyper::body::to_bytes;
-use hyper::{Body, Request, StatusCode};
+use futures::{StreamExt, stream};
 use tc_error::{TCError, TCResult};
 
-use self::http_util::{bad_request, empty_response, text_response};
+/// One bounded canonical application body crossing a host boundary.
+#[derive(Clone)]
+pub struct CanonicalBody {
+    pub identity: pathlink::Link,
+    pub body: Arc<[u8]>,
+    pub content_type: String,
+}
 
-pub const LIBRARY_EXPORT_PATH: &str = crate::uri::HOST_LIBRARY_EXPORT;
 pub const PEERS_PATH_SUFFIX: &str = "/_cluster/peers";
 pub const PEERS_JOIN_PATH_SUFFIX: &str = "/_cluster/peers/join";
 pub const PEERS_LEAVE_PATH_SUFFIX: &str = "/_cluster/peers/leave";
 pub const PEERS_HEARTBEAT_PATH_SUFFIX: &str = "/_cluster/peers/heartbeat";
-pub const FORWARDED_HEADER: &str = "x-tc-replicated";
-const TOKEN_PATH: &str = "/";
-const REPLICATION_TTL: Duration = Duration::from_secs(30);
+const DECISION_ATTEMPTS: usize = 3;
+const FANOUT_CONCURRENCY: usize = 8;
 
-#[derive(Clone, Copy, Debug)]
-pub struct ParticipantFanoutPolicy {
-    pub max_attempts: usize,
-}
-
-impl Default for ParticipantFanoutPolicy {
-    fn default() -> Self {
-        Self { max_attempts: 3 }
-    }
-}
-
-pub use client::{HttpClusterGateway, PeerClusterListing, normalize_peer};
-pub use gateway::ClusterGateway;
-pub use handler::{export_handler, replication_token_handler};
+#[cfg(feature = "http-client")]
+pub use client::HttpClusterGateway;
+pub use gateway::{ClusterGateway, LocalClusterGateway};
 pub use issuer::{ReplicationIssuer, parse_psk_keys, parse_psk_list};
 pub use membership::{PeerDescriptor, PeerIdentity, PeerMembership};
+#[cfg(feature = "http-server")]
 pub use peers::peer_membership_handler;
 
-fn stage_install_error_response(error: StageInstallError) -> hyper::Response<Body> {
-    let (status, message) = match error {
-        StageInstallError::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message),
-        StageInstallError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
-        StageInstallError::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+#[derive(Clone, Debug, Default)]
+pub struct PeerClusterListing {
+    pub peers: Vec<String>,
+    pub identities: Vec<PeerIdentity>,
+}
+
+pub fn normalize_peer(peer: &str) -> TCResult<String> {
+    let value = if peer.contains("://") {
+        peer.to_string()
+    } else {
+        format!("http://{peer}")
     };
-    hyper::Response::builder()
-        .status(status)
-        .body(Body::from(message))
-        .expect("replication install error response")
+    let url = url::Url::parse(&value)
+        .map_err(|error| TCError::bad_request(format!("invalid peer url: {error}")))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| TCError::bad_request("peer URL missing host"))?;
+    Ok(url.port().map_or_else(
+        || format!("{}://{host}", url.scheme()),
+        |port| format!("{}://{host}:{port}", url.scheme()),
+    ))
 }
 
 pub fn is_supported_replicated_path(path: &str) -> bool {
-    path.starts_with("/lib/") || path.starts_with("/service/")
+    path.parse::<pathlink::Link>()
+        .ok()
+        .and_then(|link| {
+            crate::application::split_application_link(&link)
+                .ok()
+                .map(|(_, segments, _)| segments)
+        })
+        .is_some_and(|segments| !segments.is_empty())
 }
 
 pub fn normalize_replicated_prefix(prefix: &str) -> TCResult<String> {
@@ -75,7 +83,7 @@ pub fn normalize_replicated_prefix(prefix: &str) -> TCResult<String> {
 
     if !is_supported_replicated_path(trimmed) {
         return Err(TCError::bad_request(format!(
-            "trusted installer prefix must start with /lib/ or /service/: {trimmed}"
+            "trusted installer prefix must start with /lib/, /class/, or /service/: {trimmed}"
         )));
     }
 
@@ -92,9 +100,13 @@ pub fn is_peer_membership_path(path: &str) -> bool {
 #[derive(Clone, Debug)]
 pub struct PeerRoutes {
     cluster_root: String,
+    #[cfg(feature = "http-server")]
     peers: String,
+    #[cfg(any(feature = "http-client", feature = "http-server"))]
     join: String,
+    #[cfg(feature = "http-server")]
     leave: String,
+    #[cfg(feature = "http-server")]
     heartbeat: String,
 }
 
@@ -102,9 +114,13 @@ impl PeerRoutes {
     pub fn new(cluster_root: &str) -> TCResult<Self> {
         let cluster_root = normalize_cluster_root(cluster_root)?;
         Ok(Self {
+            #[cfg(feature = "http-server")]
             peers: format!("{cluster_root}{PEERS_PATH_SUFFIX}"),
+            #[cfg(any(feature = "http-client", feature = "http-server"))]
             join: format!("{cluster_root}{PEERS_JOIN_PATH_SUFFIX}"),
+            #[cfg(feature = "http-server")]
             leave: format!("{cluster_root}{PEERS_LEAVE_PATH_SUFFIX}"),
+            #[cfg(feature = "http-server")]
             heartbeat: format!("{cluster_root}{PEERS_HEARTBEAT_PATH_SUFFIX}"),
             cluster_root,
         })
@@ -113,113 +129,30 @@ impl PeerRoutes {
     pub fn cluster_root(&self) -> &str {
         &self.cluster_root
     }
-
-    pub fn peers_path(&self) -> &str {
-        &self.peers
-    }
-
-    pub fn join_path(&self) -> &str {
-        &self.join
-    }
-
-    pub fn leave_path(&self) -> &str {
-        &self.leave
-    }
-
-    pub fn heartbeat_path(&self) -> &str {
-        &self.heartbeat
-    }
-
-    pub fn matches(&self, path: &str) -> bool {
-        path == self.peers || path == self.join || path == self.leave || path == self.heartbeat
-    }
 }
 
 fn normalize_cluster_root(value: &str) -> TCResult<String> {
     let root = value.trim().trim_end_matches('/');
-    if !root.starts_with("/lib/") && !root.starts_with("/service/") {
+    let supported = root
+        .parse::<pathlink::Link>()
+        .ok()
+        .and_then(|link| {
+            crate::application::split_application_link(&link).ok().map(
+                |(kind, segments, suffix)| {
+                    (kind == "lib" || kind == "service")
+                        && !segments.is_empty()
+                        && suffix.is_empty()
+                },
+            )
+        })
+        .unwrap_or(false);
+    if !supported {
         return Err(TCError::bad_request(format!(
             "invalid cluster root {root}: expected /lib/<publisher> or /service/<publisher>"
         )));
     }
 
-    if root == "/lib" || root == "/lib/" || root == "/service" || root == "/service/" {
-        return Err(TCError::bad_request(
-            "invalid cluster root: expected /lib/<publisher> or /service/<publisher>",
-        ));
-    }
-
     Ok(root.to_string())
-}
-
-struct ParticipantFanoutError {
-    delivered: ParticipantSet<String>,
-    err: TCError,
-}
-
-#[must_use]
-#[derive(Clone, Debug, Default)]
-pub struct ReplicationReport {
-    pub installed: Vec<String>,
-    pub unavailable: Vec<String>,
-    pub skipped: Vec<String>,
-    pub failed: Vec<String>,
-    discovered_paths: HashSet<String>,
-    installed_paths: HashSet<String>,
-    skipped_paths: HashSet<String>,
-    failed_paths: HashSet<String>,
-}
-
-impl ReplicationReport {
-    pub fn is_clean(&self) -> bool {
-        self.unavailable.is_empty() && self.skipped.is_empty() && self.failed.is_empty()
-    }
-
-    fn record_installed(&mut self, peer: &str, path: &str) {
-        self.installed.push(format!("{peer} {path}"));
-        self.installed_paths.insert(path.to_string());
-    }
-
-    fn record_unavailable(&mut self, peer: &str, err: impl std::fmt::Display) {
-        self.unavailable.push(format!("{peer}: {err}"));
-    }
-
-    fn record_skipped(&mut self, peer: &str, path: &str) {
-        self.skipped.push(format!("{peer} {path}"));
-        self.skipped_paths.insert(path.to_string());
-    }
-
-    fn record_failed(&mut self, peer: &str, path: &str, err: impl std::fmt::Display) {
-        self.failed.push(format!("{peer} {path}: {err}"));
-        self.failed_paths.insert(path.to_string());
-    }
-
-    fn record_discovered_path(&mut self, path: &str) {
-        self.discovered_paths.insert(path.to_string());
-    }
-
-    pub fn discovered_paths(&self) -> HashSet<String> {
-        self.discovered_paths.clone()
-    }
-
-    pub fn resolved_paths(&self) -> HashSet<String> {
-        self.installed_paths
-            .union(&self.skipped_paths)
-            .cloned()
-            .collect()
-    }
-
-    pub fn failed_paths(&self) -> HashSet<String> {
-        self.failed_paths.clone()
-    }
-
-    pub fn has_hard_failures(&self) -> bool {
-        !self.failed_paths.is_empty()
-    }
-
-    pub fn made_install_progress(&self) -> bool {
-        !self.installed_paths.is_empty()
-    }
 }
 
 #[must_use]
@@ -228,56 +161,6 @@ pub struct ClusterJoinReport {
     pub contacted: Vec<String>,
     pub failed: Vec<String>,
     pub discovered: Vec<String>,
-}
-
-pub async fn replicate_from_peers_targeted(
-    registry: &Arc<LibraryRegistry>,
-    peers: &[String],
-    keys: &[Key<Aes256GcmSiv>],
-    target_paths: Option<&HashSet<String>>,
-    gateway: &impl ClusterGateway,
-) -> ReplicationReport {
-    let mut report = ReplicationReport::default();
-
-    for peer in peers {
-        let library_paths = match gateway.discover_library_paths(peer).await {
-            Ok(paths) => paths,
-            Err(err) => {
-                report.record_unavailable(peer, err);
-                continue;
-            }
-        };
-
-        for path in library_paths {
-            report.record_discovered_path(&path);
-
-            if target_paths.is_some_and(|targets| !targets.is_empty() && !targets.contains(&path)) {
-                continue;
-            }
-
-            let token = match gateway.request_replication_token(peer, &path, keys).await {
-                Ok(token) => token,
-                Err(err) => {
-                    report.record_failed(peer, &path, err);
-                    continue;
-                }
-            };
-
-            match gateway.fetch_compiled_library_package(peer, &token).await {
-                Ok(Some(payload)) => {
-                    if let Err(err) = registry.install_compiled_package(payload).await {
-                        report.record_failed(peer, &path, err.message());
-                    } else {
-                        report.record_installed(peer, &path);
-                    }
-                }
-                Ok(None) => report.record_skipped(peer, &path),
-                Err(err) => report.record_failed(peer, &path, err),
-            }
-        }
-    }
-
-    report
 }
 
 pub async fn announce_self_to_cluster(
@@ -339,62 +222,11 @@ pub async fn announce_self_to_cluster(
     report
 }
 
-pub fn live_replicating_install_put_handler(
-    registry: Arc<LibraryRegistry>,
-    membership: PeerMembership,
-    gateway: HttpClusterGateway,
-) -> impl crate::http::HttpHandler {
-    move |req: Request<Body>| {
-        let registry = Arc::clone(&registry);
-        let membership = membership.clone();
-        let gateway = gateway.clone();
-        async move {
-            let forwarded = req
-                .headers()
-                .get(FORWARDED_HEADER)
-                .and_then(|value| value.to_str().ok())
-                == Some("1");
-
-            let txn = match req.extensions().get::<crate::txn::TxnHandle>().cloned() {
-                Some(txn) => txn,
-                None => {
-                    return text_response(StatusCode::UNAUTHORIZED, "missing transaction context");
-                }
-            };
-
-            let body = match to_bytes(req.into_body()).await {
-                Ok(body) => body,
-                Err(err) => return bad_request(err.to_string()),
-            };
-
-            match decode_authorize_and_stage_install(&registry, &txn, &body).await {
-                Ok(_) => {}
-                Err(err) => return stage_install_error_response(err),
-            }
-
-            if !forwarded {
-                let install_bytes = body.to_vec();
-                match forward_install_to_peers(&membership, &txn, install_bytes, &gateway).await {
-                    Ok(participants) => {
-                        registry.record_replication_participants(txn.id(), participants)
-                    }
-                    Err(err) => {
-                        return text_response(StatusCode::BAD_GATEWAY, err.to_string());
-                    }
-                }
-            }
-
-            empty_response(StatusCode::NO_CONTENT)
-        }
-        .boxed()
-    }
-}
-
-pub async fn forward_install_to_peers(
-    membership: &PeerMembership,
+pub(crate) async fn forward_install_to_peers(
+    peers: &std::collections::BTreeSet<String>,
     txn: &crate::txn::TxnHandle,
-    install_compiled_package: Vec<u8>,
-    gateway: &impl ClusterGateway,
+    application: CanonicalBody,
+    gateway: &dyn ClusterGateway,
 ) -> TCResult<Vec<String>> {
     let token = txn
         .raw_token()
@@ -402,133 +234,83 @@ pub async fn forward_install_to_peers(
         .to_string();
     let txn_id = txn.id();
 
-    let participants = membership.snapshot_active_peers().into_iter().collect();
-    let delivered = fanout_participants(
-        &participants,
-        "install payload",
-        ParticipantFanoutPolicy::default(),
-        |peer| {
-            let token = token.clone();
-            let payload = install_compiled_package.clone();
-            async move {
-                gateway
-                    .push_install_compiled_package(&peer, &token, txn_id, payload)
-                    .await
-            }
-        },
-    )
-    .await
-    .map_err(|err| err.err)?;
+    let delivered = fanout_peers(peers, "install payload", |peer| {
+        let token = token.clone();
+        let application = application.clone();
+        async move {
+            gateway
+                .put_application(&peer, &token, txn_id, application, txn.deadline())
+                .await
+        }
+    })
+    .await?;
 
     Ok(delivered.into_iter().collect())
 }
 
-pub fn live_replicating_finalize_hook<G>(
-    registry: Arc<LibraryRegistry>,
-    gateway: G,
-) -> impl Fn(crate::txn::TxnHandle, bool) -> futures::future::BoxFuture<'static, TCResult<()>>
-+ Send
-+ Sync
-+ 'static
-where
-    G: ClusterGateway + Clone,
-{
-    move |txn: crate::txn::TxnHandle, commit: bool| {
-        let registry = Arc::clone(&registry);
-        let gateway = gateway.clone();
-        async move {
-            let Some(participants) = registry.replication_participants(txn.id()) else {
-                return Ok(());
-            };
-
-            match forward_finalize_to_participants_progress(&participants, &txn, commit, &gateway)
-                .await
-            {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    registry.retain_unfinished_replication_participants(txn.id(), &err.delivered);
-                    Err(err.err)
-                }
-            }
-        }
-        .boxed()
-    }
-}
-
-pub async fn forward_finalize_to_peers(
-    membership: &PeerMembership,
+pub(crate) async fn forward_delete_to_peers(
+    peers: &std::collections::BTreeSet<String>,
     txn: &crate::txn::TxnHandle,
-    commit: bool,
-    gateway: &impl ClusterGateway,
+    identity: &pathlink::Link,
+    gateway: &dyn ClusterGateway,
 ) -> TCResult<()> {
-    let participants = membership.snapshot_active_peers().into_iter().collect();
-    forward_finalize_to_participants(&participants, txn, commit, gateway).await
-}
-
-async fn forward_finalize_to_participants<G>(
-    participants: &ParticipantSet<String>,
-    txn: &crate::txn::TxnHandle,
-    commit: bool,
-    gateway: &G,
-) -> TCResult<()>
-where
-    G: ClusterGateway,
-{
-    let _ = forward_finalize_to_participants_progress(participants, txn, commit, gateway)
-        .await
-        .map_err(|err| err.err)?;
-    Ok(())
-}
-
-async fn forward_finalize_to_participants_progress<G>(
-    participants: &ParticipantSet<String>,
-    txn: &crate::txn::TxnHandle,
-    commit: bool,
-    gateway: &G,
-) -> Result<ParticipantSet<String>, ParticipantFanoutError>
-where
-    G: ClusterGateway,
-{
     let token = txn
         .raw_token()
-        .ok_or_else(|| ParticipantFanoutError {
-            delivered: ParticipantSet::default(),
-            err: tc_error::TCError::unauthorized("missing bearer token"),
-        })?
+        .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?
         .to_string();
     let txn_id = txn.id();
-
-    fanout_participants(
-        participants,
-        "finalize transaction",
-        ParticipantFanoutPolicy::default(),
-        |peer| {
-            let token = token.clone();
-            async move {
-                gateway
-                    .finalize_install_txn(&peer, &token, txn_id, commit)
-                    .await
-            }
-        },
-    )
+    fanout_peers(peers, "delete application", |peer| {
+        let token = token.clone();
+        let identity = identity.clone();
+        async move {
+            gateway
+                .delete_application(&peer, &token, txn_id, &identity, txn.deadline())
+                .await
+        }
+    })
     .await
+    .map(drop)
 }
 
-async fn fanout_participants<F, Fut>(
-    participants: &ParticipantSet<String>,
+pub(crate) async fn forward_resource_decision(
+    peers: &std::collections::BTreeSet<String>,
+    txn: &crate::txn::TxnHandle,
+    resource: &pathlink::PathBuf,
+    commit: bool,
+    gateway: &dyn ClusterGateway,
+) -> TCResult<()> {
+    let token = txn
+        .raw_token()
+        .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?
+        .to_string();
+    let txn_id = txn.id();
+    fanout_peers(peers, "deliver transaction decision", |peer| {
+        let token = token.clone();
+        let resource = resource.clone();
+        async move {
+            gateway
+                .decide_resource(&peer, &token, txn_id, &resource, commit, txn.deadline())
+                .await
+        }
+    })
+    .await
+    .map(drop)
+}
+
+async fn fanout_peers<F, Fut>(
+    peers: &std::collections::BTreeSet<String>,
     operation: &str,
-    policy: ParticipantFanoutPolicy,
     apply: F,
-) -> Result<ParticipantSet<String>, ParticipantFanoutError>
+) -> TCResult<std::collections::BTreeSet<String>>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = TCResult<()>>,
 {
-    let mut delivered = ParticipantSet::default();
+    let mut delivered = std::collections::BTreeSet::new();
     let mut first_error = None;
 
-    for _ in 1..=policy.max_attempts {
-        let targets = participants
+    for _ in 0..DECISION_ATTEMPTS {
+        let targets = peers
             .iter()
             .filter(|peer| !delivered.contains(*peer))
             .cloned()
@@ -538,10 +320,12 @@ where
             return Ok(delivered);
         }
 
-        let results = join_all(targets.into_iter().map(|peer| {
+        let results = stream::iter(targets.into_iter().map(|peer| {
             let fut = apply(peer.clone());
             async move { (peer, fut.await) }
         }))
+        .buffer_unordered(FANOUT_CONCURRENCY)
+        .collect::<Vec<_>>()
         .await;
 
         for (peer, result) in results {
@@ -558,7 +342,7 @@ where
         }
     }
 
-    let unresolved = participants
+    let unresolved = peers
         .iter()
         .filter(|peer| !delivered.contains(*peer))
         .cloned()
@@ -567,53 +351,32 @@ where
     if unresolved.is_empty() {
         Ok(delivered)
     } else {
-        Err(ParticipantFanoutError {
-            delivered,
-            err: first_error.unwrap_or_else(|| {
-                TCError::bad_gateway(format!(
-                    "failed to {operation} on transaction participants: {}",
-                    unresolved.join(", ")
-                ))
-            }),
-        })
+        Err(first_error.unwrap_or_else(|| {
+            TCError::bad_gateway(format!(
+                "failed to {operation} on peers: {}",
+                unresolved.join(", ")
+            ))
+        }))
     }
 }
 
 #[cfg(test)]
 mod rpc_tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
     #[derive(Default)]
     struct CountingGateway {
-        token: AtomicUsize,
         work: AtomicUsize,
-        finalize: AtomicUsize,
+        decisions: AtomicUsize,
     }
 
     #[async_trait::async_trait]
     impl ClusterGateway for CountingGateway {
-        async fn discover_library_paths(&self, _peer: &str) -> TCResult<Vec<String>> {
-            unreachable!("transactional fanout must not perform discovery")
-        }
-
-        async fn request_replication_token(
-            &self,
-            _peer: &str,
-            _path: &str,
-            _keys: &[Key<Aes256GcmSiv>],
-        ) -> TCResult<String> {
-            self.token.fetch_add(1, Ordering::SeqCst);
-            Ok("redundant-token".to_string())
-        }
-
-        async fn fetch_compiled_library_package(
-            &self,
-            _peer: &str,
-            _token: &str,
-        ) -> TCResult<Option<crate::library::CompiledLibraryPackage>> {
-            unreachable!("transactional fanout must not fetch an artifact")
+        fn replicas(&self, _resource: &pathlink::PathBuf) -> std::collections::BTreeSet<String> {
+            std::collections::BTreeSet::from(["http://replica".to_string()])
         }
 
         async fn register_with_peer(
@@ -626,53 +389,98 @@ mod rpc_tests {
             unreachable!("transactional fanout must not register a peer")
         }
 
-        async fn push_install_compiled_package(
+        async fn put_application(
             &self,
             _peer: &str,
             _token: &str,
             _txn_id: tc_ir::TxnId,
-            _payload: Vec<u8>,
+            application: CanonicalBody,
+            _deadline: crate::Deadline,
+        ) -> TCResult<()> {
+            assert_eq!(application.identity.path()[0].as_str(), "class");
+            self.work.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn delete_application(
+            &self,
+            _peer: &str,
+            _token: &str,
+            _txn_id: tc_ir::TxnId,
+            _identity: &pathlink::Link,
+            _deadline: crate::Deadline,
         ) -> TCResult<()> {
             self.work.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
-        async fn finalize_install_txn(
+        async fn decide_resource(
             &self,
             _peer: &str,
             _token: &str,
             _txn_id: tc_ir::TxnId,
+            _resource: &pathlink::PathBuf,
             _commit: bool,
+            _deadline: crate::Deadline,
         ) -> TCResult<()> {
-            self.finalize.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            let attempt = self.decisions.fetch_add(1, Ordering::SeqCst);
+            (!matches!(attempt, 3..=5))
+                .then_some(())
+                .ok_or_else(|| TCError::bad_gateway("lost resource decision acknowledgement"))
         }
     }
 
     #[tokio::test]
-    async fn transactional_fanout_meets_the_failure_free_rpc_lower_bound() {
+    async fn work_and_resource_decisions_need_no_probe_or_finalization_rpc() {
         let peers = vec![
             "http://peer-a".to_string(),
             "http://peer-b".to_string(),
             "http://peer-c".to_string(),
         ];
-        let membership = PeerMembership::new(peers.clone());
-        let txn = crate::txn::test_txn("rpc-minimality");
-        let gateway = CountingGateway::default();
+        let peer_set = peers.iter().cloned().collect();
+        let kernel = crate::txn::test_kernel("rpc-minimality").await;
+        let txn = kernel.test_txn().await;
+        let gateway = Arc::new(CountingGateway::default());
+        let classes = &kernel.runtime.applications.classes;
+        let cluster = crate::cluster::Cluster::new(
+            classes.path().clone(),
+            classes.state().clone(),
+            Arc::clone(classes.protocol()),
+            Arc::clone(&gateway) as Arc<dyn ClusterGateway>,
+            crate::cluster::Staging::default(),
+        );
+        cluster.claim(&txn).await.expect("first cluster claim");
 
-        let prepared =
-            forward_install_to_peers(&membership, &txn, b"compiled-library".to_vec(), &gateway)
-                .await
-                .expect("prepare participants");
+        let prepared = forward_install_to_peers(
+            &peer_set,
+            &txn,
+            CanonicalBody {
+                identity: "/class/example-devco/test/1.0.0".parse().expect("identity"),
+                body: Arc::from(b"literal-class".as_slice()),
+                content_type: "application/json".to_string(),
+            },
+            gateway.as_ref(),
+        )
+        .await
+        .expect("forward work");
         let prepared = prepared.into_iter().collect();
-        forward_finalize_to_participants(&prepared, &txn, true, &gateway)
+        let resource = "/class/example-devco/test/1.0.0"
+            .parse()
+            .expect("resource path");
+        forward_resource_decision(&prepared, &txn, &resource, true, gateway.as_ref())
             .await
-            .expect("finalize participants");
+            .expect("decide resources");
+        cluster
+            .decide(&txn, crate::txn::TransactionOutcome::Rollback)
+            .await
+            .expect_err("first propagation fails visibly");
+        cluster
+            .decide(&txn, crate::txn::TransactionOutcome::Rollback)
+            .await
+            .expect("repeated decision retries propagation");
 
-        assert_eq!(prepared, peers.into_iter().collect());
-        assert_eq!(gateway.token.load(Ordering::SeqCst), 0);
-        let participant_count = prepared.iter().count();
-        assert_eq!(gateway.work.load(Ordering::SeqCst), participant_count);
-        assert_eq!(gateway.finalize.load(Ordering::SeqCst), participant_count);
+        assert_eq!(gateway.work.load(Ordering::SeqCst), peers.len());
+        let decisions = gateway.decisions.load(Ordering::SeqCst);
+        assert_eq!(decisions, peers.len() + DECISION_ATTEMPTS + 1);
     }
 }

@@ -1,16 +1,15 @@
-pub(crate) const LIB_ROOT: &str = "/lib";
-pub(crate) const CLASS_ROOT: &str = "/class";
-pub(crate) const CLASS_ROOT_PREFIX: &str = "/class/";
-pub(crate) const LIB_ROOT_PREFIX: &str = "/lib/";
-pub(crate) const SERVICE_ROOT: &str = "/service";
-pub(crate) const SERVICE_ROOT_PREFIX: &str = "/service/";
 pub(crate) const HOST_ROOT: &str = "/host";
+pub(crate) const HOST_HEALTH: &str = "/healthz";
 pub(crate) const HOST_ROOT_PREFIX: &str = "/host/";
 pub(crate) const HOST_METRICS: &str = "/host/metrics";
 pub(crate) const HOST_PUBLIC_KEY: &str = "/host/public_key";
 pub(crate) const HOST_AUTH_CONTEXT: &str = "/host/auth/context";
-pub const HOST_LIBRARY_EXPORT: &str = "/host/library/export";
+pub const HOST_TXN_PREFIX: &str = "/host/txn/";
+pub(crate) fn transaction_path(txn_id: tc_ir::TxnId) -> String {
+    format!("{HOST_TXN_PREFIX}{txn_id}")
+}
 
+#[cfg(feature = "http-client")]
 pub(crate) fn append_kernel_txn_id(
     url: &mut url::Url,
     txn_id: tc_ir::TxnId,
@@ -35,85 +34,5 @@ pub(crate) fn normalize_path(path: &str) -> &str {
         path.trim_end_matches('/')
     } else {
         path
-    }
-}
-
-pub(crate) fn component_root(path: &str) -> Option<&str> {
-    let path = normalize_path(path);
-
-    if path == LIB_ROOT {
-        return Some(path);
-    }
-
-    if path == CLASS_ROOT {
-        return Some(path);
-    }
-
-    if path == SERVICE_ROOT {
-        return Some(path);
-    }
-
-    if path == HOST_ROOT {
-        return Some(path);
-    }
-
-    if path.starts_with(LIB_ROOT_PREFIX) {
-        return component_root_with_segments(path, 4).or(Some(LIB_ROOT));
-    }
-
-    if path.starts_with(CLASS_ROOT_PREFIX) {
-        return component_root_with_segments(path, 4).or(Some(CLASS_ROOT));
-    }
-
-    if path.starts_with(SERVICE_ROOT_PREFIX) {
-        return component_root_with_segments(path, 5).or(Some(SERVICE_ROOT));
-    }
-
-    if path.starts_with(HOST_ROOT_PREFIX) {
-        return Some(HOST_ROOT);
-    }
-
-    None
-}
-
-fn component_root_with_segments(path: &str, segments: usize) -> Option<&str> {
-    debug_assert!(path.starts_with('/'));
-
-    let mut slash_indices = [0usize; 6];
-    let mut slash_count = 0usize;
-
-    for (idx, byte) in path.as_bytes().iter().enumerate() {
-        if *byte == b'/' {
-            if slash_count < slash_indices.len() {
-                slash_indices[slash_count] = idx;
-            }
-            slash_count += 1;
-        }
-    }
-
-    if slash_count < segments {
-        return None;
-    }
-
-    let end = if slash_count > segments {
-        slash_indices[segments]
-    } else {
-        path.len()
-    };
-
-    Some(&path[..end])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn class_component_root_includes_immutable_version() {
-        assert_eq!(
-            component_root("/class/acme/counter/1.0.0/increment"),
-            Some("/class/acme/counter/1.0.0")
-        );
-        assert_eq!(component_root("/class/acme"), Some(CLASS_ROOT));
     }
 }

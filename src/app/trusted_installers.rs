@@ -82,7 +82,7 @@ impl TrustedInstallerPolicy {
         for (host, actor_id, claim) in &ctx.claims {
             let path = claim.link.to_string();
 
-            if path.starts_with("/txn/") {
+            if path.starts_with(tinychain::uri::HOST_TXN_PREFIX) {
                 continue;
             }
 
@@ -149,7 +149,7 @@ impl TokenVerifier for TrustedInstallerTokenVerifier {
 
             for (host, actor_id, claim) in &ctx.claims {
                 let path = claim.link.to_string();
-                if path.starts_with("/txn/") {
+                if path.starts_with(tinychain::uri::HOST_TXN_PREFIX) {
                     continue;
                 }
 
@@ -164,9 +164,7 @@ impl TokenVerifier for TrustedInstallerTokenVerifier {
                         return Err(tinychain::txn::TxnError::Unauthorized);
                     }
 
-                    if path != tinychain::uri::HOST_LIBRARY_EXPORT
-                        && !path_matches_prefix(&path, policy.replication_root())
-                    {
+                    if !path_matches_prefix(&path, policy.replication_root()) {
                         return Err(tinychain::txn::TxnError::Unauthorized);
                     }
                 }

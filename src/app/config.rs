@@ -10,40 +10,6 @@ const DEFAULT_BIND: &str = "0.0.0.0:8702";
 const DEFAULT_DATA_DIR: &str = "/tmp/tinychain";
 const DEFAULT_WORKSPACE: &str = "/tmp/tinychain-workspace";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BootstrapReadinessMode {
-    Lenient,
-    Strict,
-}
-
-impl std::fmt::Display for BootstrapReadinessMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Lenient => write!(f, "lenient"),
-            Self::Strict => write!(f, "strict"),
-        }
-    }
-}
-
-fn parse_bootstrap_readiness_mode(value: &str) -> Result<BootstrapReadinessMode, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "lenient" => Ok(BootstrapReadinessMode::Lenient),
-        "strict" => Ok(BootstrapReadinessMode::Strict),
-        other => Err(format!(
-            "invalid bootstrap readiness mode: {other} (expected lenient|strict)"
-        )),
-    }
-}
-
-fn parse_replicate_env(value: &str) -> Result<bool, String> {
-    match value.trim() {
-        "" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        "1" | "true" | "yes" | "on" => Ok(true),
-        other => Err(format!("invalid TC_REPLICATE value: {other}")),
-    }
-}
-
 fn flatten_list(items: Vec<String>) -> Vec<String> {
     items
         .into_iter()
@@ -105,12 +71,6 @@ pub(crate) struct Config {
     #[arg(long = "advertise-ip", env = "TC_ADVERTISE_IP")]
     pub(crate) advertise_ip: Option<std::net::IpAddr>,
 
-    #[arg(long, env = "TC_REPLICATE", value_parser = parse_replicate_env, default_value_t = true)]
-    pub(crate) replicate: bool,
-
-    #[arg(long = "no-replicate", action = clap::ArgAction::SetTrue)]
-    pub(crate) no_replicate: bool,
-
     #[arg(long = "max-request-bytes", env = "TC_MAX_REQUEST_BYTES", default_value_t = 1 * 1024 * 1024)]
     pub(crate) max_request_bytes: usize,
 
@@ -129,28 +89,6 @@ pub(crate) struct Config {
         env = "TC_TRUSTED_INSTALLERS_JSON_PATH"
     )]
     pub(crate) trusted_installers_json_path: Option<PathBuf>,
-
-    #[arg(
-        long = "bootstrap-readiness",
-        env = "TC_BOOTSTRAP_READINESS",
-        default_value_t = BootstrapReadinessMode::Lenient,
-        value_parser = parse_bootstrap_readiness_mode
-    )]
-    pub(crate) bootstrap_readiness: BootstrapReadinessMode,
-
-    #[arg(
-        long = "bootstrap-max-attempts",
-        env = "TC_BOOTSTRAP_MAX_ATTEMPTS",
-        default_value_t = 5
-    )]
-    pub(crate) bootstrap_max_attempts: u8,
-
-    #[arg(
-        long = "bootstrap-retry-delay-secs",
-        env = "TC_BOOTSTRAP_RETRY_DELAY_SECS",
-        default_value_t = 2
-    )]
-    pub(crate) bootstrap_retry_delay_secs: u64,
 }
 
 impl Config {
@@ -159,10 +97,6 @@ impl Config {
 
         config.peers = flatten_list(config.peers);
         config.psk_keys = flatten_psk_list(config.psk_keys);
-
-        if config.no_replicate {
-            config.replicate = false;
-        }
 
         if config.trusted_installers_json.is_some() && config.trusted_installers_json_path.is_some()
         {
