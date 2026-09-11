@@ -1,11 +1,89 @@
 use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use pathlink::PathSegment;
+use semver::Version;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Handler, Id, Map, Route, Transact, TxnId};
 
-use super::{Cluster, DirItem, REPLICAS, ResourceHash};
+use super::{AsyncHash, Cluster, DirItem, REPLICAS};
 use crate::storage::ApplicationBlock;
+
+impl<T> Cluster<Dir<T>>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    pub(crate) fn load<F, Fut>(
+        txn_id: TxnId,
+        storage: txfs::Dir<TxnId, ApplicationBlock>,
+        path: pathlink::PathBuf,
+        root_name: &'static str,
+        protocol: Arc<crate::ProtocolAuthority>,
+        gateway: Arc<dyn crate::replication::ClusterGateway>,
+        load_item: F,
+    ) -> Pin<Box<dyn Future<Output = TCResult<Self>> + Send>>
+    where
+        F: Fn(TxnId, txfs::Dir<TxnId, ApplicationBlock>) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = TCResult<T>> + Send + 'static,
+    {
+        Box::pin(async move {
+            let entries = storage.iter(txn_id).await.map_err(TCError::from)?;
+            let mut members = Vec::new();
+            for (name, entry) in entries {
+                let name = (*name).clone();
+                let txfs::DirEntry::Dir(child) = &*entry else {
+                    return Err(TCError::bad_request(format!(
+                        "application files appear before a version at {path}/{name}",
+                    )));
+                };
+                let child_path = path.clone().append(name.clone());
+                let member = if Version::parse(name.as_str()).is_ok() {
+                    if child_path.len() < 4 {
+                        return Err(TCError::bad_request(
+                            "an application version requires a publisher and resource path",
+                        ));
+                    }
+                    let identity: pathlink::Link =
+                        child_path.to_string().parse().map_err(|error| {
+                            TCError::bad_request(format!("invalid application identity: {error}"))
+                        })?;
+                    crate::uri::validate_identity(&identity, root_name)?;
+                    let item = load_item(txn_id, child.clone()).await?;
+                    DirEntry::Item(Cluster::new(
+                        identity.path().clone(),
+                        item,
+                        Arc::clone(&protocol),
+                        Arc::clone(&gateway),
+                    ))
+                } else {
+                    if name.as_str() == ".txfs" {
+                        return Err(TCError::bad_request(
+                            ".txfs is a reserved application segment",
+                        ));
+                    }
+                    DirEntry::Dir(
+                        Self::load(
+                            txn_id,
+                            child.clone(),
+                            child_path,
+                            root_name,
+                            Arc::clone(&protocol),
+                            Arc::clone(&gateway),
+                            load_item.clone(),
+                        )
+                        .await?,
+                    )
+                };
+                members.push((name, member));
+            }
+            Ok(Cluster::new(
+                path,
+                Dir::from_committed(storage, members),
+                protocol,
+                gateway,
+            ))
+        })
+    }
+}
 
 #[derive(Clone)]
 pub(crate) enum DirEntry<T> {
@@ -23,6 +101,23 @@ pub(crate) enum Resolved<T> {
         suffix: Box<[PathSegment]>,
         ancestors: Vec<(Cluster<Dir<T>>, Id)>,
     },
+}
+
+impl<T> Resolved<T>
+where
+    T: AsyncHash + Clone + Send + Sync + 'static,
+{
+    pub(crate) async fn exact_hash(self, txn: &crate::TxnHandle) -> TCResult<[u8; 32]> {
+        match self {
+            Self::Dir { cluster, unmatched } if unmatched.is_empty() => {
+                cluster.state().hash(txn.id()).await
+            }
+            Self::Item {
+                cluster, suffix, ..
+            } if suffix.is_empty() => cluster.state().hash(txn.id()).await,
+            _ => Err(TCError::not_found("bootstrap resource")),
+        }
+    }
 }
 
 impl<T> Resolved<T> {
@@ -539,11 +634,11 @@ where
     }
 }
 
-impl<T> ResourceHash for Dir<T>
+impl<T> AsyncHash for Dir<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    async fn resource_hash(&self, txn_id: TxnId) -> TCResult<[u8; 32]> {
+    async fn hash(&self, txn_id: TxnId) -> TCResult<[u8; 32]> {
         let entries = self.entries(txn_id).await?;
         let ordered = entries
             .into_iter()

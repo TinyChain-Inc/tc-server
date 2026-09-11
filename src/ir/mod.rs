@@ -27,11 +27,12 @@ impl<'a> Handler<'a, State> for OpHandler {
             Box::new(move |txn, key| {
                 Box::pin(async move {
                     let subject = self.subject();
-                    crate::op_executor::execute_get_with_self(
+                    tc_state::StateExecutor::execute_op(
                         txn,
                         self.definition,
-                        key,
+                        State::from_scalar(key),
                         Some(subject),
+                        None,
                     )
                     .await
                 }) as tc_ir::HandlerFuture<'a, State>
@@ -47,14 +48,15 @@ impl<'a> Handler<'a, State> for OpHandler {
             Box::new(move |txn, key, value| {
                 Box::pin(async move {
                     let subject = self.subject();
-                    crate::op_executor::execute_put_with_self(
+                    tc_state::StateExecutor::execute_op(
                         txn,
                         self.definition,
-                        key,
-                        value,
+                        State::Tuple(vec![State::from_scalar(key), value]),
                         Some(subject),
+                        None,
                     )
                     .await
+                    .map(|_| ())
                 }) as tc_ir::HandlerFuture<'a, ()>
             }) as PutHandler<'a, 'txn, State>
         })
@@ -68,11 +70,12 @@ impl<'a> Handler<'a, State> for OpHandler {
             Box::new(move |txn, params| {
                 Box::pin(async move {
                     let subject = self.subject();
-                    crate::op_executor::execute_post_with_self(
+                    tc_state::StateExecutor::execute_op(
                         txn,
                         self.definition,
-                        params,
+                        State::Map(params),
                         Some(subject),
+                        None,
                     )
                     .await
                 }) as tc_ir::HandlerFuture<'a, State>
@@ -88,13 +91,15 @@ impl<'a> Handler<'a, State> for OpHandler {
             Box::new(move |txn, key| {
                 Box::pin(async move {
                     let subject = self.subject();
-                    crate::op_executor::execute_delete_with_self(
+                    tc_state::StateExecutor::execute_op(
                         txn,
                         self.definition,
-                        key,
+                        State::from_scalar(key),
                         Some(subject),
+                        None,
                     )
                     .await
+                    .map(|_| ())
                 }) as tc_ir::HandlerFuture<'a, ()>
             }) as DeleteHandler<'a, 'txn, State>
         })
@@ -143,7 +148,7 @@ pub(crate) fn compile_ir_library(definition: Scalar) -> TCResult<LibraryAnalysis
     })
 }
 
-fn application_requirements<'a>(
+pub(crate) fn application_requirements<'a>(
     values: impl IntoIterator<Item = &'a Scalar>,
 ) -> crate::txn::Requirements {
     let mut requirements = crate::txn::Requirements::new();
@@ -189,20 +194,5 @@ pub(crate) fn route_member<'a>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolves_nested_literal_members_without_a_second_directory_type() {
-        let mut nested = Map::new();
-        nested.insert(
-            "answer".parse().unwrap(),
-            Scalar::from(tc_value::Value::from(42_u64)),
-        );
-        let mut members = Map::new();
-        members.insert("nested".parse().unwrap(), Scalar::Map(nested));
-        let analysis = compile_ir_library(Scalar::Map(members)).unwrap();
-        let path = ["nested".parse().unwrap(), "answer".parse().unwrap()];
-        assert!(member(&analysis.members, &path).is_some());
-    }
-}
+#[path = "../../tests/support/ir.rs"]
+mod tests;

@@ -4,7 +4,7 @@ use pathlink::PathSegment;
 use tc_error::{TCError, TCResult};
 use tc_ir::{DeleteHandler, GetHandler, Handler, PutHandler, Route, Scalar, Transact, TxnId};
 
-use super::{Cluster, ResourceHash};
+use super::{AsyncHash, Cluster};
 
 pub(super) struct ReplicaHandler<'a, T> {
     pub(super) cluster: &'a Cluster<T>,
@@ -131,9 +131,7 @@ impl<T> Cluster<T> {
         txn.mark_resource_mutated(self.path())?;
 
         if !result.delivered.is_empty() {
-            let target: pathlink::Link = format!("{}/replicas", self.path)
-                .parse()
-                .map_err(|error| TCError::internal(format!("invalid replica route: {error}")))?;
+            let target = replicas_link(&self.path);
             for endpoint in result.failed {
                 let removal = crate::replication::forward_delete_to_peers(
                     &result.delivered,
@@ -171,9 +169,7 @@ impl<T> Cluster<T> {
             return Ok(());
         }
 
-        let target: pathlink::Link = format!("{}/replicas", self.path)
-            .parse()
-            .map_err(|error| TCError::internal(format!("invalid replica route: {error}")))?;
+        let target = replicas_link(&self.path);
         let key = Scalar::Value(tc_value::Value::String(endpoint.to_string()));
         let result = self.forward(txn, &peers, &target, key, value).await?;
         self.accept_write_fanout(txn, result).await
@@ -244,7 +240,7 @@ impl<T> Cluster<T> {
 
 impl<T> Route<crate::State> for Cluster<T>
 where
-    T: Route<crate::State> + ResourceHash,
+    T: Route<crate::State> + AsyncHash,
 {
     fn route<'a>(
         &'a self,
@@ -290,7 +286,7 @@ where
 
 impl<'a, T> Handler<'a, crate::State> for ReplicaHandler<'a, T>
 where
-    T: ResourceHash,
+    T: AsyncHash,
 {
     fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, crate::State>>
     where
@@ -329,7 +325,7 @@ where
                     .ok_or_else(|| TCError::bad_request("replica PUT requires an endpoint key"))?;
                 let (host, actor_id, algorithm, public_key_b64, expected_hash) =
                     replica_value(value)?;
-                let actual_hash = self.cluster.state.resource_hash(txn.id()).await?;
+                let actual_hash = self.cluster.state.hash(txn.id()).await?;
                 if hex::encode(actual_hash) != expected_hash {
                     return Err(TCError::conflict(
                         "replica state hash does not match this resource",
@@ -433,6 +429,16 @@ fn replica_key(path: Option<&str>, key: Scalar) -> TCResult<Option<String>> {
         }
         (path, key) => Ok(path.or(key)),
     }
+}
+
+fn replicas_link(path: &pathlink::PathBuf) -> pathlink::Link {
+    pathlink::Link::from(
+        path.clone().append(
+            super::REPLICAS
+                .parse::<pathlink::PathSegment>()
+                .expect("reserved replica segment"),
+        ),
+    )
 }
 
 fn replica_value(value: crate::State) -> TCResult<(String, String, rjwt::AlgKind, String, String)> {

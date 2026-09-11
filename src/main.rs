@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RjwtTokenVerifier::new(Arc::new(keyring.clone())),
         installer_policy,
     );
-    let resources = tinychain::HostResources::new(limits.clone());
+    let resources = tinychain::HostResources::new(limits.clone())?;
     let services = tinychain::HostServices {
         application_roots,
         replication: Arc::new(gateway.clone()),

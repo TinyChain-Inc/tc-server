@@ -28,7 +28,10 @@ provide additional, non-normative integration context.
   oldest-first cutoff scheduling, readiness, and workspace cleanup only.
 - Graph scheduling, admission, deadlines, and `OpDef` execution remain here.
   IR values expose intrinsic dependency discovery; executor-local planning stays
-  here. Recursive State resolution and native routing use `tc_state`.
+  here. The executor is private host machinery, never a public execution API.
+  Recursive State resolution and native routing use `tc_state`. Class
+  validation reports structure and declaring-method ownership only; application
+  link classification and dependency scopes remain server policy.
 
 ## Requests and adapters
 
@@ -50,6 +53,22 @@ provide additional, non-normative integration context.
   only in `client/rust`.
 - HTTP owns parsing, bounded bodies, response streaming, and wire codecs. It has
   no semantic fallback callback. Unknown kernel targets return `NotFound`.
+- HTTP pull-decodes application JSON directly into its canonical `(Link, Scalar)`
+  definition. Admission is a request-local capacity lease, never a binary body
+  carrier. Only raw WASM is materialized as bytes because those bytes are the
+  semantic application value; the lease remains held through installation and
+  terminal response success.
+- Domain and protocol values expose `destream` codecs; HTTP and persistence
+  select JSON at their real boundaries and stream it in both directions. A
+  contiguous buffer is permitted only for semantic bytes or an intrinsically
+  contiguous AEAD/WASM call, and remains bounded and owner-local. Operator JSON
+  configuration is not a TinyChain semantic wire type.
+- Decoded IR and WASM are untrusted. Every entry crosses a request guard and
+  inherits its absolute deadline, graph shape limits, shared operation budget,
+  and capacity permits. `TxnHandle` and `StateExecutor` are trusted host SPI;
+  decoded values cannot choose their declaring Class or widen a budget. A
+  `TxnHandle` carries this enforcement context but does not interpret an
+  `OpDef`; the private executor validates and interprets each definition once.
 
 ## Applications and storage
 
@@ -78,7 +97,12 @@ provide additional, non-normative integration context.
   and must not maintain parallel error mappers.
 - Bootstrap loads each recursive root once and constructs final Library, Class,
   and Service values directly. It validates the complete loaded Class graph
-  without rebuilding a second runtime tree.
+  without rebuilding a second runtime tree. Generic recursive loading belongs
+  to `Cluster<Dir<T>>`; the kernel retains only Class-before-Library-before-Service
+  orchestration.
+- Runtime Library, Class, and Service values depend on storage and execution
+  context and are not wire codecs. The one-entry literal definition is the sole
+  application wire representation.
 - Service execution and standalone named persistent collections are unsupported
   until Service and Chain own them. Do not add a server registry or placeholder.
 
@@ -89,8 +113,12 @@ provide additional, non-normative integration context.
   [transaction document](https://github.com/TinyChain-Inc/tcv2/blob/main/docs/protocol/transactions.md)
   describes the integrated protocol.
 - The first owning Cluster coordinates a successful mutation after the complete
-  request succeeds. Each exact leader propagates to replicas for its path and
-  participants do not forward.
+  request succeeds, including terminal viewing, encoding, streaming, or PyO3
+  materialization. Dropping a response guard sends no decision. The coordinator
+  is the first exact resource recorded after transaction ownership in signed
+  claim order; it is never stored separately or selected by path ordering. Each
+  exact leader propagates to replicas for its path and participants do not
+  forward.
 - Propagation is fail-fast and precedes local lifecycle application. Duplicate
   delivery replays idempotent resource behavior; no outcome or retry ledger is
   retained.
@@ -123,3 +151,6 @@ provide additional, non-normative integration context.
   and relevant HTTP/WASM/Python/two-host acceptance after ownership changes.
 - Keep handwritten unsafe code out of the crate. The foreign-runtime exception
   is owned and narrowly allowlisted elsewhere.
+- Configure Wasmtime only in the bootstrap-owned compiler. Fuel, Store resource
+  limits, compilation admission, blocking isolation, and checked ABI ranges are
+  mandatory; JSON Library construction must not initialize Wasmtime.

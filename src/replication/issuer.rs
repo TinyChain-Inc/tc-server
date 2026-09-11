@@ -1,6 +1,8 @@
 use aes_gcm_siv::{Aes256GcmSiv, Key, KeyInit};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use destream::{de, en};
+use futures::TryStreamExt;
 use tc_error::TCError;
 use tc_ir::TxnId;
 
@@ -10,26 +12,9 @@ use umask::USER_EXEC;
 use crate::auth::{Actor, KeyringActorResolver};
 
 use super::Replica;
-use super::crypto::{
-    decode_encrypted_payload, decrypt_path, encode_encrypted_payload, encrypt_path_with_key,
-};
+use super::crypto::{decrypt, encrypt_with_key};
 
-#[derive(serde::Deserialize, serde::Serialize)]
-pub(crate) struct BootstrapRequest {
-    pub(crate) resource: String,
-    txn_id: String,
-    identity: Replica,
-}
-
-#[derive(serde::Deserialize, serde::Serialize)]
-struct BootstrapResponse {
-    token: String,
-    host: String,
-    actor_id: String,
-    algorithm: rjwt::AlgKind,
-    public_key_b64: String,
-    state_hash: String,
-}
+const MAX_BOOTSTRAP_MESSAGE_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "http-client")]
 pub(crate) struct BootstrapSession {
@@ -119,36 +104,46 @@ impl ReplicationIssuer {
         self.keyring.insert(host, actor)
     }
 
-    pub fn decrypt_path_with_key(
+    pub fn decrypt_with_key(
         &self,
         nonce: &[u8],
         ciphertext: &[u8],
-    ) -> tc_error::TCResult<(String, Key<Aes256GcmSiv>)> {
+    ) -> tc_error::TCResult<(Vec<u8>, Key<Aes256GcmSiv>)> {
         for key in &self.keys {
             let cipher = Aes256GcmSiv::new(key);
-            if let Ok(path) = decrypt_path(&cipher, nonce, ciphertext) {
-                return Ok((path, *key));
+            if let Ok(plaintext) = decrypt(&cipher, nonce, ciphertext) {
+                return Ok((plaintext, *key));
             }
         }
 
         Err(TCError::bad_request("unable to decrypt replication path"))
     }
 
-    pub(crate) fn open_request(
+    pub(crate) async fn open_request(
         &self,
         txn_id: TxnId,
-        encrypted: &[u8],
-    ) -> tc_error::TCResult<(BootstrapRequest, Key<Aes256GcmSiv>)> {
-        let (nonce, ciphertext) = decode_encrypted_payload(encrypted)?;
-        let (payload, key) = self.decrypt_path_with_key(&nonce, &ciphertext)?;
-        let request: BootstrapRequest = serde_json::from_str(&payload)
-            .map_err(|error| TCError::bad_request(format!("invalid bootstrap request: {error}")))?;
-        if request.txn_id != txn_id.to_string() {
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> tc_error::TCResult<(pathlink::Link, Key<Aes256GcmSiv>)> {
+        let (payload, key) = self.decrypt_with_key(nonce, ciphertext)?;
+        let (resource, received_txn_id, endpoint, host, actor_id, algorithm, public_key_b64): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = decode_message(payload, "bootstrap request").await?;
+        let received_txn_id: TxnId = received_txn_id.parse().map_err(|error| {
+            TCError::bad_request(format!("invalid bootstrap transaction: {error}"))
+        })?;
+        if received_txn_id != txn_id {
             return Err(TCError::conflict(
                 "bootstrap transaction identity changed in transit",
             ));
         }
-        let resource: pathlink::Link = request.resource.parse().map_err(|error| {
+        let resource: pathlink::Link = resource.parse().map_err(|error| {
             TCError::bad_request(format!("invalid bootstrap resource: {error}"))
         })?;
         if !matches!(
@@ -159,18 +154,26 @@ impl ReplicationIssuer {
                 "bootstrap must name an application Cluster",
             ));
         }
-        self.register_peer_identity(&request.identity)?;
+        self.register_peer_identity(&Replica {
+            endpoint,
+            host,
+            actor_id,
+            algorithm: algorithm
+                .parse()
+                .map_err(|error: rjwt::Error| TCError::bad_request(error.to_string()))?,
+            public_key_b64,
+        })?;
 
-        Ok((request, key))
+        Ok((resource, key))
     }
 
-    pub(crate) fn seal_response(
+    pub(crate) async fn seal_response(
         &self,
         txn_id: TxnId,
         resource: pathlink::Link,
         state_hash: [u8; 32],
         key: &Key<Aes256GcmSiv>,
-    ) -> tc_error::TCResult<Vec<u8>> {
+    ) -> tc_error::TCResult<(Vec<u8>, Vec<u8>)> {
         let grants = crate::auth::wire_claim(Claim::new(
             crate::uri::transaction_path(txn_id)
                 .parse()
@@ -198,112 +201,112 @@ impl ReplicationIssuer {
                 std::time::SystemTime::now(),
             )
             .map_err(|error| TCError::unauthorized(error.to_string()))?;
-        let response = serde_json::to_string(&BootstrapResponse {
-            token: signed.into_jwt(),
-            host: self.authority.host.to_string(),
-            actor_id: self.authority.actor.id().clone(),
-            algorithm: self.authority.actor.verifying_key().alg(),
-            public_key_b64: BASE64.encode(self.authority.actor.verifying_key().to_bytes()),
-            state_hash: hex::encode(state_hash),
-        })
-        .map_err(|error| TCError::internal(format!("encode bootstrap response: {error}")))?;
-        let (nonce, ciphertext) = encrypt_path_with_key(&response, key)?;
-        encode_encrypted_payload(&nonce, &ciphertext)
+        let response = (
+            signed.into_jwt(),
+            self.authority.host.to_string(),
+            self.authority.actor.id().clone(),
+            self.authority
+                .actor
+                .verifying_key()
+                .alg()
+                .name()
+                .to_string(),
+            BASE64.encode(self.authority.actor.verifying_key().to_bytes()),
+            hex::encode(state_hash),
+        );
+        let response = encode_message(&response).await?;
+        encrypt_with_key(&response, key)
     }
 
     #[cfg(feature = "http-client")]
-    pub(crate) fn bootstrap_requests(
+    pub(crate) async fn bootstrap_requests(
         &self,
         txn_id: TxnId,
         resource: &pathlink::Link,
         identity: &Replica,
-    ) -> tc_error::TCResult<Vec<Vec<u8>>> {
-        let request = serde_json::to_string(&BootstrapRequest {
-            resource: resource.to_string(),
-            txn_id: txn_id.to_string(),
-            identity: identity.clone(),
-        })
-        .map_err(|error| TCError::internal(format!("encode bootstrap request: {error}")))?;
+    ) -> tc_error::TCResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let request = (
+            resource.to_string(),
+            txn_id.to_string(),
+            identity.endpoint.clone(),
+            identity.host.clone(),
+            identity.actor_id.clone(),
+            identity.algorithm.name().to_string(),
+            identity.public_key_b64.clone(),
+        );
+        let request = encode_message(&request).await?;
         self.keys
             .iter()
-            .map(|key| {
-                let (nonce, ciphertext) = encrypt_path_with_key(&request, key)?;
-                encode_encrypted_payload(&nonce, &ciphertext)
-            })
+            .map(|key| encrypt_with_key(&request, key))
             .collect()
     }
 
     #[cfg(feature = "http-client")]
-    pub(crate) fn open_response(
+    pub(crate) async fn open_response(
         &self,
         endpoint: String,
-        encrypted: &[u8],
+        nonce: &[u8],
+        ciphertext: &[u8],
     ) -> tc_error::TCResult<BootstrapSession> {
-        let (nonce, ciphertext) = decode_encrypted_payload(encrypted)?;
-        let (response, _) = self.decrypt_path_with_key(&nonce, &ciphertext)?;
-        let response: BootstrapResponse = serde_json::from_str(&response).map_err(|error| {
-            TCError::bad_gateway(format!("invalid bootstrap response: {error}"))
-        })?;
+        let (response, _) = self.decrypt_with_key(nonce, ciphertext)?;
+        let (token, host, actor_id, algorithm, public_key_b64, state_hash): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = decode_message(response, "bootstrap response").await?;
         let replica = Replica {
             endpoint,
-            host: response.host,
-            actor_id: response.actor_id,
-            algorithm: response.algorithm,
-            public_key_b64: response.public_key_b64,
+            host,
+            actor_id,
+            algorithm: algorithm
+                .parse()
+                .map_err(|error: rjwt::Error| TCError::bad_gateway(error.to_string()))?,
+            public_key_b64,
         };
         self.register_peer_identity(&replica)?;
         Ok(BootstrapSession {
-            token: response.token,
+            token,
             replica,
-            state_hash: response.state_hash,
+            state_hash,
         })
     }
 }
 
-#[cfg(all(test, feature = "http-client"))]
-mod tests {
-    use super::*;
-
-    fn issuer(label: &str, keys: Vec<Key<Aes256GcmSiv>>) -> ReplicationIssuer {
-        let actor = Actor::new_falcon512(label.to_string()).expect("test actor");
-        let authority = std::sync::Arc::new(crate::ProtocolAuthority::new(
-            format!("https://{label}.example").parse().expect("host"),
-            actor,
-        ));
-        ReplicationIssuer::new(authority, keys, KeyringActorResolver::default())
-            .expect("replication issuer")
-    }
-
-    #[test]
-    fn psk_rotation_accepts_overlap_and_rejects_a_retired_key() {
-        let old = Key::<Aes256GcmSiv>::from([7; 32]);
-        let new = Key::<Aes256GcmSiv>::from([8; 32]);
-        let seed = issuer("seed", vec![old, new]);
-        let old_client = issuer("old-client", vec![old]);
-        let new_client = issuer("new-client", vec![new]);
-        let txn_id = TxnId::from_parts(tc_ir::NetworkTime::from_nanos(1), 0);
-        let resource: pathlink::Link = "/lib".parse().expect("resource");
-
-        for client in [&old_client, &new_client] {
-            let identity = client
-                .self_identity("http://127.0.0.1:8702".to_string())
-                .expect("identity");
-            let encrypted = client
-                .bootstrap_requests(txn_id, &resource, &identity)
-                .expect("bootstrap request")
-                .remove(0);
-            seed.open_request(txn_id, &encrypted)
-                .expect("overlapping PSK accepted");
-        }
-
-        let rotated = issuer("rotated-seed", vec![new]);
-        let identity = old_client
-            .self_identity("http://127.0.0.1:8703".to_string())
-            .expect("identity");
-        let encrypted = old_client
-            .bootstrap_requests(txn_id, &resource, &identity)
-            .expect("bootstrap request")
-            .remove(0);
-        assert!(rotated.open_request(txn_id, &encrypted).is_err());
-    }
+async fn encode_message<T>(value: &T) -> tc_error::TCResult<Vec<u8>>
+where
+    T: for<'en> en::ToStream<'en>,
+{
+    destream_json::encode(value)
+        .map_err(|error| TCError::internal(format!("encode bootstrap message: {error}")))?
+        .map_err(|error| TCError::internal(format!("encode bootstrap message: {error}")))
+        .try_fold(Vec::new(), |mut bytes, chunk| async move {
+            if bytes.len().saturating_add(chunk.len()) > MAX_BOOTSTRAP_MESSAGE_BYTES {
+                return Err(TCError::bad_request("bootstrap message exceeds its bound"));
+            }
+            bytes.extend_from_slice(&chunk);
+            Ok(bytes)
+        })
+        .await
 }
+
+async fn decode_message<T>(bytes: Vec<u8>, label: &str) -> tc_error::TCResult<T>
+where
+    T: de::FromStream<Context = ()>,
+{
+    if bytes.len() > MAX_BOOTSTRAP_MESSAGE_BYTES {
+        return Err(TCError::bad_request(format!("{label} exceeds its bound")));
+    }
+    destream_json::try_decode(
+        (),
+        futures::stream::iter([Ok::<_, std::io::Error>(bytes.into())]),
+    )
+    .await
+    .map_err(|error| TCError::bad_request(format!("invalid {label}: {error}")))
+}
+
+#[cfg(all(test, feature = "http-client"))]
+#[path = "../../tests/support/replication_issuer.rs"]
+mod tests;

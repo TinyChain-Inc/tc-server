@@ -17,7 +17,7 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
             Box::pin(async move {
                 let (identity, definition) = crate::literal::into_put(key, value)?;
                 let segments = crate::uri::validate_identity(&identity, "service")?;
-                if !txn.has_claim(&identity, umask::USER_WRITE) {
+                if !txn.may_mutate(&identity, self.0.path()) {
                     return Err(TCError::unauthorized("unauthorized Service install"));
                 }
                 let expected = definition.clone();
@@ -157,8 +157,8 @@ impl crate::cluster::DirItem for Service {
     }
 }
 
-impl crate::cluster::ResourceHash for Service {
-    async fn resource_hash(&self, _txn_id: TxnId) -> TCResult<[u8; 32]> {
+impl crate::cluster::AsyncHash for Service {
+    async fn hash(&self, _txn_id: TxnId) -> TCResult<[u8; 32]> {
         Ok(async_hash::Hash::<async_hash::Sha256>::hash(&self.definition).into())
     }
 }
@@ -184,7 +184,7 @@ impl<'a> Handler<'a, crate::State> for &'a Service {
                         "Service deletion requires an explicit JSON null",
                     ));
                 }
-                if !txn.has_claim(self.identity(), umask::USER_WRITE) {
+                if !txn.may_mutate(self.identity(), self.identity().path()) {
                     return Err(TCError::unauthorized("unauthorized Service deletion"));
                 }
                 Ok(())

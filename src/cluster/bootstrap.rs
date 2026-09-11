@@ -16,13 +16,7 @@ impl<T: DirItem> Cluster<Dir<T>> {
         let (txn, session) = kernel.bootstrap_resource(seed, &root, identity).await?;
         let resources = seed_tree(kernel, seed, identity, &session.token, &txn, &root).await?;
         kernel
-            .coordinate(
-                &txn,
-                &txn.coordinator()
-                    .ok_or_else(|| TCError::conflict("bootstrap has no coordinator"))?,
-                crate::txn::TransactionOutcome::Commit,
-                true,
-            )
+            .coordinate(&txn, crate::txn::TransactionOutcome::Commit, true)
             .await?;
 
         let mut peers = BTreeSet::new();
@@ -70,13 +64,7 @@ impl<T: DirItem> Cluster<Dir<T>> {
             )
             .await?;
         kernel
-            .coordinate(
-                &txn,
-                &txn.coordinator()
-                    .ok_or_else(|| TCError::conflict("bootstrap has no coordinator"))?,
-                crate::txn::TransactionOutcome::Commit,
-                true,
-            )
+            .coordinate(&txn, crate::txn::TransactionOutcome::Commit, true)
             .await?;
         Ok(peers)
     }
@@ -95,9 +83,15 @@ async fn seed_tree(
     let mut items = Vec::new();
     while let Some((directory, token)) = directories.pop_front() {
         resources.push(directory.clone());
-        let state =
-            crate::replication::read_seed_state(seed, &token, txn.id(), &directory, txn.deadline())
-                .await?;
+        let state = crate::replication::read_seed_state(
+            seed,
+            &token,
+            txn.id(),
+            &directory,
+            txn.deadline(),
+            txn.resources().limits().ingress.request_body_bytes,
+        )
+        .await?;
         let crate::State::Map(entries) = state else {
             return Err(TCError::bad_gateway(format!(
                 "seed directory {directory} did not return a membership map"
@@ -122,6 +116,7 @@ async fn seed_tree(
                     txn.id(),
                     &child,
                     txn.deadline(),
+                    txn.resources().limits().ingress.application_body_bytes,
                 )
                 .await?;
                 kernel.install_seed_item(txn, child.clone(), state).await?;
@@ -151,7 +146,15 @@ async fn seed_replica_endpoints(
     target: &pathlink::Link,
     deadline: crate::Deadline,
 ) -> TCResult<BTreeSet<String>> {
-    let state = crate::replication::read_seed_state(seed, token, txn_id, target, deadline).await?;
+    let state = crate::replication::read_seed_state(
+        seed,
+        token,
+        txn_id,
+        target,
+        deadline,
+        crate::literal::MAX_DEFINITION_BYTES,
+    )
+    .await?;
     let crate::State::Tuple(replicas) = state else {
         return Err(TCError::bad_gateway("seed replicas were not a tuple"));
     };

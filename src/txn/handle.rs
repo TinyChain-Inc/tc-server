@@ -1,7 +1,7 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt, sync::Arc, time::SystemTime};
 
 use pathlink::Link;
-use safecast::TryCastFrom;
 use tc_error::TCError;
 use tc_ir::{Transaction, TxnId};
 use umask::Mode;
@@ -9,10 +9,34 @@ use umask::Mode;
 use crate::Claim;
 use crate::auth::{Actor, AuthContext, SignedToken, Token};
 
+fn execution_unavailable(message: impl std::fmt::Display) -> TCError {
+    TCError::resource_unavailable(
+        message,
+        tc_error::Pressure::new("/host/resource/graph", tc_error::PressureReason::Saturated),
+    )
+}
+
 #[derive(Clone)]
 pub(crate) enum ExecutionScope {
     Host,
     Application(Arc<crate::txn::DependencyScope>),
+}
+
+pub(super) struct ClaimContext {
+    pub(super) signed: Option<Arc<SignedToken>>,
+    pub(super) mutated: bool,
+}
+
+pub(super) struct ExecutionBudget {
+    remaining: AtomicUsize,
+}
+
+impl ExecutionBudget {
+    pub(super) fn new(invocations: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(invocations),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -22,10 +46,13 @@ pub struct TxnHandle {
     pub(crate) kernel: Arc<crate::kernel::KernelInner>,
     pub(super) scope: ExecutionScope,
     pub(super) auth_context: Option<AuthContext>,
-    pub(crate) protocol_claims: Arc<parking_lot::Mutex<crate::cluster::ClaimState>>,
+    pub(super) protocol_claims: Arc<parking_lot::Mutex<ClaimContext>>,
+    pub(super) autocommit: bool,
     pub(super) workspace_path: Vec<String>,
     pub(super) deadline: crate::Deadline,
     pub(super) graph_admitted: bool,
+    pub(super) execution_budget: Arc<ExecutionBudget>,
+    pub(super) execution_depth: usize,
 }
 
 impl TxnHandle {
@@ -51,10 +78,6 @@ impl TxnHandle {
         self.protocol_snapshot()
             .map(|claims| claims.leaders.into_keys().collect())
             .unwrap_or_default()
-    }
-
-    pub(crate) fn coordinator(&self) -> Option<pathlink::PathBuf> {
-        self.protocol_claims.lock().coordinator.clone()
     }
 
     pub(crate) fn mark_resource_mutated(&self, path: &pathlink::PathBuf) -> tc_error::TCResult<()> {
@@ -126,26 +149,17 @@ impl TxnHandle {
                     .map_err(|error| TCError::unauthorized(error.to_string()))?
             };
             claims.signed = Some(Arc::new(signed));
-            if ownerless {
-                claims.coordinator = Some(path.clone());
-            }
         }
         Ok(())
     }
 
     pub(crate) fn lock_coordinator(
         &self,
-        coordinator: &pathlink::PathBuf,
         require_mutation: bool,
-    ) -> tc_error::TCResult<bool> {
+    ) -> tc_error::TCResult<Option<pathlink::PathBuf>> {
         let mut claims = self.protocol_claims.lock();
-        if require_mutation && (!claims.autocommit || !claims.mutated) {
-            return Ok(false);
-        }
-        if claims.coordinator.as_ref() != Some(coordinator) {
-            return Err(TCError::unauthorized(
-                "only the first owning resource may coordinate a decision",
-            ));
+        if require_mutation && (!self.autocommit || !claims.mutated) {
+            return Ok(None);
         }
         let snapshot = claims
             .signed
@@ -153,6 +167,9 @@ impl TxnHandle {
             .map(|token| crate::txn::protocol_snapshot(self.id, token))
             .transpose()?
             .ok_or_else(|| TCError::conflict("cannot decide an ownerless transaction"))?;
+        let coordinator = snapshot
+            .coordinator
+            .ok_or_else(|| TCError::conflict("transaction has no resource coordinator"))?;
         let owner = snapshot
             .owner
             .ok_or_else(|| TCError::conflict("cannot decide an ownerless transaction"))?;
@@ -179,7 +196,7 @@ impl TxnHandle {
                 .map_err(|error| TCError::unauthorized(error.to_string()))?;
             claims.signed = Some(Arc::new(signed));
         }
-        Ok(true)
+        Ok(Some(coordinator))
     }
 
     pub fn subcontext(&self, name: impl Into<String>) -> Self {
@@ -215,6 +232,32 @@ impl TxnHandle {
         let mut txn = self.clone();
         txn.graph_admitted = true;
         txn
+    }
+
+    async fn enter_execution(&self) -> tc_error::TCResult<Self> {
+        if self.deadline.is_expired() {
+            return Err(self.deadline.exceeded());
+        }
+        let limits = &self.resources().limits().execution;
+        if self.execution_depth >= limits.max_execution_depth {
+            return Err(execution_unavailable(format!(
+                "operation nesting exceeds the {}-level limit",
+                limits.max_execution_depth
+            )));
+        }
+        self.execution_budget
+            .remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .map_err(|_| execution_unavailable("operation invocation budget exhausted"))?;
+        tokio::task::yield_now().await;
+        if self.deadline.is_expired() {
+            return Err(self.deadline.exceeded());
+        }
+        let mut txn = self.clone();
+        txn.execution_depth += 1;
+        Ok(txn)
     }
 
     pub(crate) fn for_application(&self, scope: Arc<crate::txn::DependencyScope>) -> Self {
@@ -273,6 +316,12 @@ impl TxnHandle {
                     .iter()
                     .any(|claim| claim.claim.allows(link, required))
             })
+    }
+
+    /// Forwarded work is authorized only by a verified claim for this exact resource.
+    pub(crate) fn may_mutate(&self, identity: &Link, resource: &pathlink::PathBuf) -> bool {
+        self.has_claim(identity, umask::USER_WRITE)
+            || (!self.autocommit && self.leader(resource).is_some())
     }
 
     pub fn auth_context(&self) -> Option<&AuthContext> {
@@ -459,60 +508,24 @@ impl tc_state::StateExecutor for TxnHandle {
         subject: Option<crate::State>,
         declared_by: Option<Link>,
     ) -> tc_error::TCResult<crate::State> {
+        let entered = self.enter_execution().await?;
         let txn = if let Some(identity) = declared_by {
-            let class = self.class(&identity).await?;
-            self.for_application(class.state().scope())
+            let class = entered.class(&identity).await?;
+            entered.for_application(class.state().scope())
         } else {
             match &subject {
                 Some(crate::State::Object(object)) => match object.as_ref() {
                     tc_state::Object::Instance(instance) => {
                         let identity = instance.class().identity();
-                        let class = self.class(identity).await?;
-                        self.for_application(class.state().scope())
+                        let class = entered.class(identity).await?;
+                        entered.for_application(class.state().scope())
                     }
-                    _ => self.clone(),
+                    _ => entered.clone(),
                 },
-                _ => self.clone(),
+                _ => entered.clone(),
             }
         };
-        match definition {
-            definition @ tc_ir::OpDef::Get(_) => {
-                let key = tc_ir::Scalar::try_cast_from(args, |_| {
-                    TCError::bad_request("GET OpDef expects a scalar key")
-                })?;
-                crate::op_executor::execute_get_with_self(&txn, definition, key, subject).await
-            }
-            definition @ tc_ir::OpDef::Put(_) => {
-                let crate::State::Tuple(mut args) = args else {
-                    return Err(TCError::bad_request("PUT OpDef expects [key, value]"));
-                };
-                if args.len() != 2 {
-                    return Err(TCError::bad_request("PUT OpDef expects [key, value]"));
-                }
-                let value = args.pop().expect("PUT argument length checked");
-                let key = tc_ir::Scalar::try_cast_from(
-                    args.pop().expect("PUT argument length checked"),
-                    |_| TCError::bad_request("PUT OpDef expects a scalar key"),
-                )?;
-                crate::op_executor::execute_put_with_self(&txn, definition, key, value, subject)
-                    .await?;
-                Ok(crate::State::default())
-            }
-            definition @ tc_ir::OpDef::Post(_) => {
-                let crate::State::Map(params) = args else {
-                    return Err(TCError::bad_request("POST OpDef expects a parameter map"));
-                };
-                crate::op_executor::execute_post_with_self(&txn, definition, params, subject).await
-            }
-            definition @ tc_ir::OpDef::Delete(_) => {
-                let key = tc_ir::Scalar::try_cast_from(args, |_| {
-                    TCError::bad_request("DELETE OpDef expects a scalar key")
-                })?;
-                crate::op_executor::execute_delete_with_self(&txn, definition, key, subject)
-                    .await?;
-                Ok(crate::State::default())
-            }
-        }
+        crate::op_executor::execute(&txn, definition, args, subject).await
     }
 }
 

@@ -1,34 +1,34 @@
 use super::*;
 use tc_ir::Public;
-async fn manifest(identity: &pathlink::Link, value: &tc_ir::Scalar) -> std::sync::Arc<[u8]> {
-    crate::literal::encode(identity, value, crate::literal::MAX_DEFINITION_BYTES)
-        .await
-        .expect("encode manifest")
-        .into()
-}
 async fn stage_service(
     kernel: &Kernel,
     txn: &crate::TxnHandle,
     identity: pathlink::Link,
     definition: tc_ir::Scalar,
-) {
-    kernel
-        .execute(
-            KernelTarget::Application("/service".parse().expect("application target")),
-            txn.clone(),
-            Method::Put,
-            Some(crate::State::Tuple(vec![
-                crate::State::from(tc_value::Value::Link(identity)),
-                crate::State::from_scalar(definition),
-            ])),
-        )
+) -> KernelRequestGuard {
+    let deadline = txn.deadline();
+    let guard = KernelRequestGuard {
+        kernel: kernel.clone(),
+        method: Method::Put,
+        target: KernelTarget::Application("/service".parse().expect("application target")),
+        txn: txn.clone(),
+        _permit: kernel
+            .resources()
+            .admit_request(deadline)
+            .await
+            .expect("request admission"),
+    };
+    guard
+        .execute(Some(crate::State::Tuple(vec![
+            crate::State::from(tc_value::Value::Link(identity)),
+            crate::State::from_scalar(definition),
+        ])))
         .await
         .expect("stage Service");
+    guard
 }
 async fn kernel(name: &str) -> Kernel {
-    setup_with_ttl(name, std::time::Duration::from_secs(3))
-        .await
-        .0
+    setup_with_ttl(name, std::time::Duration::from_secs(3)).await
 }
 async fn execute(
     kernel: &Kernel,
@@ -52,9 +52,8 @@ async fn bind(kernel: &Kernel) -> crate::TxnHandle {
         .with_deadline(kernel.resources().deadline())
 }
 async fn complete(kernel: &Kernel, txn: crate::TxnHandle, outcome: crate::txn::TransactionOutcome) {
-    let coordinator = txn.coordinator().expect("transaction coordinator");
     kernel
-        .coordinate(&txn, &coordinator, outcome, false)
+        .coordinate(&txn, outcome, false)
         .await
         .expect("complete transaction");
 }
@@ -75,20 +74,17 @@ async fn collection_type_routes_do_not_host_named_resources() {
         .expect_err("a deeper collection URI must not resolve as a hosted resource");
     assert_eq!(error.code(), tc_error::ErrorKind::NotFound);
 }
-async fn setup(name: &str) -> (Kernel, std::sync::Arc<crate::kernel::KernelInner>) {
+async fn setup(name: &str) -> Kernel {
     setup_with_ttl(name, std::time::Duration::from_secs(3)).await
 }
-async fn setup_with_ttl(
-    name: &str,
-    ttl: std::time::Duration,
-) -> (Kernel, std::sync::Arc<crate::kernel::KernelInner>) {
+async fn setup_with_ttl(name: &str, ttl: std::time::Duration) -> Kernel {
     setup_with_bootstrap(name, ttl, false).await
 }
 async fn setup_with_bootstrap(
     name: &str,
     ttl: std::time::Duration,
     bootstrap_required: bool,
-) -> (Kernel, std::sync::Arc<crate::kernel::KernelInner>) {
+) -> Kernel {
     let workspace = crate::txn::test_workspace(name);
     let host: pathlink::Link = crate::uri::HOST_ROOT.parse().expect("host link");
     let (protocol, actor) = workspace
@@ -129,13 +125,12 @@ async fn setup_with_bootstrap(
     )
     .await
     .expect("construct kernel");
-    let runtime = std::sync::Arc::clone(&kernel.inner);
-    (kernel, runtime)
+    kernel
 }
 
 #[tokio::test]
 async fn configured_seed_bootstrap_gates_readiness() {
-    let (kernel, _) = setup_with_bootstrap(
+    let kernel = setup_with_bootstrap(
         "bootstrap-readiness",
         std::time::Duration::from_secs(3),
         true,
@@ -145,7 +140,7 @@ async fn configured_seed_bootstrap_gates_readiness() {
 }
 #[tokio::test]
 async fn service_discovery_and_delete_use_the_native_owner_path() {
-    let (kernel, _applications) = setup("service-native").await;
+    let kernel = setup("service-native").await;
     let identity: pathlink::Link = "/service/example-devco/catalog/1.0.0"
         .parse()
         .expect("identity");
@@ -155,8 +150,13 @@ async fn service_discovery_and_delete_use_the_native_owner_path() {
         identity.clone(),
         umask::Mode::all(),
     )]);
-    stage_service(&kernel, &txn, identity.clone(), manifest).await;
-    complete(&kernel, txn, crate::txn::TransactionOutcome::Commit).await;
+    let guard = stage_service(&kernel, &txn, identity.clone(), manifest).await;
+    assert!(
+        !txn.is_locked(),
+        "routing must not commit before projection"
+    );
+    guard.finish_success().await.expect("terminal success");
+    assert!(txn.is_locked(), "terminal success must trigger autocommit");
     let txn = bind(&kernel).await;
     let state = execute(
         &kernel,
@@ -217,7 +217,7 @@ async fn service_discovery_and_delete_use_the_native_owner_path() {
 }
 #[tokio::test]
 async fn class_instance_routes_bound_methods_with_concrete_self() {
-    let (kernel, _applications) = setup("class-self").await;
+    let kernel = setup("class-self").await;
     let identity: pathlink::Link = "/class/example-devco/named/1.0.0"
         .parse()
         .expect("identity");
@@ -245,7 +245,6 @@ async fn class_instance_routes_bound_methods_with_concrete_self() {
         umask::Mode::all(),
     )]);
     let definition = definition.definition();
-    let _bytes = manifest(&identity, &definition).await;
     execute(
         &kernel,
         Method::Put,
@@ -305,9 +304,7 @@ async fn binds_an_ownerless_transaction_for_native_execution() {
 }
 #[tokio::test]
 async fn ttl_worker_finalizes_an_abandoned_transaction() {
-    let kernel = setup_with_ttl("ttl", std::time::Duration::from_millis(10))
-        .await
-        .0;
+    let kernel = setup_with_ttl("ttl", std::time::Duration::from_millis(10)).await;
     let txn = kernel
         .txn_server
         .bind(None, None, std::sync::Arc::clone(&kernel.inner))
@@ -339,32 +336,16 @@ async fn decisions_delegate_repeatedly_until_time_based_finalization() {
         .claim(&txn)
         .await
         .expect("claim resource");
-    let coordinator = txn.coordinator().expect("transaction coordinator");
     kernel
-        .coordinate(
-            &txn,
-            &coordinator,
-            crate::txn::TransactionOutcome::Rollback,
-            false,
-        )
+        .coordinate(&txn, crate::txn::TransactionOutcome::Rollback, false)
         .await
         .expect("first decision");
     kernel
-        .coordinate(
-            &txn,
-            &coordinator,
-            crate::txn::TransactionOutcome::Rollback,
-            false,
-        )
+        .coordinate(&txn, crate::txn::TransactionOutcome::Rollback, false)
         .await
         .expect("duplicate decision");
     kernel
-        .coordinate(
-            &txn,
-            &coordinator,
-            crate::txn::TransactionOutcome::Commit,
-            false,
-        )
+        .coordinate(&txn, crate::txn::TransactionOutcome::Commit, false)
         .await
         .expect("opposite decision delegates to the idempotent resource lifecycle");
     let error = kernel
@@ -379,7 +360,7 @@ async fn decisions_delegate_repeatedly_until_time_based_finalization() {
 }
 #[tokio::test]
 async fn a_locked_empty_put_decides_only_its_exact_resource() {
-    let (kernel, _applications) = setup("exact-resource-decision").await;
+    let kernel = setup("exact-resource-decision").await;
     let identity: pathlink::Link = "/service/example-devco/nested/catalog/1.0.0"
         .parse()
         .expect("identity");
@@ -389,7 +370,7 @@ async fn a_locked_empty_put_decides_only_its_exact_resource() {
         umask::Mode::all(),
     )]);
     let definition = tc_ir::Scalar::Map(tc_ir::Map::new());
-    stage_service(&kernel, &txn, identity.clone(), definition).await;
+    let _guard = stage_service(&kernel, &txn, identity.clone(), definition).await;
     let active_bearer = txn.raw_token().expect("protocol token").to_string();
     let error = match kernel
         .begin_request(
@@ -532,7 +513,7 @@ async fn an_unlocked_empty_mutation_is_ordinary_invalid_input() {
 }
 #[tokio::test]
 async fn a_locked_decision_excludes_new_work() {
-    let (kernel, applications) = setup("decision-work-race").await;
+    let kernel = setup("decision-work-race").await;
     let identity: pathlink::Link = "/service/example-devco/race/1.0.0"
         .parse()
         .expect("identity");
@@ -555,7 +536,8 @@ async fn a_locked_decision_excludes_new_work() {
         .await
         .expect("bind decision");
     assert!(guard.execute(None).await.expect("decision").is_none());
-    let error = applications
+    let error = kernel
+        .inner
         .classes
         .claim(&txn)
         .await

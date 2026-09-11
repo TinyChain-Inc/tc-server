@@ -156,6 +156,17 @@ mod rjwt_token {
         pub fn public_key(&self, actor_id: &str) -> Option<VerifyingKey> {
             self.0.read().keys.get(actor_id).cloned()
         }
+
+        pub(crate) fn public_key_state(&self, actor_id: &str) -> tc_error::TCResult<crate::State> {
+            use base64::Engine as _;
+
+            let key = self
+                .public_key(actor_id)
+                .ok_or_else(|| tc_error::TCError::not_found(actor_id))?;
+            Ok(crate::State::from(tc_value::Value::from(
+                base64::engine::general_purpose::STANDARD.encode(key.to_bytes()),
+            )))
+        }
     }
 
     pub fn verifying_key_from_bytes(

@@ -1,19 +1,6 @@
 use crate::State;
 use tc_ir::Method;
 
-#[cfg(feature = "http-server")]
-pub(crate) struct AdmittedBody {
-    bytes: std::sync::Arc<[u8]>,
-    _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
-}
-
-#[cfg(feature = "http-server")]
-impl AdmittedBody {
-    pub(crate) fn shared(&self) -> std::sync::Arc<[u8]> {
-        std::sync::Arc::clone(&self.bytes)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BodyContract {
     Application { max_bytes: usize },
@@ -39,13 +26,8 @@ pub struct KernelRequestGuard {
 
 impl KernelRequestGuard {
     #[cfg(feature = "http-server")]
-    pub(crate) fn returns_wasm(&self, state: &State) -> bool {
-        self.method == Method::Get
-            && matches!(&self.target, KernelTarget::Application(target) if target.path().first().is_some_and(|root| root.as_str() == "lib"))
-            && matches!(
-                state,
-                State::Scalar(tc_ir::Scalar::Value(tc_value::Value::Bytes(_)))
-            )
+    pub(crate) fn request(&self) -> (Method, &KernelTarget) {
+        (self.method, &self.target)
     }
 
     pub fn txn(&self) -> &crate::TxnHandle {
@@ -92,78 +74,29 @@ impl KernelRequestGuard {
     }
 
     pub async fn execute(&self, body: Option<State>) -> tc_error::TCResult<Option<State>> {
-        let state = self
-            .kernel
-            .execute(self.target.clone(), self.txn.clone(), self.method, body)
-            .await?;
-        // Only this outer request boundary knows that nested graph execution has
-        // completed successfully. It reports success; the first claimed Cluster
-        // remains the sole owner of whether and how to commit its resources.
-        if state.is_some() {
-            if let Some(coordinator) = self.txn.coordinator() {
+        self.deadline()
+            .run(
                 self.kernel
-                    .coordinate(
-                        &self.txn,
-                        &coordinator,
-                        crate::txn::TransactionOutcome::Commit,
-                        true,
-                    )
-                    .await?;
-            }
-        }
-        Ok(state)
+                    .execute(self.target.clone(), self.txn.clone(), self.method, body),
+            )
+            .await
+    }
+
+    /// Report that routing and terminal response projection both succeeded.
+    ///
+    /// Dropping a guard never selects an outcome. The first owning Cluster remains
+    /// responsible for deciding whether this successful request mutated anything.
+    pub async fn finish_success(self) -> tc_error::TCResult<()> {
+        self.kernel
+            .coordinate(&self.txn, crate::txn::TransactionOutcome::Commit, true)
+            .await
     }
 
     pub async fn execute_bound(
         self,
         body: Option<State>,
     ) -> tc_error::TCResult<(Option<State>, Self)> {
-        match self.execute(body).await {
-            Ok(state) => Ok((state, self)),
-            Err(error) => Err(error),
-        }
-    }
-
-    #[cfg(feature = "http-server")]
-    pub(crate) async fn admit_body<S>(
-        &self,
-        input: S,
-        max_bytes: usize,
-    ) -> tc_error::TCResult<AdmittedBody>
-    where
-        S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
-    {
-        use futures::TryStreamExt;
-
-        let resources = self.txn.resources().clone();
-        let deadline = self.deadline();
-        let (bytes, permits) = input
-            .try_fold(
-                (Vec::new(), Vec::new()),
-                move |(mut bytes, mut permits), chunk| {
-                    let resources = resources.clone();
-                    async move {
-                        if bytes.len().saturating_add(chunk.len()) > max_bytes {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "application body exceeds its request bound",
-                            ));
-                        }
-                        let permit = resources
-                            .admit_application_bytes(chunk.len(), deadline)
-                            .await
-                            .map_err(|error| std::io::Error::other(error.to_string()))?;
-                        bytes.extend_from_slice(&chunk);
-                        permits.push(permit);
-                        Ok((bytes, permits))
-                    }
-                },
-            )
-            .await
-            .map_err(|error| tc_error::TCError::bad_request(error.to_string()))?;
-        Ok(AdmittedBody {
-            bytes: bytes.into(),
-            _permits: permits,
-        })
+        let state = self.execute(body).await?;
+        Ok((state, self))
     }
 }

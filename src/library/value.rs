@@ -10,9 +10,6 @@ use crate::storage::ApplicationBlock;
 
 const MANIFEST: &str = "manifest.json";
 const MODULE: &str = "module.wasm";
-#[cfg(feature = "http-client")]
-pub(crate) const MAX_LIBRARY_BYTES: usize = 64 * 1024 * 1024;
-
 pub(crate) struct Root<'a> {
     libraries: &'a crate::cluster::Cluster<crate::cluster::Dir<Library>>,
     #[cfg(feature = "wasm")]
@@ -45,11 +42,14 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
                     {
                         #[cfg(feature = "wasm")]
                         {
-                            let wasm = self.compiler.module(&module).await?;
+                            let wasm = self
+                                .compiler
+                                .module(Arc::clone(&module), txn.deadline())
+                                .await?;
                             let identity = wasm.identity().clone();
                             let definition = wasm.definition().clone();
                             crate::uri::validate_identity(&identity, "lib")?;
-                            if !txn.has_claim(&identity, umask::USER_WRITE) {
+                            if !txn.may_mutate(&identity, self.libraries.path()) {
                                 return Err(TCError::unauthorized("unauthorized Library install"));
                             }
                             let analysis = crate::ir::compile_ir_library(definition.clone())?;
@@ -123,7 +123,7 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
                     value => {
                         let (identity, definition) = crate::literal::into_put(key, value)?;
                         let segments = crate::uri::validate_identity(&identity, "lib")?;
-                        if !txn.has_claim(&identity, umask::USER_WRITE) {
+                        if !txn.may_mutate(&identity, self.libraries.path()) {
                             return Err(TCError::unauthorized("unauthorized Library install"));
                         }
                         let analysis = crate::ir::compile_ir_library(definition.clone())?;
@@ -178,26 +178,71 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
 }
 
 #[derive(Clone)]
+enum LibraryRuntime {
+    Json(Map<Scalar>),
+    #[cfg(feature = "wasm")]
+    Wasm {
+        members: Map<Scalar>,
+        module: crate::wasm::WasmLibrary,
+    },
+}
+
+impl LibraryRuntime {
+    fn members(&self) -> &Map<Scalar> {
+        match self {
+            Self::Json(members) => members,
+            #[cfg(feature = "wasm")]
+            Self::Wasm { members, .. } => members,
+        }
+    }
+
+    fn hash(&self) -> [u8; 32] {
+        let definition: [u8; 32] =
+            async_hash::Hash::<async_hash::Sha256>::hash(self.members()).into();
+        #[cfg(feature = "wasm")]
+        let module = match self {
+            Self::Json(_) => None,
+            Self::Wasm { module, .. } => Some(module.module_hash()),
+        };
+        #[cfg(not(feature = "wasm"))]
+        let module: Option<[u8; 32]> = None;
+        async_hash::Hash::<async_hash::Sha256>::hash((definition, module)).into()
+    }
+}
+
+#[derive(Clone)]
 pub struct Library {
     storage: txfs::Dir<TxnId, ApplicationBlock>,
     identity: Link,
-    members: Map<Scalar>,
-    #[cfg(feature = "wasm")]
-    wasm: Option<crate::wasm::WasmLibrary>,
+    runtime: LibraryRuntime,
     scope: Arc<crate::txn::DependencyScope>,
 }
 
 impl Library {
+    fn new(
+        storage: txfs::Dir<TxnId, ApplicationBlock>,
+        identity: Link,
+        requirements: crate::txn::Requirements,
+        runtime: LibraryRuntime,
+    ) -> Self {
+        let scope = Arc::new(crate::txn::DependencyScope::new(
+            identity.clone(),
+            requirements,
+        ));
+        Self {
+            storage,
+            identity,
+            runtime,
+            scope,
+        }
+    }
+
     pub(crate) async fn create_json(
         txn_id: TxnId,
         storage: txfs::Dir<TxnId, ApplicationBlock>,
         identity: Link,
         analysis: crate::ir::LibraryAnalysis,
     ) -> TCResult<Self> {
-        let scope = Arc::new(crate::txn::DependencyScope::new(
-            identity.clone(),
-            analysis.requirements,
-        ));
         storage
             .create_file(
                 txn_id,
@@ -206,14 +251,12 @@ impl Library {
             )
             .await
             .map_err(TCError::from)?;
-        Ok(Self {
+        Ok(Self::new(
             storage,
             identity,
-            members: analysis.members,
-            #[cfg(feature = "wasm")]
-            wasm: None,
-            scope,
-        })
+            analysis.requirements,
+            LibraryRuntime::Json(analysis.members),
+        ))
     }
 
     #[cfg(feature = "wasm")]
@@ -225,10 +268,6 @@ impl Library {
         module_bytes: Arc<[u8]>,
         wasm: crate::wasm::WasmLibrary,
     ) -> TCResult<Self> {
-        let scope = Arc::new(crate::txn::DependencyScope::new(
-            identity.clone(),
-            analysis.requirements,
-        ));
         storage
             .create_file(
                 txn_id,
@@ -245,13 +284,15 @@ impl Library {
             )
             .await
             .map_err(TCError::from)?;
-        Ok(Self {
+        Ok(Self::new(
             storage,
             identity,
-            members: analysis.members,
-            wasm: Some(wasm),
-            scope,
-        })
+            analysis.requirements,
+            LibraryRuntime::Wasm {
+                members: analysis.members,
+                module: wasm,
+            },
+        ))
     }
 
     pub(crate) async fn load(
@@ -288,20 +329,12 @@ impl Library {
         crate::uri::validate_identity(identity, "lib")?;
         let analysis = crate::ir::compile_ir_library(definition.clone())?;
         match module {
-            None => {
-                let scope = Arc::new(crate::txn::DependencyScope::new(
-                    identity.clone(),
-                    analysis.requirements,
-                ));
-                Ok(Self {
-                    storage,
-                    identity: identity.clone(),
-                    members: analysis.members,
-                    #[cfg(feature = "wasm")]
-                    wasm: None,
-                    scope,
-                })
-            }
+            None => Ok(Self::new(
+                storage,
+                identity.clone(),
+                analysis.requirements,
+                LibraryRuntime::Json(analysis.members),
+            )),
             Some(module) => {
                 let block = module
                     .read::<ApplicationBlock>(txn_id)
@@ -312,7 +345,9 @@ impl Library {
                 };
                 #[cfg(feature = "wasm")]
                 {
-                    let wasm = compiler.module(bytes).await?;
+                    let wasm = compiler
+                        .module(Arc::clone(bytes), compiler.deadline())
+                        .await?;
                     if wasm.identity() != identity || wasm.definition() != definition {
                         return Err(TCError::internal(
                             "embedded WASM definition does not match manifest.json",
@@ -325,17 +360,15 @@ impl Library {
                             "a WASM export does not correspond to an embedded Library member",
                         ));
                     }
-                    let scope = Arc::new(crate::txn::DependencyScope::new(
+                    Ok(Self::new(
+                        storage,
                         identity.clone(),
                         analysis.requirements,
-                    ));
-                    Ok(Self {
-                        storage,
-                        identity: identity.clone(),
-                        members: analysis.members,
-                        wasm: Some(wasm),
-                        scope,
-                    })
+                        LibraryRuntime::Wasm {
+                            members: analysis.members,
+                            module: wasm,
+                        },
+                    ))
                 }
                 #[cfg(not(feature = "wasm"))]
                 {
@@ -356,19 +389,15 @@ impl Library {
         Arc::clone(&self.scope)
     }
     fn same_json(&self, members: &Map<Scalar>) -> bool {
-        #[cfg(feature = "wasm")]
-        if self.wasm.is_some() {
-            return false;
-        }
-        &self.members == members
+        matches!(&self.runtime, LibraryRuntime::Json(existing) if existing == members)
     }
     #[cfg(feature = "wasm")]
     fn same_wasm(&self, members: &Map<Scalar>, module_hash: [u8; 32]) -> bool {
-        self.members == *members
-            && self
-                .wasm
-                .as_ref()
-                .is_some_and(|wasm| wasm.module_hash() == module_hash)
+        matches!(
+            &self.runtime,
+            LibraryRuntime::Wasm { members: existing, module }
+                if existing == members && module.module_hash() == module_hash
+        )
     }
 }
 
@@ -399,18 +428,9 @@ impl crate::cluster::DirItem for Library {
     }
 }
 
-impl crate::cluster::ResourceHash for Library {
-    async fn resource_hash(&self, _txn_id: TxnId) -> TCResult<[u8; 32]> {
-        let definition: [u8; 32] =
-            async_hash::Hash::<async_hash::Sha256>::hash(&self.members).into();
-        #[cfg(feature = "wasm")]
-        let module = self
-            .wasm
-            .as_ref()
-            .map(crate::wasm::WasmLibrary::module_hash);
-        #[cfg(not(feature = "wasm"))]
-        let module: Option<[u8; 32]> = None;
-        Ok(async_hash::Hash::<async_hash::Sha256>::hash((definition, module)).into())
+impl crate::cluster::AsyncHash for Library {
+    async fn hash(&self, _txn_id: TxnId) -> TCResult<[u8; 32]> {
+        Ok(self.runtime.hash())
     }
 }
 
@@ -423,13 +443,13 @@ impl Route<crate::State> for Library {
             return Some(Box::new(self));
         }
         #[cfg(feature = "wasm")]
-        if let Some(wasm) = &self.wasm {
+        if let LibraryRuntime::Wasm { module, .. } = &self.runtime {
             return Some(Box::new(crate::wasm::WasmRoute::new(
-                wasm.clone(),
+                module.clone(),
                 path.to_vec(),
             )));
         }
-        crate::ir::route_member(&self.identity, &self.members, path)
+        crate::ir::route_member(&self.identity, self.runtime.members(), path)
     }
 }
 
@@ -441,7 +461,7 @@ impl<'a> Handler<'a, crate::State> for &'a Library {
         Some(Box::new(move |_txn, _key| {
             Box::pin(async move {
                 #[cfg(feature = "wasm")]
-                if self.wasm.is_some() {
+                if matches!(self.runtime, LibraryRuntime::Wasm { .. }) {
                     let module: tc_ir::Id = MODULE.parse().expect("module file name");
                     let block = self
                         .storage
@@ -453,7 +473,9 @@ impl<'a> Handler<'a, crate::State> for &'a Library {
                     };
                     return Ok(crate::State::from(tc_value::Value::Bytes(bytes.clone())));
                 }
-                Ok(crate::State::from_scalar(Scalar::Map(self.members.clone())))
+                Ok(crate::State::from_scalar(Scalar::Map(
+                    self.runtime.members().clone(),
+                )))
             })
         }))
     }
@@ -468,7 +490,7 @@ impl<'a> Handler<'a, crate::State> for &'a Library {
                         "Library deletion requires an explicit JSON null",
                     ));
                 }
-                if !txn.has_claim(&self.identity, umask::USER_WRITE) {
+                if !txn.may_mutate(&self.identity, self.identity.path()) {
                     return Err(TCError::unauthorized("unauthorized Library deletion"));
                 }
                 Ok(())

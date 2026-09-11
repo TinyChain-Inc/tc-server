@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor = if let Some(secret_key_b64) = secret_key_b64 {
         let secret_key_bytes = base64::engine::general_purpose::STANDARD.decode(secret_key_b64)?;
         let signing_key = rjwt::SigningKey::from_bytes(alg, &secret_key_bytes)?;
-        Actor::with_verifying_key(actor_id, signing_key.verifying_key())
+        Actor::with_signing_key(actor_id, signing_key)
     } else {
         Actor::new_falcon512(actor_id)?
     };
@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         application_roots,
         replication: std::sync::Arc::new(tinychain::replication::LocalClusterGateway),
         rpc: std::sync::Arc::new(tinychain::LocalRpcGateway),
-        resources: tinychain::HostResources::new(limits.clone()),
+        resources: tinychain::HostResources::new(limits.clone())?,
         protocol,
         verifier: std::sync::Arc::new(verifier),
         actors: keyring,

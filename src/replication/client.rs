@@ -11,17 +11,19 @@ pub(crate) async fn bootstrap_seed(
 ) -> TCResult<super::issuer::BootstrapSession> {
     let seed = super::normalize_peer(seed)?;
     let url = crate::http_client::peer_txn_url(&seed, crate::uri::HOST_ROOT, txn_id)?;
-    let requests = issuer.bootstrap_requests(txn_id, resource, identity)?;
+    let requests = issuer
+        .bootstrap_requests(txn_id, resource, identity)
+        .await?;
     if requests.is_empty() {
         return Err(TCError::bad_gateway("bootstrap has no configured PSK"));
     }
     let mut last_error = None;
-    for encrypted in requests {
-        let encoded = crate::literal::encode_json(
-            tc_ir::Scalar::Value(tc_value::Value::Bytes(encrypted.into())),
-            crate::literal::MAX_DEFINITION_BYTES,
-        )
-        .await?;
+    for (nonce, ciphertext) in requests {
+        let deadline = crate::Deadline::after(crate::outbound_http::DEFAULT_TIMEOUT);
+        let encoded = crate::http_body::json_body(tc_ir::Scalar::Tuple(vec![
+            tc_ir::Scalar::Value(tc_value::Value::Bytes(nonce.into())),
+            tc_ir::Scalar::Value(tc_value::Value::Bytes(ciphertext.into())),
+        ]));
         match crate::http_client::send_http(
             &hyper::Client::new(),
             hyper::Method::GET,
@@ -29,30 +31,49 @@ pub(crate) async fn bootstrap_seed(
             None,
             Some("application/json"),
             encoded,
-            crate::Deadline::after(crate::outbound_http::DEFAULT_TIMEOUT),
+            deadline,
         )
         .await
         {
-            Ok((status, body)) if status.is_success() => {
-                let stream = futures::stream::iter([Ok::<_, std::io::Error>(body)]);
-                let scalar: tc_ir::Scalar =
-                    destream_json::try_decode((), stream)
-                        .await
-                        .map_err(|error| {
-                            TCError::bad_gateway(format!("invalid bootstrap body: {error}"))
-                        })?;
-                let tc_ir::Scalar::Value(tc_value::Value::Bytes(encrypted)) = scalar else {
+            Ok(response) => {
+                let scalar: tc_ir::Scalar = match crate::outbound_http::decode(
+                    response,
+                    (),
+                    deadline,
+                    crate::literal::MAX_DEFINITION_BYTES,
+                )
+                .await
+                {
+                    Ok(scalar) => scalar,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+                let tc_ir::Scalar::Tuple(response) = scalar else {
                     return Err(TCError::bad_gateway(
-                        "bootstrap response was not encrypted bytes",
+                        "bootstrap response was not an encrypted tuple",
                     ));
                 };
-                return issuer.open_response(seed, &encrypted);
-            }
-            Ok((status, body)) => {
-                last_error = Some(TCError::bad_gateway(format!(
-                    "seed returned {status}: {}",
-                    String::from_utf8_lossy(&body)
-                )))
+                let [nonce, ciphertext]: [tc_ir::Scalar; 2] =
+                    response.try_into().map_err(|_| {
+                        TCError::bad_gateway("bootstrap response must contain nonce and ciphertext")
+                    })?;
+                let bytes = |value| match value {
+                    tc_ir::Scalar::Value(tc_value::Value::Bytes(bytes)) => Ok(bytes),
+                    _ => Err(TCError::bad_gateway(
+                        "bootstrap encrypted fields must be bytes",
+                    )),
+                };
+                let nonce = bytes(nonce)?;
+                let ciphertext = bytes(ciphertext)?;
+                match issuer
+                    .open_response(seed.clone(), &nonce, &ciphertext)
+                    .await
+                {
+                    Ok(session) => return Ok(session),
+                    Err(error) => last_error = Some(error),
+                }
             }
             Err(error) => last_error = Some(error),
         }
@@ -66,10 +87,11 @@ pub(crate) async fn read_seed_state(
     txn_id: TxnId,
     target: &pathlink::Link,
     deadline: crate::Deadline,
+    response_bound: usize,
 ) -> TCResult<crate::State> {
     let seed = super::normalize_peer(seed)?;
     let url = crate::http_client::peer_txn_url(&seed, &target.to_string(), txn_id)?;
-    let (status, body) = crate::http_client::send_http(
+    let response = crate::http_client::send_http(
         &hyper::Client::new(),
         hyper::Method::GET,
         url,
@@ -79,12 +101,17 @@ pub(crate) async fn read_seed_state(
         deadline,
     )
     .await?;
-    if !status.is_success() {
-        return Err(crate::outbound_http::error_from_status(status, body));
+    let content_type = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if content_type == Some("application/wasm") {
+        return crate::outbound_http::collect_bytes(response, deadline, response_bound)
+            .await
+            .map(|bytes| crate::State::from(tc_value::Value::Bytes(bytes)));
     }
-    let input = futures::stream::iter([Ok::<_, std::io::Error>(body)]);
-    let scalar: tc_ir::Scalar = destream_json::try_decode((), input)
+
+    crate::outbound_http::decode::<tc_ir::Scalar>(response, (), deadline, response_bound)
         .await
-        .map_err(|error| TCError::bad_gateway(format!("invalid bootstrap state: {error}")))?;
-    Ok(crate::State::from_scalar(scalar))
+        .map(crate::State::from_scalar)
 }

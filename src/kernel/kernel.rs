@@ -1,9 +1,255 @@
+use std::sync::Arc;
+
+use pathlink::{Link, PathSegment};
 use tc_error::{TCError, TCResult};
-use tc_ir::{Handler, Scalar};
+use tc_ir::{Handler, Scalar, Transact, TxnId};
 
 use super::Method;
 use super::types::KernelTarget;
 use crate::txn::TxnServer;
+
+type Root<T> = crate::cluster::Cluster<crate::cluster::Dir<T>>;
+
+pub struct HostServices {
+    pub application_roots: crate::storage::ApplicationRoots,
+    pub replication: Arc<dyn crate::replication::ClusterGateway>,
+    pub rpc: Arc<dyn crate::gateway::RpcGateway>,
+    pub resources: crate::HostResources,
+    pub protocol: crate::ProtocolAuthority,
+    pub verifier: Arc<dyn crate::auth::TokenVerifier>,
+    pub actors: crate::auth::KeyringActorResolver,
+    pub bootstrap: Arc<crate::replication::ReplicationIssuer>,
+    pub bootstrap_required: bool,
+}
+
+pub(crate) struct KernelInner {
+    pub(crate) libraries: Root<crate::library::Library>,
+    pub(crate) classes: Root<crate::class::Class>,
+    pub(crate) services: Root<crate::service::Service>,
+    #[cfg(feature = "wasm")]
+    pub(crate) compiler: crate::library::compiler::Compiler,
+    pub(crate) rpc: Arc<dyn crate::gateway::RpcGateway>,
+    pub(crate) state: tc_state::Static<crate::TxnHandle>,
+    resources: crate::HostResources,
+    actors: crate::auth::KeyringActorResolver,
+    pub(crate) bootstrap: Arc<crate::replication::ReplicationIssuer>,
+}
+
+impl KernelInner {
+    async fn load(
+        txn_id: TxnId,
+        roots: crate::storage::ApplicationRoots,
+        protocol: crate::ProtocolAuthority,
+        replication: Arc<dyn crate::replication::ClusterGateway>,
+        rpc: Arc<dyn crate::gateway::RpcGateway>,
+        resources: crate::HostResources,
+        actors: crate::auth::KeyringActorResolver,
+        bootstrap: Arc<crate::replication::ReplicationIssuer>,
+    ) -> TCResult<Self> {
+        let protocol = Arc::new(protocol);
+        let (class_root, library_root, service_root) = roots.into_parts();
+        let path = |root: &str| std::iter::once(root.parse().expect("application root")).collect();
+        let compiler = crate::library::compiler::Compiler::new(&resources)?;
+        let library_compiler = compiler.clone();
+        let (classes, libraries, services) = tokio::try_join!(
+            Root::<crate::class::Class>::load(
+                txn_id,
+                class_root,
+                path("class"),
+                "class",
+                Arc::clone(&protocol),
+                Arc::clone(&replication),
+                crate::class::Class::load,
+            ),
+            Root::<crate::library::Library>::load(
+                txn_id,
+                library_root,
+                path("lib"),
+                "lib",
+                Arc::clone(&protocol),
+                Arc::clone(&replication),
+                move |txn_id, storage| {
+                    crate::library::Library::load(library_compiler.clone(), txn_id, storage)
+                },
+            ),
+            Root::<crate::service::Service>::load(
+                txn_id,
+                service_root,
+                path("service"),
+                "service",
+                Arc::clone(&protocol),
+                Arc::clone(&replication),
+                crate::service::Service::load,
+            ),
+        )?;
+
+        let loaded_classes = classes.state().items(txn_id).await?;
+        let definitions = loaded_classes
+            .iter()
+            .map(|class| (class.identity().clone(), class.definition().clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        tc_state::validate_classes(&definitions, definitions.keys().cloned())
+            .map_err(|error| TCError::bad_request(error.to_string()))?;
+
+        Ok(Self {
+            libraries,
+            classes,
+            services,
+            #[cfg(feature = "wasm")]
+            compiler,
+            rpc,
+            state: tc_state::Static::default(),
+            resources,
+            actors,
+            bootstrap,
+        })
+    }
+
+    async fn bootstrap(
+        &self,
+        txn: &crate::TxnHandle,
+        state: crate::State,
+    ) -> TCResult<crate::State> {
+        let crate::State::Tuple(payload) = state else {
+            return Err(TCError::bad_request(
+                "GET /host requires an encrypted nonce and ciphertext",
+            ));
+        };
+        let [nonce, ciphertext]: [crate::State; 2] = payload.try_into().map_err(|_| {
+            TCError::bad_request("GET /host requires an encrypted nonce and ciphertext")
+        })?;
+        let bytes = |state| match state {
+            crate::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::Bytes(bytes))) => Ok(bytes),
+            _ => Err(TCError::bad_request(
+                "GET /host encrypted message fields must be bytes",
+            )),
+        };
+        let nonce = bytes(nonce)?;
+        let ciphertext = bytes(ciphertext)?;
+        let (resource, key) = self
+            .bootstrap
+            .open_request(txn.id(), &nonce, &ciphertext)
+            .await?;
+        let hash = match resource.path().first().map(PathSegment::as_str) {
+            Some("class") => {
+                self.classes
+                    .clone()
+                    .lookup(txn, &resource.path()[1..])
+                    .await?
+                    .exact_hash(txn)
+                    .await?
+            }
+            Some("lib") => {
+                self.libraries
+                    .clone()
+                    .lookup(txn, &resource.path()[1..])
+                    .await?
+                    .exact_hash(txn)
+                    .await?
+            }
+            Some("service") => {
+                self.services
+                    .clone()
+                    .lookup(txn, &resource.path()[1..])
+                    .await?
+                    .exact_hash(txn)
+                    .await?
+            }
+            _ => {
+                return Err(TCError::bad_request(
+                    "bootstrap must name an application Cluster",
+                ));
+            }
+        };
+        self.bootstrap
+            .seal_response(txn.id(), resource, hash, &key)
+            .await
+            .map(|(nonce, ciphertext)| {
+                crate::State::Tuple(vec![
+                    crate::State::from(tc_value::Value::Bytes(nonce.into())),
+                    crate::State::from(tc_value::Value::Bytes(ciphertext.into())),
+                ])
+            })
+    }
+
+    pub(crate) async fn dispatch(
+        &self,
+        txn: &crate::TxnHandle,
+        target: &Link,
+        method: Method,
+        body: Option<crate::State>,
+    ) -> TCResult<Option<crate::State>> {
+        match target.path().first().map(PathSegment::as_str) {
+            Some("lib") => {
+                self.libraries
+                    .clone()
+                    .dispatch(
+                        txn,
+                        target,
+                        method,
+                        body,
+                        Box::new(crate::library::Root::new(
+                            &self.libraries,
+                            #[cfg(feature = "wasm")]
+                            &self.compiler,
+                        )),
+                    )
+                    .await
+            }
+            Some("class") => {
+                self.classes
+                    .clone()
+                    .dispatch(
+                        txn,
+                        target,
+                        method,
+                        body,
+                        Box::new(crate::class::Root(&self.classes)),
+                    )
+                    .await
+            }
+            Some("service") => {
+                self.services
+                    .clone()
+                    .dispatch(
+                        txn,
+                        target,
+                        method,
+                        body,
+                        Box::new(crate::service::Root(&self.services)),
+                    )
+                    .await
+            }
+            _ => Err(TCError::not_found(target.to_string())),
+        }
+    }
+
+    fn metrics(&self) -> crate::State {
+        self.resources.state()
+    }
+
+    fn public_key(&self, actor_id: &str) -> TCResult<crate::State> {
+        self.actors.public_key_state(actor_id)
+    }
+
+    async fn dispatch_state(
+        &self,
+        txn: &crate::TxnHandle,
+        target: &[PathSegment],
+        method: Method,
+        body: Option<crate::State>,
+    ) -> TCResult<Option<crate::State>> {
+        let handler =
+            tc_ir::Route::route(&self.state, target).ok_or_else(|| TCError::not_found("/state"))?;
+        invoke_handler(handler, txn, method, body).await.map(Some)
+    }
+
+    pub(crate) async fn finalize(&self, cutoff: &TxnId) -> TCResult<()> {
+        self.libraries.finalize(cutoff).await?;
+        self.classes.finalize(cutoff).await?;
+        self.services.finalize(cutoff).await
+    }
+}
 
 #[derive(Clone)]
 pub struct Kernel {
@@ -105,16 +351,13 @@ impl Kernel {
     pub(crate) async fn coordinate(
         &self,
         txn: &crate::TxnHandle,
-        coordinator: &pathlink::PathBuf,
         outcome: crate::txn::TransactionOutcome,
         require_mutation: bool,
     ) -> TCResult<()> {
-        if !txn.lock_coordinator(coordinator, require_mutation)? {
+        let Some(coordinator) = txn.lock_coordinator(require_mutation)? else {
             return Ok(());
-        }
-        let target: pathlink::Link = coordinator.to_string().parse().map_err(|error| {
-            TCError::internal(format!("invalid coordinator resource path: {error}"))
-        })?;
+        };
+        let target = pathlink::Link::from(coordinator);
         let applied = self
             .inner
             .dispatch(
@@ -137,7 +380,7 @@ impl Kernel {
     }
 
     pub async fn new(
-        services: super::HostServices,
+        services: HostServices,
         workspace: crate::Workspace,
         ttl: std::time::Duration,
     ) -> TCResult<Self> {
@@ -151,7 +394,7 @@ impl Kernel {
         let txn_server = crate::txn::TxnServer::load(txn, services.verifier).await?;
         let bootstrap_txn = txn_server.allocate().await?;
         let inner = std::sync::Arc::new(
-            super::KernelInner::load(
+            KernelInner::load(
                 bootstrap_txn,
                 services.application_roots,
                 services.protocol,

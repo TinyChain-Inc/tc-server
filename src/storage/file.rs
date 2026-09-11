@@ -1,14 +1,16 @@
 use std::{io, path::Path, sync::Arc};
 
-use bytes::Bytes;
 use freqfs::{FileLoad, FileSave};
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 use get_size::GetSize;
 use safecast::AsType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::io::ReaderStream;
 
 use pathlink::Link;
 use tc_ir::Scalar;
+
+const MAX_APPLICATION_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) enum ApplicationBlock {
@@ -45,17 +47,29 @@ impl FileLoad for ApplicationBlock {
     async fn load(
         path: &Path,
         mut file: tokio::fs::File,
-        _metadata: std::fs::Metadata,
+        metadata: std::fs::Metadata,
     ) -> io::Result<Self> {
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).await?;
+        if metadata.len() > MAX_APPLICATION_BLOCK_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "application storage block exceeds its bound",
+            ));
+        }
         match path.file_name().and_then(|name| name.to_str()) {
             Some("manifest.json") => {
-                let input = stream::iter([Ok::<_, io::Error>(Bytes::from(bytes))]);
-                let (identity, definition) = crate::literal::decode_stream(input).await?;
+                let crate::literal::Definition(identity, definition) =
+                    destream_json::try_decode((), ReaderStream::new(file))
+                        .await
+                        .map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })?;
                 Ok(Self::Manifest(identity, definition))
             }
-            Some("module.wasm") => Ok(Self::Module(bytes.into())),
+            Some("module.wasm") => {
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                file.read_to_end(&mut bytes).await?;
+                Ok(Self::Module(bytes.into()))
+            }
             Some(name) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported application layout file {name}"),

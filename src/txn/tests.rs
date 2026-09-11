@@ -129,11 +129,48 @@ async fn workspace_cleanup_removes_every_transaction_child_together() {
             .expect("transaction removed")
     );
 }
-use crate::auth::{RjwtTokenVerifier, Token, TokenVerifier};
+use crate::auth::{RjwtTokenVerifier, SignedToken, Token, TokenVerifier};
 use tc_ir::{NetworkTime, TxnId};
 
 use crate::Claim;
 use umask::Mode;
+
+fn signed_claim_chain(actor: &Actor, claims: impl IntoIterator<Item = Claim>) -> SignedToken {
+    let host = pathlink::Link::from_str("/host").expect("host link");
+    let now = SystemTime::now();
+    let mut claims = claims.into_iter();
+    let first = claims.next().expect("nonempty claim chain");
+    let token = Token::new(
+        host.clone(),
+        now,
+        Duration::from_secs(30),
+        actor.id().clone(),
+        crate::auth::wire_claim(first),
+    );
+    claims.fold(
+        actor.sign_token(token).expect("signed token"),
+        |token, claim| {
+            actor
+                .consume_and_sign(token, host.clone(), crate::auth::wire_claim(claim), now)
+                .expect("extend signed token")
+        },
+    )
+}
+
+fn claim(path: &str) -> Claim {
+    Claim::new(
+        pathlink::Link::from_str(path).expect("claim link"),
+        umask::USER_EXEC,
+    )
+}
+
+fn snapshot_error(txn_id: TxnId, token: &SignedToken) -> tc_error::TCError {
+    match crate::txn::protocol_snapshot(txn_id, token) {
+        Ok(_) => panic!("invalid protocol claims must fail"),
+        Err(error) => error,
+    }
+}
+
 #[tokio::test]
 async fn mints_host_signed_bearer_token_for_unauthenticated_txn() {
     let kernel = test_kernel("test-host").await;
@@ -181,76 +218,103 @@ async fn mints_host_signed_bearer_token_for_unauthenticated_txn() {
 
 #[tokio::test]
 async fn preserves_an_append_only_claim_chain() {
-    use std::time::{Duration, SystemTime};
-
-    use rjwt::Actor;
-
     let handle = test_txn("test-host").await;
     let txn_id = handle.id();
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate Falcon-512 actor");
+    let txn_claim = claim(&crate::uri::transaction_path(txn_id));
+    let signed = signed_claim_chain(&actor, [txn_claim.clone(), claim("/lib/auth")]);
+    let updated = handle.with_signed_token(signed).expect("token accepted");
+    assert!(updated.has_claim(&txn_claim.link, txn_claim.mask));
+    handle
+        .with_signed_token(signed_claim_chain(
+            &actor,
+            [txn_claim, claim("/lib/other"), claim("/lib/final")],
+        ))
+        .expect("later resource grants preserve the transaction owner");
+}
 
-    let txn_claim = Claim::new(
-        pathlink::Link::from_str(&crate::uri::transaction_path(txn_id)).expect("txn claim"),
-        umask::USER_EXEC,
+#[tokio::test]
+async fn coordinator_is_the_first_claimed_resource_not_the_first_sorted_path() {
+    let handle = test_txn("claim-order").await;
+    let txn_id = handle.id();
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate actor");
+    let signed = signed_claim_chain(
+        &actor,
+        [
+            claim(&crate::uri::transaction_path(txn_id)),
+            claim("/service/z/1.0.0"),
+            claim("/class/a/1.0.0"),
+        ],
     );
-    let auth_claim = Claim::new(
-        pathlink::Link::from_str("/lib/auth").expect("auth link"),
-        Mode::all(),
+    let snapshot = crate::txn::protocol_snapshot(txn_id, &signed).expect("protocol snapshot");
+    assert_eq!(
+        snapshot.coordinator.expect("coordinator").to_string(),
+        "/service/z/1.0.0"
+    );
+}
+
+#[tokio::test]
+async fn rejects_resource_leadership_before_transaction_ownership() {
+    let handle = test_txn("claim-order-invalid").await;
+    let txn_id = handle.id();
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate actor");
+    let signed = signed_claim_chain(
+        &actor,
+        [
+            claim("/lib/a/1.0.0"),
+            claim(&crate::uri::transaction_path(txn_id)),
+        ],
+    );
+    let error = snapshot_error(txn_id, &signed);
+    assert!(error.message().contains("precedes transaction ownership"));
+}
+
+#[tokio::test]
+async fn rejects_ambiguous_owners_and_conflicting_leaders() {
+    let txn_id = test_txn("ambiguous-claims").await.id();
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate actor");
+    let txn = claim(&crate::uri::transaction_path(txn_id));
+    let duplicate_owner = signed_claim_chain(&actor, [txn.clone(), txn.clone()]);
+    assert!(
+        snapshot_error(txn_id, &duplicate_owner)
+            .message()
+            .contains("multiple transaction owners")
     );
 
     let host = pathlink::Link::from_str("/host").expect("host link");
-    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate Falcon-512 actor");
     let now = SystemTime::now();
-    let ttl = Duration::from_secs(30);
-
+    let grants = [txn.clone(), claim("/lib/a/1.0.0"), claim("/class/a/1.0.0")]
+        .into_iter()
+        .map(|claim| (claim.link.path().clone(), claim.mask.into()))
+        .collect();
     let token = Token::new(
         host.clone(),
         now,
-        ttl,
+        Duration::from_secs(30),
         actor.id().clone(),
-        crate::auth::wire_claim(auth_claim.clone()),
+        grants,
     );
-    let signed = actor.sign_token(token).expect("signed token");
-    let signed = actor
-        .consume_and_sign(
-            signed,
-            host.clone(),
-            crate::auth::wire_claim(txn_claim.clone()),
-            now,
-        )
-        .expect("consume token");
-    let updated = handle.with_signed_token(signed).expect("token accepted");
-    assert!(updated.has_claim(&txn_claim.link, txn_claim.mask));
+    let ambiguous = actor.sign_token(token).expect("sign ambiguous claims");
+    assert!(
+        snapshot_error(txn_id, &ambiguous)
+            .message()
+            .contains("ambiguous")
+    );
 
-    let other_claim = Claim::new(
-        pathlink::Link::from_str("/lib/other").expect("other link"),
-        Mode::all(),
-    );
-    let final_claim = Claim::new(
-        pathlink::Link::from_str("/lib/final").expect("final link"),
-        Mode::all(),
-    );
-    let token = Token::new(
-        host.clone(),
-        now,
-        ttl,
-        actor.id().clone(),
-        crate::auth::wire_claim(txn_claim),
-    );
-    let signed = actor.sign_token(token).expect("signed token");
-    let signed = actor
+    let first = signed_claim_chain(&actor, [txn, claim("/lib/a/1.0.0")]);
+    let other = Actor::new_falcon512("actor-b".to_string()).expect("generate other actor");
+    let conflicting = other
         .consume_and_sign(
-            signed,
-            host.clone(),
-            crate::auth::wire_claim(other_claim),
+            first,
+            host,
+            crate::auth::wire_claim(claim("/lib/a/1.0.0")),
             now,
         )
-        .expect("consume token");
-    let signed = actor
-        .consume_and_sign(signed, host, crate::auth::wire_claim(final_claim), now)
-        .expect("consume token");
-    handle
-        .with_signed_token(signed)
-        .expect("later resource grants preserve the transaction owner");
+        .expect("append conflicting leader");
+    assert_eq!(
+        snapshot_error(txn_id, &conflicting).code(),
+        tc_error::ErrorKind::Conflict
+    );
 }
 
 #[tokio::test]

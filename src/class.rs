@@ -23,19 +23,12 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
             Box::pin(async move {
                 let (identity, definition) = crate::literal::into_put(key, value)?;
                 let segments = crate::uri::validate_identity(&identity, "class")?;
-                if !txn.has_claim(&identity, umask::USER_WRITE) {
+                if !txn.may_mutate(&identity, self.0.path()) {
                     return Err(TCError::unauthorized("unauthorized Class install"));
                 }
                 let body = ClassBody::try_from(definition.clone())
                     .map_err(|error| TCError::bad_request(error.to_string()))?;
                 let class = ClassDef::from_body(identity.clone(), body);
-                class
-                    .validate_digest()
-                    .map_err(|error| TCError::bad_request(error.to_string()))?;
-                let scope = Arc::new(crate::txn::DependencyScope::new(
-                    identity.clone(),
-                    class.referenced_methods(),
-                ));
                 let expected = class.clone();
                 let conflict_identity = identity.clone();
                 let path = identity.path()[1..].to_vec();
@@ -64,7 +57,7 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
                                 .await?;
                             parent
                                 .create_item(txn, &remaining, move |storage| {
-                                    Class::create(txn.id(), storage, class, scope)
+                                    Class::create(txn.id(), storage, class)
                                 })
                                 .await
                                 .map(|_| ())
@@ -88,7 +81,6 @@ impl Class {
         txn_id: TxnId,
         storage: txfs::Dir<TxnId, ApplicationBlock>,
         class: ClassDef,
-        scope: Arc<crate::txn::DependencyScope>,
     ) -> TCResult<Self> {
         storage
             .create_file(
@@ -98,11 +90,7 @@ impl Class {
             )
             .await
             .map_err(TCError::from)?;
-        Ok(Self {
-            storage,
-            class,
-            scope,
-        })
+        Ok(Self::new(storage, class))
     }
 
     pub(crate) async fn load(
@@ -134,18 +122,19 @@ impl Class {
         let body = ClassBody::try_from(definition.clone())
             .map_err(|error| TCError::bad_request(error.to_string()))?;
         let class = ClassDef::from_body(identity.clone(), body);
-        class
-            .validate_digest()
-            .map_err(|error| TCError::bad_request(error.to_string()))?;
-        let scope = Arc::new(crate::txn::DependencyScope::new(
-            identity.clone(),
-            class.referenced_methods(),
-        ));
-        Ok(Self {
+        Ok(Self::new(storage, class))
+    }
+
+    fn new(storage: txfs::Dir<TxnId, ApplicationBlock>, class: ClassDef) -> Self {
+        let scope = crate::txn::DependencyScope::new(
+            class.identity().clone(),
+            crate::ir::application_requirements(class.prototype().values()),
+        );
+        Self {
             storage,
             class,
-            scope,
-        })
+            scope: Arc::new(scope),
+        }
     }
 
     pub(crate) fn scope(&self) -> Arc<crate::txn::DependencyScope> {
@@ -186,8 +175,8 @@ impl crate::cluster::DirItem for Class {
     }
 }
 
-impl crate::cluster::ResourceHash for Class {
-    async fn resource_hash(&self, _txn_id: TxnId) -> TCResult<[u8; 32]> {
+impl crate::cluster::AsyncHash for Class {
+    async fn hash(&self, _txn_id: TxnId) -> TCResult<[u8; 32]> {
         Ok(*self.class.digest())
     }
 }
@@ -233,7 +222,7 @@ impl<'a> Handler<'a, crate::State> for &'a Class {
                         "Class deletion requires an explicit JSON null",
                     ));
                 }
-                if !txn.has_claim(self.identity(), umask::USER_WRITE) {
+                if !txn.may_mutate(self.identity(), self.identity().path()) {
                     return Err(TCError::unauthorized("unauthorized Class deletion"));
                 }
                 Ok(())

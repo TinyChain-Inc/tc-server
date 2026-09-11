@@ -1,12 +1,11 @@
 use std::io;
 
+use crate::{State, txn::TxnHandle};
 use bytes::Bytes;
-use futures::{Stream, TryStreamExt, stream, stream::BoxStream};
+use futures::{TryStreamExt, stream, stream::BoxStream};
 use safecast::TryCastFrom;
 use tc_error::{TCError, TCResult};
-use tc_ir::{IntoView, Scalar};
-
-use crate::{State, txn::TxnHandle};
+use tc_ir::{IntoView, Method, Scalar};
 
 use super::{Body, Response, StatusCode, header};
 
@@ -16,18 +15,20 @@ pub(crate) async fn native_state_response(
     txn: TxnHandle,
     request: Option<crate::KernelRequestGuard>,
 ) -> TCResult<Response> {
-    if request
-        .as_ref()
-        .is_some_and(|request| request.returns_wasm(&state))
-    {
+    if request.as_ref().is_some_and(|request| {
+        let (method, target) = request.request();
+        method == Method::Get
+            && matches!(target, crate::kernel::KernelTarget::Application(target) if target.path().first().is_some_and(|root| root.as_str() == "lib"))
+            && matches!(
+                state,
+                State::Scalar(Scalar::Value(tc_value::Value::Bytes(_)))
+            )
+    }) {
         let State::Scalar(Scalar::Value(tc_value::Value::Bytes(bytes))) = state else {
-            unreachable!("returns_wasm checked the State variant")
+            unreachable!("the HTTP representation check matched a byte value")
         };
         let stream = stream::once(async move { Ok(Bytes::from_owner(bytes)) });
-        let stream = Box::pin(CompletionStream::new(
-            Box::pin(stream),
-            request.expect("request"),
-        ));
+        let stream = completion_stream(Box::pin(stream), request.expect("request"));
         return Ok(http::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/wasm")
@@ -35,9 +36,9 @@ pub(crate) async fn native_state_response(
             .expect("WASM response"));
     }
     let view = state.into_view(txn.clone()).await?;
-    let stream = json_stream(view);
+    let stream = crate::http_body::json_stream(view);
     let stream: BoxStream<'static, Result<Bytes, io::Error>> = match request {
-        Some(request) => Box::pin(CompletionStream::new(stream, request)),
+        Some(request) => completion_stream(stream, request),
         None => stream,
     };
     Ok(json_stream_response(stream))
@@ -59,7 +60,7 @@ fn json_response<T>(value: T) -> Response
 where
     T: for<'en> destream::en::IntoStream<'en> + Send + 'static,
 {
-    json_stream_response(json_stream(value))
+    json_stream_response(crate::http_body::json_stream(value))
 }
 
 fn json_stream_response(stream: BoxStream<'static, Result<Bytes, io::Error>>) -> Response {
@@ -70,70 +71,32 @@ fn json_stream_response(stream: BoxStream<'static, Result<Bytes, io::Error>>) ->
         .expect("state response")
 }
 
-struct CompletionStream {
+fn completion_stream(
     stream: BoxStream<'static, Result<Bytes, io::Error>>,
-    request: Option<crate::KernelRequestGuard>,
-    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
-    timed_out: bool,
-}
-
-impl CompletionStream {
-    fn new(
-        stream: BoxStream<'static, Result<Bytes, io::Error>>,
-        request: crate::KernelRequestGuard,
-    ) -> Self {
-        let deadline = request.deadline();
-        Self {
-            stream,
-            request: Some(request),
-            deadline: Box::pin(tokio::time::sleep_until(deadline.instant())),
-            timed_out: false,
-        }
-    }
-}
-
-impl Stream for CompletionStream {
-    type Item = Result<Bytes, io::Error>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.as_mut().get_mut();
-        if !this.timed_out && this.deadline.as_mut().poll(cx).is_ready() {
-            this.timed_out = true;
-            if let Some(request) = this.request.take() {
-                let err = request.deadline().exceeded();
-                return std::task::Poll::Ready(Some(Err(io::Error::other(err.to_string()))));
+    request: crate::KernelRequestGuard,
+) -> BoxStream<'static, Result<Bytes, io::Error>> {
+    let deadline = request.deadline();
+    Box::pin(stream::try_unfold(
+        (stream, Some(request)),
+        move |(mut stream, request)| async move {
+            match tokio::time::timeout_at(deadline.instant(), stream.try_next()).await {
+                Err(_) => Err(io::Error::other(deadline.exceeded().to_string())),
+                Ok(Err(error)) => Err(error),
+                Ok(Ok(Some(bytes))) => Ok(Some((bytes, (stream, request)))),
+                Ok(Ok(None)) => {
+                    let request = request.expect("completion request");
+                    deadline
+                        .wait(request.finish_success())
+                        .await
+                        .and_then(|result| result)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    Ok(None)
+                }
             }
-        }
-
-        if this.timed_out {
-            return std::task::Poll::Ready(None);
-        }
-
-        match this.stream.as_mut().poll_next(cx) {
-            std::task::Poll::Ready(Some(Err(err))) => {
-                this.request.take();
-                std::task::Poll::Ready(Some(Err(err)))
-            }
-            std::task::Poll::Ready(None) => {
-                this.request.take();
-                std::task::Poll::Ready(None)
-            }
-            poll => poll,
-        }
-    }
+        },
+    ))
 }
 
-fn json_stream<T>(value: T) -> BoxStream<'static, Result<Bytes, io::Error>>
-where
-    T: for<'en> destream::en::IntoStream<'en> + Send + 'static,
-{
-    match destream_json::encode(value) {
-        Ok(stream) => Box::pin(stream.map_err(|err| io::Error::other(err.to_string()))),
-        Err(err) => Box::pin(stream::once(async move {
-            Err(io::Error::other(err.to_string()))
-        })),
-    }
-}
+#[cfg(test)]
+#[path = "../../tests/support/http_body.rs"]
+mod tests;

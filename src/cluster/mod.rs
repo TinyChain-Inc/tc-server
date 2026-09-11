@@ -12,29 +12,22 @@ use crate::replication::ClusterGateway;
 mod bootstrap;
 mod dir;
 mod replicas;
-pub(crate) use dir::{Dir, DirEntry, Resolved};
+pub(crate) use dir::Dir;
 #[cfg(feature = "http-client")]
 pub(crate) use replicas::replica_put_state;
 
 const REPLICAS: &str = "replicas";
 
-pub(crate) trait ResourceHash: Send + Sync {
-    fn resource_hash(&self, txn_id: TxnId) -> impl Future<Output = TCResult<[u8; 32]>> + Send;
+/// Hash a resource's transaction-visible state using `async_hash` composition.
+pub(crate) trait AsyncHash: Send + Sync {
+    fn hash(&self, txn_id: TxnId) -> impl Future<Output = TCResult<[u8; 32]>> + Send;
 }
 
 pub(crate) trait DirItem:
-    Clone + ResourceHash + Route<crate::State> + Transact + Send + Sync + 'static
+    Clone + AsyncHash + Route<crate::State> + Transact + Send + Sync + 'static
 {
     fn identity(&self) -> &pathlink::Link;
     fn bind(&self, txn: &crate::TxnHandle) -> crate::TxnHandle;
-}
-
-#[derive(Clone)]
-pub(crate) struct ClaimState {
-    pub(crate) signed: Option<Arc<crate::auth::SignedToken>>,
-    pub(crate) coordinator: Option<PathBuf>,
-    pub(crate) mutated: bool,
-    pub(crate) autocommit: bool,
 }
 
 #[derive(Clone)]
@@ -89,7 +82,7 @@ impl<T> Cluster<T> {
 
 impl<T> Cluster<T>
 where
-    T: Route<crate::State> + Transact + ResourceHash,
+    T: Route<crate::State> + Transact + AsyncHash,
 {
     pub(crate) async fn invoke(
         &self,

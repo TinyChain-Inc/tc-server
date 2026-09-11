@@ -143,44 +143,63 @@ impl Service<Request> for KernelService {
                         .headers()
                         .get(http::header::CONTENT_TYPE)
                         .and_then(|value| value.to_str().ok())
-                        .unwrap_or("application/json")
-                        .to_string();
-                    if req
-                        .headers()
-                        .get(http::header::CONTENT_LENGTH)
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .is_some_and(|length| length > limit)
-                    {
-                        return Ok(super::response::payload_too_large_response(
-                            "application exceeds its request bound",
-                        ));
-                    }
-                    let body = req.into_body().map_err(std::io::Error::other);
-                    let result = match guard.admit_body(body, limit).await {
-                        Ok(body) => {
-                            let state = match content_type.as_str() {
-                                "application/wasm" => Ok(crate::State::Tuple(vec![
-                                    crate::State::None,
-                                    crate::State::from(tc_value::Value::Bytes(body.shared())),
-                                ])),
-                                "application/json" => crate::literal::decode(&body.shared(), limit)
-                                    .await
-                                    .map(|(identity, definition)| {
-                                        crate::State::Tuple(vec![
-                                            crate::State::from(tc_value::Value::Link(identity)),
-                                            crate::State::from_scalar(definition),
-                                        ])
-                                    }),
-                                _ => Err(tc_error::TCError::bad_request(
+                        .unwrap_or("application/json");
+                    let is_wasm = match content_type {
+                        "application/json" => false,
+                        "application/wasm" => true,
+                        _ => {
+                            return Ok(super::response::tc_error_response(
+                                tc_error::TCError::bad_request(
                                     "unsupported application content type",
-                                )),
-                            };
-                            match state {
-                                Ok(state) => guard.execute(Some(state)).await.map(|_| ()),
-                                Err(error) => Err(error),
-                            }
+                                ),
+                            ));
                         }
+                    };
+                    let mut body = crate::http_body::BoundedBody::new(
+                        req.into_body(),
+                        limit,
+                        Some((resources.clone(), deadline)),
+                    );
+                    let state = if is_wasm {
+                        match (&mut body)
+                            .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                                bytes.extend_from_slice(&chunk);
+                                Ok(bytes)
+                            })
+                            .await
+                        {
+                            Ok(bytes) if bytes.is_empty() => {
+                                Err(tc_error::TCError::bad_request("empty WASM Library"))
+                            }
+                            Ok(bytes) => Ok(crate::State::Tuple(vec![
+                                crate::State::None,
+                                crate::State::from(tc_value::Value::Bytes(bytes.into())),
+                            ])),
+                            Err(error) => Err(body.decode_error(error)),
+                        }
+                    } else {
+                        match destream_json::try_decode::<_, _, crate::literal::Definition>(
+                            (),
+                            &mut body,
+                        )
+                        .await
+                        {
+                            Ok(crate::literal::Definition(identity, definition)) => {
+                                Ok(crate::State::Tuple(vec![
+                                    crate::State::from(tc_value::Value::Link(identity)),
+                                    crate::State::from_scalar(definition),
+                                ]))
+                            }
+                            Err(error) => Err(body.decode_error(error)),
+                        }
+                    };
+                    let _admission = body.permit.take();
+                    let result = match state {
+                        Ok(state) => match guard.execute(Some(state)).await {
+                            Ok(Some(_)) => guard.finish_success().await,
+                            Ok(None) => Ok(()),
+                            Err(error) => Err(error),
+                        },
                         Err(error) => Err(error),
                     };
                     return Ok(match result {

@@ -193,7 +193,7 @@ async fn start_with_psk(
         application_roots: host.roots,
         replication: Arc::new(gateway.clone()),
         rpc: Arc::new(gateway),
-        resources: tinychain::HostResources::new(limits.clone()),
+        resources: tinychain::HostResources::new(limits.clone()).unwrap(),
         protocol: host.protocol,
         verifier: Arc::new(RjwtTokenVerifier::new(Arc::new(keyring.clone()))),
         actors: keyring,
