@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use base64::engine::general_purpose::STANDARD_NO_PAD;
     use pathlink::Link;
     use rjwt::{AlgKind, SigningKey};
-    use tc_ir::Claim;
+    use tinychain::Claim;
     use umask::{USER_EXEC, USER_WRITE};
 
     use tinychain::auth::{Actor, Token};
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--txn-id" => txn_id = args.next(),
             "--secret-key-b64" => secret_key_b64 = args.next(),
-            "--alg" => alg = parse_alg(args.next().ok_or("missing --alg value")?.as_str())?,
+            "--alg" => alg = args.next().ok_or("missing --alg value")?.parse()?,
             "--ttl-secs" => {
                 ttl_secs = args.next().ok_or("missing --ttl-secs value")?.parse()?;
             }
@@ -80,18 +80,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SystemTime::now(),
         Duration::from_secs(ttl_secs),
         actor.id().clone(),
-        claims.first().cloned().ok_or("missing --lib claim")?,
+        tinychain::auth::wire_claim(claims.first().cloned().ok_or("missing --lib claim")?),
     );
     let mut signed = actor.sign_token(token)?;
     for claim in claims.iter().skip(1).cloned() {
-        signed = actor.consume_and_sign(signed, host.clone(), claim, SystemTime::now())?;
+        signed = actor.consume_and_sign(
+            signed,
+            host.clone(),
+            tinychain::auth::wire_claim(claim),
+            SystemTime::now(),
+        )?;
     }
     if let Some(txn_id) = txn_id {
         let txn_claim = Claim::new(
-            Link::from_str(&format!("/txn/{txn_id}"))?,
+            Link::from_str(&format!("/host/txn/{txn_id}"))?,
             USER_EXEC | USER_WRITE,
         );
-        signed = actor.consume_and_sign(signed, host.clone(), txn_claim, SystemTime::now())?;
+        signed = actor.consume_and_sign(
+            signed,
+            host.clone(),
+            tinychain::auth::wire_claim(txn_claim),
+            SystemTime::now(),
+        )?;
     }
 
     let public_key_b64 = STANDARD.encode(actor.verifying_key().to_bytes());
@@ -101,19 +111,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("claim: {}", claim.link);
     }
     println!("actor_id: {actor_id}");
+    println!("algorithm: {}", actor.verifying_key().alg());
     println!("public_key_b64: {public_key_b64}");
     println!("secret_key_b64: {secret_key_b64}");
     println!("bearer_token: {}", signed.into_jwt());
 
     Ok(())
-}
-
-fn parse_alg(alg: &str) -> Result<rjwt::AlgKind, Box<dyn std::error::Error>> {
-    match alg.trim().to_ascii_lowercase().as_str() {
-        "falcon512" | "falcon-512" | "fn-dsa-512" => Ok(rjwt::AlgKind::Falcon512),
-        "ed25519" | "eddsa" => Ok(rjwt::AlgKind::Ed25519),
-        other => Err(format!("unsupported signature algorithm: {other}").into()),
-    }
 }
 
 fn print_usage() {

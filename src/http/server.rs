@@ -1,176 +1,30 @@
-use std::net::{SocketAddr, TcpListener};
-use std::str::FromStr;
-use std::sync::Arc;
+use std::net::TcpListener;
 use std::task::{Context, Poll};
 
-use futures::future::BoxFuture;
+use futures::{TryStreamExt, future::BoxFuture};
 use tower::Service;
 
-use super::parse::{
-    TxnParseError, decode_native_body, parse_bearer_token, parse_body, parse_txn_id,
-};
-use super::response::{
-    bad_request_response, handle_finalize_result, method_not_allowed, not_found,
-};
-use super::{Body, HttpHandler, Request, Response, StatusCode};
-use crate::kernel::BoundTransaction;
-use crate::{Kernel, KernelRequest, Method};
-
-/// HTTP-only endpoint routing. Native kernel routes are deliberately absent
-/// from this type.
-#[derive(Clone)]
-pub struct HttpRouter {
-    registry: Arc<crate::library::LibraryRegistry>,
-    health: Arc<dyn super::HttpHandler>,
-    host: Arc<dyn super::HttpHandler>,
-    service: Arc<dyn super::HttpHandler>,
-    library_put: Option<Arc<dyn super::HttpHandler>>,
-}
-
-impl HttpRouter {
-    pub fn new<H, Ho, S>(
-        registry: Arc<crate::library::LibraryRegistry>,
-        health: H,
-        host: Ho,
-        service: S,
-    ) -> Self
-    where
-        H: super::HttpHandler,
-        Ho: super::HttpHandler,
-        S: super::HttpHandler,
-    {
-        Self {
-            registry,
-            health: Arc::new(health),
-            host: Arc::new(host),
-            service: Arc::new(service),
-            library_put: None,
-        }
-    }
-
-    pub fn with_library_put_handler<H>(mut self, handler: H) -> Self
-    where
-        H: super::HttpHandler,
-    {
-        self.library_put = Some(Arc::new(handler));
-        self
-    }
-
-    pub fn is_native(&self, path: &str) -> bool {
-        path.starts_with("/state/")
-            || path == crate::uri::HOST_AUTH_CONTEXT
-            || path == crate::uri::CLASS_ROOT
-            || path.starts_with(crate::uri::CLASS_ROOT_PREFIX)
-            || self
-                .registry
-                .resolve_native(path)
-                .is_some_and(|(_, _, is_root)| !is_root)
-    }
-
-    fn requires_transaction(&self, path: &str) -> bool {
-        self.is_native(path)
-            || path == crate::uri::LIB_ROOT
-            || path.starts_with(crate::uri::LIB_ROOT_PREFIX)
-            || path == crate::uri::CLASS_ROOT
-            || path.starts_with(crate::uri::CLASS_ROOT_PREFIX)
-            || path == crate::uri::SERVICE_ROOT
-            || path.starts_with(crate::uri::SERVICE_ROOT_PREFIX)
-            || path == crate::uri::HOST_LIBRARY_EXPORT
-    }
-
-    async fn call(&self, method: Method, path: &str, request: Request) -> Response {
-        if path == "/healthz" {
-            let resources = request.extensions().get::<crate::HostResources>().cloned();
-            let mut response = self.health.call(request).await;
-            #[allow(clippy::collapsible_if)]
-            if response.status().is_success() {
-                if let Some(resources) = resources {
-                    let body = serde_json::json!({
-                        "status": "ok",
-                        "resources": resources.snapshots(),
-                    });
-                    response.headers_mut().insert(
-                        hyper::header::CONTENT_TYPE,
-                        hyper::header::HeaderValue::from_static("application/json"),
-                    );
-                    *response.body_mut() = Body::from(body.to_string());
-                }
-            }
-            return response;
-        }
-        if path == crate::uri::LIB_ROOT {
-            return match method {
-                Method::Get => {
-                    crate::library::http::schema_get_handler(Arc::clone(&self.registry))
-                        .call(request)
-                        .await
-                }
-                Method::Put => match &self.library_put {
-                    Some(handler) => handler.call(request).await,
-                    None => {
-                        crate::library::http::schema_put_handler(Arc::clone(&self.registry))
-                            .call(request)
-                            .await
-                    }
-                },
-                _ => method_not_allowed(),
-            };
-        }
-        if path.starts_with(crate::uri::LIB_ROOT_PREFIX) {
-            return crate::library::http::routes_handler(Arc::clone(&self.registry))
-                .call(request)
-                .await;
-        }
-        if path == crate::uri::SERVICE_ROOT || path.starts_with(crate::uri::SERVICE_ROOT_PREFIX) {
-            return self.service.call(request).await;
-        }
-        if path == "/"
-            || path == crate::uri::HOST_ROOT
-            || path.starts_with(crate::uri::HOST_ROOT_PREFIX)
-        {
-            return self.host.call(request).await;
-        }
-        not_found()
-    }
-}
+use super::parse::{decode_native_body, parse_bearer_token};
+use super::response::method_not_allowed;
+use super::{Request, Response};
+use crate::{Kernel, Method};
 
 pub struct HttpServer {
     pub(super) kernel: Kernel,
-    pub(super) router: HttpRouter,
 }
 
 impl HttpServer {
-    pub fn new(kernel: Kernel, router: HttpRouter) -> Self {
-        Self { kernel, router }
+    pub fn new(kernel: Kernel) -> Self {
+        Self { kernel }
     }
 
-    pub async fn serve(self, addr: SocketAddr) -> hyper::Result<()> {
-        self.kernel
-            .start_transaction_expiry(&tokio::runtime::Handle::current());
-        let service = KernelService::new(self.kernel, self.router);
-        let make_service = MakeKernelService::new(service);
-        hyper::Server::bind(&addr).serve(make_service).await
+    fn into_service(self) -> MakeKernelService {
+        MakeKernelService::new(KernelService::new(self.kernel))
     }
 
     pub async fn serve_listener(self, listener: TcpListener) -> hyper::Result<()> {
-        self.kernel
-            .start_transaction_expiry(&tokio::runtime::Handle::current());
-        let service = KernelService::new(self.kernel, self.router);
-        let make_service = MakeKernelService::new(service);
-        hyper::Server::from_tcp(listener)?.serve(make_service).await
-    }
-
-    pub async fn serve_with_shutdown<F>(self, addr: SocketAddr, shutdown: F) -> hyper::Result<()>
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        self.kernel
-            .start_transaction_expiry(&tokio::runtime::Handle::current());
-        let service = KernelService::new(self.kernel, self.router);
-        let make_service = MakeKernelService::new(service);
-        hyper::Server::bind(&addr)
-            .serve(make_service)
-            .with_graceful_shutdown(shutdown)
+        hyper::Server::from_tcp(listener)?
+            .serve(self.into_service())
             .await
     }
 
@@ -182,12 +36,8 @@ impl HttpServer {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.kernel
-            .start_transaction_expiry(&tokio::runtime::Handle::current());
-        let service = KernelService::new(self.kernel, self.router);
-        let make_service = MakeKernelService::new(service);
         hyper::Server::from_tcp(listener)?
-            .serve(make_service)
+            .serve(self.into_service())
             .with_graceful_shutdown(shutdown)
             .await
     }
@@ -196,12 +46,11 @@ impl HttpServer {
 #[derive(Clone)]
 pub(crate) struct KernelService {
     kernel: Kernel,
-    router: HttpRouter,
 }
 
 impl KernelService {
-    pub(crate) fn new(kernel: Kernel, router: HttpRouter) -> Self {
-        Self { kernel, router }
+    pub(crate) fn new(kernel: Kernel) -> Self {
+        Self { kernel }
     }
 }
 
@@ -219,171 +68,169 @@ impl Service<Request> for KernelService {
         let method = req.method().clone();
         let path = uri.path().to_owned();
         let kernel = self.kernel.clone();
-        let router = self.router.clone();
-        let resources = self.kernel.resources().clone();
 
         Box::pin(async move {
-            let deadline = resources.deadline();
-            let request_permit = match resources.admit_request(deadline).await {
-                Ok(permit) => permit,
-                Err(err) => return Ok(super::response::tc_error_response(err)),
-            };
+            let deadline = kernel.deadline();
             let method = match to_kernel_method(&method) {
                 Some(method) => method,
                 None => return Ok(method_not_allowed()),
             };
 
-            let mut req = req;
-            req.extensions_mut().insert(resources.clone());
-
-            if !router.requires_transaction(&path) {
-                return Ok(router.call(method, &path, req).await);
-            }
-
-            let txn_id = match parse_txn_id(&req) {
-                Ok(ctx) => ctx,
-                Err(TxnParseError::Invalid) => {
-                    return Ok(bad_request_response("invalid transaction id"));
+            if path == crate::uri::HOST_HEALTH
+                || path == crate::uri::HOST_METRICS
+                || path == crate::uri::HOST_PUBLIC_KEY
+            {
+                let _request = match kernel.admit_host_request().await {
+                    Ok((_, permit)) => permit,
+                    Err(err) => return Ok(super::response::tc_error_response(err)),
+                };
+                if path == crate::uri::HOST_HEALTH {
+                    return Ok(match kernel.health(method) {
+                        Ok(health) => super::state_response(health),
+                        Err(error) => super::response::tc_error_response(error),
+                    });
                 }
-            };
+                if path == crate::uri::HOST_METRICS {
+                    return Ok(match kernel.metrics(method) {
+                        Ok(metrics) => super::state_response(metrics),
+                        Err(error) => super::response::tc_error_response(error),
+                    });
+                }
+                if path == crate::uri::HOST_PUBLIC_KEY {
+                    let actor = match super::host::public_key_actor(&req).await {
+                        Ok(actor) => actor,
+                        Err(response) => return Ok(*response),
+                    };
+                    return Ok(match kernel.public_key(method, &actor) {
+                        Ok(key) => super::state_response(key),
+                        Err(error) => super::response::tc_error_response(error),
+                    });
+                }
+            }
 
             let bearer = parse_bearer_token(&req);
             let body_is_none = hyper::body::HttpBody::size_hint(req.body()).exact() == Some(0);
-            let inbound_txn_id = txn_id;
-            let token = match bearer {
-                Some(token) => match deadline.wait(kernel.token_verifier().verify(token)).await {
-                    Err(err) => return Ok(super::response::tc_error_response(err)),
-                    Ok(result) => match result {
-                        Ok(token) => Some(token),
-                        Err(crate::txn::TxnError::Unauthorized) => {
-                            return Ok(hyper::Response::builder()
-                                .status(StatusCode::UNAUTHORIZED)
-                                .body(Body::empty())
-                                .expect("unauthorized response"));
-                        }
-                        Err(crate::txn::TxnError::NotFound) => {
-                            unreachable!("verifier does not use NotFound")
-                        }
-                    },
-                },
-                None => None,
-            };
+            let raw_path = uri
+                .path_and_query()
+                .map(|path| path.as_str())
+                .unwrap_or(&path);
 
-            let binding = match deadline
-                .wait(kernel.bind_transaction(
-                    method,
-                    &path,
-                    body_is_none,
-                    inbound_txn_id,
-                    token.as_ref(),
-                    deadline,
-                ))
+            let guard = match deadline
+                .wait(kernel.begin_request(method, raw_path, body_is_none, bearer))
                 .await
             {
                 Err(err) => return Ok(super::response::tc_error_response(err)),
-                Ok(Ok(binding)) => binding,
+                Ok(Ok(guard)) => *guard,
                 Ok(Err(err)) => return Ok(super::response::tc_error_response(err)),
             };
 
-            match binding {
-                None => Ok(handle_finalize_result(Ok(()))),
-                Some(BoundTransaction { txn, implicit }) => {
-                    req.extensions_mut().insert(txn.clone());
-                    if !router.is_native(&path) {
-                        let (req, _) = match deadline
-                            .wait(parse_body(
-                                req,
-                                resources.limits().ingress.artifact_body_bytes,
-                            ))
+            {
+                let contract = guard.body_contract();
+                let txn = guard.txn().clone();
+                if let crate::BodyContract::Application { max_bytes: limit } = contract {
+                    let admission = guard.application_admission();
+                    let content_type = req
+                        .headers()
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("application/json");
+                    let is_wasm = match content_type {
+                        "application/json" => false,
+                        "application/wasm" => true,
+                        _ => {
+                            return Ok(super::response::tc_error_response(
+                                tc_error::TCError::bad_request(
+                                    "unsupported application content type",
+                                ),
+                            ));
+                        }
+                    };
+                    let mut body =
+                        crate::http_body::BoundedBody::new(req.into_body(), limit, Some(admission));
+                    let state = if is_wasm {
+                        match (&mut body)
+                            .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                                bytes.extend_from_slice(&chunk);
+                                Ok(bytes)
+                            })
                             .await
                         {
-                            Err(err) => return Ok(super::response::tc_error_response(err)),
-                            Ok(result) => match result {
-                                Ok(pair) => pair,
-                                Err(response) => return Ok(response),
-                            },
-                        };
-                        let mut response =
-                            match deadline.wait(router.call(method, &path, req)).await {
-                                Ok(response) => response,
-                                Err(err) => return Ok(super::response::tc_error_response(err)),
-                            };
-                        if implicit {
-                            let outcome = crate::txn::TransactionOutcome::from_success(
-                                response.status().is_success(),
-                            );
-                            if let Err(err) = kernel.complete_transaction(txn, outcome).await {
-                                response = handle_finalize_result(Err(err));
+                            Ok(bytes) if bytes.is_empty() => {
+                                Err(tc_error::TCError::bad_request("empty WASM Library"))
                             }
+                            Ok(bytes) => Ok(crate::State::Tuple(vec![
+                                crate::State::None,
+                                crate::State::from(tc_value::Value::Bytes(bytes.into())),
+                            ])),
+                            Err(error) => Err(body.decode_error(error)),
                         }
-                        return Ok(response);
-                    }
-                    let body = match deadline
-                        .wait(decode_native_body(
-                            req,
-                            txn.clone(),
-                            resources.limits().ingress.request_body_bytes,
-                        ))
+                    } else {
+                        match destream_json::try_decode::<_, _, crate::literal::Definition>(
+                            (),
+                            &mut body,
+                        )
                         .await
-                    {
-                        Err(err) => return Ok(super::response::tc_error_response(err)),
-                        Ok(result) => match result {
-                            Ok(body) => body,
-                            Err(err) => {
-                                let response = super::response::tc_error_response(err);
-                                if implicit {
-                                    let _ = kernel
-                                        .complete_transaction(
-                                            txn,
-                                            crate::txn::TransactionOutcome::Failed,
-                                        )
-                                        .await;
-                                }
-                                return Ok(response);
+                        {
+                            Ok(crate::literal::Definition(identity, definition)) => {
+                                Ok(crate::State::Tuple(vec![
+                                    crate::State::from(tc_value::Value::Link(identity)),
+                                    crate::State::from_scalar(definition),
+                                ]))
                             }
+                            Err(error) => Err(body.decode_error(error)),
+                        }
+                    };
+                    let _admission = body.permit.take();
+                    let result = match state {
+                        Ok(state) => match guard.execute(Some(state)).await {
+                            Ok(Some(_)) => guard.finish_success().await,
+                            Ok(None) => Ok(()),
+                            Err(error) => Err(error),
                         },
+                        Err(error) => Err(error),
                     };
-                    let path = match pathlink::Link::from_str(&path) {
-                        Ok(path) => path,
-                        Err(err) => return Ok(bad_request_response(&err.to_string())),
-                    };
-                    let result = deadline
-                        .wait(kernel.execute(KernelRequest {
-                            method,
-                            path,
-                            body,
-                            txn: txn.clone(),
-                        }))
-                        .await
-                        .unwrap_or_else(Err);
-                    let mut deferred_finalize = false;
-                    let mut response = match result {
-                        Ok(state) => {
-                            let finalize = implicit.then(|| (kernel.clone(), request_permit));
-                            match deadline
-                                .wait(super::native_state_response(state, txn.clone(), finalize))
-                                .await
-                                .unwrap_or_else(Err)
-                            {
-                                Ok(response) => {
-                                    deferred_finalize = implicit;
-                                    response
-                                }
-                                Err(err) => super::response::tc_error_response(err),
-                            }
+                    return Ok(match result {
+                        Ok(_) => super::response::no_content(),
+                        Err(error) => super::response::tc_error_response(error),
+                    });
+                }
+                let native_body_limit = guard.native_body_limit();
+                let body = match deadline
+                    .wait(decode_native_body(req, txn.clone(), native_body_limit))
+                    .await
+                {
+                    Err(err) => {
+                        return Ok(super::response::tc_error_response(err));
+                    }
+                    Ok(result) => match result {
+                        Ok(body) => body,
+                        Err(err) => {
+                            return Ok(super::response::tc_error_response(err));
                         }
-                        Err(err) if err.code() == tc_error::ErrorKind::NotFound => not_found(),
-                        Err(err) => super::response::tc_error_response(err),
-                    };
-                    if implicit && !deferred_finalize {
-                        let outcome = crate::txn::TransactionOutcome::from_success(
-                            response.status().is_success(),
-                        );
-                        if let Err(err) = kernel.complete_transaction(txn, outcome).await {
-                            response = handle_finalize_result(Err(err));
+                    },
+                };
+                let result = deadline
+                    .wait(guard.execute_bound(body))
+                    .await
+                    .unwrap_or_else(Err);
+                match result {
+                    Ok((Some(state), raw_application_bytes, guard)) => {
+                        match deadline
+                            .wait(super::native_state_response(
+                                state,
+                                txn,
+                                raw_application_bytes,
+                                Some(guard),
+                            ))
+                            .await
+                            .unwrap_or_else(Err)
+                        {
+                            Ok(response) => Ok(response),
+                            Err(err) => Ok(super::response::tc_error_response(err)),
                         }
                     }
-                    Ok(response)
+                    Ok((None, _, _guard)) => Ok(super::response::no_content()),
+                    Err(err) => Ok(super::response::tc_error_response(err)),
                 }
             }
         })
@@ -412,9 +259,8 @@ impl<T> Service<T> for MakeKernelService {
 
     fn call(&mut self, _target: T) -> Self::Future {
         let service = self.service.clone();
-        let resources = service.kernel.resources().clone();
         Box::pin(async move {
-            let permit = resources.admit_connection(resources.deadline()).await?;
+            let permit = service.kernel.admit_connection().await?;
             Ok(ConnectionService {
                 service,
                 _permit: permit,
@@ -443,11 +289,5 @@ impl Service<Request> for ConnectionService {
 }
 
 pub(crate) fn to_kernel_method(method: &hyper::Method) -> Option<Method> {
-    match *method {
-        hyper::Method::GET => Some(Method::Get),
-        hyper::Method::PUT => Some(Method::Put),
-        hyper::Method::POST => Some(Method::Post),
-        hyper::Method::DELETE => Some(Method::Delete),
-        _ => None,
-    }
+    method.as_str().parse().ok()
 }

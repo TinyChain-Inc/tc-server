@@ -1,228 +1,220 @@
+use pathlink::Link;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tc_ir::Claim;
 
-use crate::txn::TxnError;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Claim {
+    pub link: Link,
+    pub mask: umask::Mode,
+}
+
+impl Claim {
+    pub fn new(link: Link, mask: umask::Mode) -> Self {
+        Self { link, mask }
+    }
+
+    pub fn allows(&self, link: &Link, required: umask::Mode) -> bool {
+        self.link == *link && u32::from(self.mask) & u32::from(required) == u32::from(required)
+    }
+}
+
 use futures::future::{BoxFuture, FutureExt};
+
+pub fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
 
 /// A kernel-owned verifier which maps an `Authorization: Bearer ...` token to a stable owner
 /// identity used to pin transaction ownership.
 ///
 /// The trait keeps transaction semantics in the kernel so protocol adapters can remain thin.
 pub trait TokenVerifier: Send + Sync + 'static {
-    fn verify(&self, bearer_token: String) -> BoxFuture<'static, Result<TokenContext, TxnError>>;
+    fn verify(&self, bearer_token: String) -> BoxFuture<'static, tc_error::TCResult<AuthContext>>;
 
     fn grant(
         &self,
-        _token: TokenContext,
+        _token: AuthContext,
         _claim: Claim,
-    ) -> BoxFuture<'static, Result<TokenContext, TxnError>> {
-        futures::future::ready(Err(TxnError::Unauthorized)).boxed()
+    ) -> BoxFuture<'static, tc_error::TCResult<AuthContext>> {
+        futures::future::ready(Err(tc_error::TCError::unauthorized(
+            "claim escalation is not supported",
+        )))
+        .boxed()
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct TokenContext {
-    pub owner_id: String,
-    pub bearer_token: String,
-    pub claims: Vec<(String, String, Claim)>,
-    pub verified_at_nanos: u64,
+pub struct AuthClaimContext {
+    pub host: String,
+    pub actor_id: String,
+    pub claim: Claim,
 }
 
-impl TokenContext {
-    pub fn new(owner_id: impl Into<String>, bearer_token: impl Into<String>) -> Self {
+#[derive(Clone)]
+pub struct AuthContext {
+    pub principal: String,
+    pub claims: Vec<AuthClaimContext>,
+    pub verified_at_nanos: u64,
+    signed: Option<Arc<SignedToken>>,
+}
+
+impl std::fmt::Debug for AuthContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthContext")
+            .field("principal", &self.principal)
+            .field("claims", &self.claims)
+            .field("verified_at_nanos", &self.verified_at_nanos)
+            .field("signed", &self.signed.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl AuthContext {
+    pub fn new(principal: impl Into<String>) -> Self {
         let verified_at_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
         Self {
-            owner_id: owner_id.into(),
-            bearer_token: bearer_token.into(),
+            principal: principal.into(),
             claims: Vec::new(),
             verified_at_nanos,
+            signed: None,
         }
     }
 
     pub fn with_claim(mut self, host: String, actor_id: String, claim: Claim) -> Self {
-        self.claims.push((host, actor_id, claim));
+        self.claims.push(AuthClaimContext {
+            host,
+            actor_id,
+            claim,
+        });
         self
     }
-}
 
-impl<T> TokenVerifier for Arc<T>
-where
-    T: TokenVerifier + ?Sized,
-{
-    fn verify(&self, bearer_token: String) -> BoxFuture<'static, Result<TokenContext, TxnError>> {
-        (**self).verify(bearer_token)
+    pub fn token_hosts(&self) -> Vec<String> {
+        self.claims
+            .iter()
+            .map(|claim| claim.host.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
-    fn grant(
-        &self,
-        token: TokenContext,
-        claim: Claim,
-    ) -> BoxFuture<'static, Result<TokenContext, TxnError>> {
-        (**self).grant(token, claim)
+    pub(crate) fn signed(&self) -> Option<&Arc<SignedToken>> {
+        self.signed.as_ref()
+    }
+
+    pub(crate) fn take_signed(&mut self) -> Option<Arc<SignedToken>> {
+        self.signed.take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_signed(mut self, signed: SignedToken) -> Self {
+        self.signed = Some(Arc::new(signed));
+        self
     }
 }
 
 mod rjwt_token {
     use std::collections::{BTreeMap, HashMap};
-    use std::str::FromStr;
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use futures::FutureExt;
     use parking_lot::RwLock;
     use pathlink::{Link, PathBuf};
-    use rjwt::{Actor, AlgKind, Error as RjwtError, Resolve, SignedToken, Token, VerifyingKey};
-    use tc_value::Value;
+    use rjwt::{
+        Actor as RjwtActor, Error as RjwtError, Resolve, SignedToken as RjwtSignedToken,
+        Token as RjwtToken, VerifyingKey,
+    };
 
-    use crate::auth::{TokenContext, TokenVerifier};
-    use crate::txn::TxnError;
-    use tc_ir::Claim;
+    use crate::auth::{AuthContext, Claim, TokenVerifier};
 
-    /// JWT claim payload accepted at the Python/Rust boundary.
-    ///
-    /// Python `rjwt` encodes a segment as a map of path to mode, while older Rust callers
-    /// issue one `Claim` tuple per segment. Both normalize to the shared IR claim here.
-    #[derive(Clone, serde::Deserialize, serde::Serialize)]
-    #[serde(untagged)]
-    pub enum WireClaims {
-        Claim(Claim),
-        Map(BTreeMap<PathBuf, u32>),
+    pub(crate) type WireClaims = BTreeMap<PathBuf, u32>;
+
+    pub fn claims_from_wire(claims: WireClaims) -> Vec<Claim> {
+        claims
+            .into_iter()
+            .map(|(path, mask)| Claim::new(Link::from(path), mask.into()))
+            .collect()
     }
 
-    impl WireClaims {
-        fn into_claims(self) -> Vec<Claim> {
-            match self {
-                Self::Claim(claim) => vec![claim],
-                Self::Map(claims) => claims
-                    .into_iter()
-                    .map(|(path, mask)| Claim::new(Link::from(path), mask.into()))
-                    .collect(),
-            }
-        }
+    pub fn wire_claim(claim: Claim) -> WireClaims {
+        BTreeMap::from([(claim.link.path().clone(), claim.mask.into())])
     }
 
-    pub type SignedTokenV1 = SignedToken<Link, String, Claim>;
-    pub type TokenV1 = Token<Link, String, Claim>;
-    pub type ActorV1 = Actor<String>;
+    pub type SignedToken = RjwtSignedToken<Link, String, WireClaims>;
+    pub type Token = RjwtToken<Link, String, WireClaims>;
+    pub type Actor = RjwtActor<String>;
+
+    #[derive(Default)]
+    struct ActorDirectory {
+        actors: HashMap<(Link, String), Actor>,
+        keys: HashMap<String, VerifyingKey>,
+    }
 
     #[derive(Clone, Default)]
-    pub struct KeyringActorResolver {
-        actors: Arc<RwLock<HashMap<(Link, String), ActorV1>>>,
-    }
+    pub struct KeyringActorResolver(Arc<RwLock<ActorDirectory>>);
 
     impl KeyringActorResolver {
-        pub fn with_actor(self, host: Link, actor: ActorV1) -> Self {
-            self.actors
-                .write()
-                .insert((host, actor.id().clone()), actor);
-            self
-        }
-    }
-
-    #[derive(Clone, Default)]
-    pub struct PublicKeyStore {
-        keys: Arc<RwLock<HashMap<String, VerifyingKey>>>,
-    }
-
-    impl PublicKeyStore {
-        pub fn insert(&self, actor_id: impl Into<String>, key: VerifyingKey) {
-            self.keys.write().insert(actor_id.into(), key);
-        }
-
-        pub fn insert_actor(&self, actor: &ActorV1) {
-            self.insert(actor.id().clone(), actor.verifying_key());
+        pub fn insert(&self, host: Link, actor: Actor) -> tc_error::TCResult<()> {
+            let actor_id = actor.id().clone();
+            let key = actor.verifying_key();
+            let mut directory = self.0.write();
+            if directory
+                .keys
+                .get(&actor_id)
+                .is_some_and(|known| known.to_bytes() != key.to_bytes())
+            {
+                return Err(tc_error::TCError::conflict(format!(
+                    "actor {actor_id} has conflicting public keys"
+                )));
+            }
+            directory.keys.insert(actor_id.clone(), key);
+            directory.actors.insert((host, actor_id), actor);
+            Ok(())
         }
 
         pub fn public_key(&self, actor_id: &str) -> Option<VerifyingKey> {
-            self.keys.read().get(actor_id).cloned()
+            self.0.read().keys.get(actor_id).cloned()
+        }
+
+        pub(crate) fn public_key_state(&self, actor_id: &str) -> tc_error::TCResult<crate::State> {
+            use base64::Engine as _;
+
+            let key = self
+                .public_key(actor_id)
+                .ok_or_else(|| tc_error::TCError::not_found(actor_id))?;
+            Ok(crate::State::from(tc_value::Value::from(
+                base64::engine::general_purpose::STANDARD.encode(key.to_bytes()),
+            )))
         }
     }
 
-    pub fn verifying_key_from_bytes(bytes: &[u8]) -> Result<VerifyingKey, RjwtError> {
-        VerifyingKey::from_bytes(AlgKind::Falcon512, bytes)
-            .or_else(|_| VerifyingKey::from_bytes(AlgKind::Ed25519, bytes))
+    pub fn verifying_key_from_bytes(
+        algorithm: rjwt::AlgKind,
+        bytes: &[u8],
+    ) -> Result<VerifyingKey, RjwtError> {
+        VerifyingKey::from_bytes(algorithm, bytes)
     }
 
     #[async_trait]
     pub trait ActorResolver: Send + Sync + 'static {
-        async fn resolve_actor(&self, host: &Link, actor_id: &str) -> Result<ActorV1, TxnError>;
+        async fn resolve_actor(&self, host: &Link, actor_id: &str) -> tc_error::TCResult<Actor>;
     }
 
     #[async_trait]
     impl ActorResolver for KeyringActorResolver {
-        async fn resolve_actor(&self, host: &Link, actor_id: &str) -> Result<ActorV1, TxnError> {
-            self.actors
+        async fn resolve_actor(&self, host: &Link, actor_id: &str) -> tc_error::TCResult<Actor> {
+            self.0
                 .read()
+                .actors
                 .get(&(host.clone(), actor_id.to_string()))
                 .cloned()
-                .ok_or(TxnError::Unauthorized)
-        }
-    }
-
-    #[cfg(feature = "http-client")]
-    #[derive(Clone)]
-    pub struct RpcActorResolver {
-        gateway: Arc<dyn crate::gateway::RpcGateway>,
-        txn: crate::txn::TxnHandle,
-    }
-
-    #[cfg(feature = "http-client")]
-    impl RpcActorResolver {
-        pub fn new(
-            gateway: Arc<dyn crate::gateway::RpcGateway>,
-            txn: crate::txn::TxnHandle,
-        ) -> Self {
-            Self { gateway, txn }
-        }
-    }
-
-    #[cfg(feature = "http-client")]
-    #[async_trait]
-    impl ActorResolver for RpcActorResolver {
-        async fn resolve_actor(&self, host: &Link, actor_id: &str) -> Result<ActorV1, TxnError> {
-            use base64::Engine as _;
-
-            let target = {
-                let host_segment =
-                    pathlink::PathSegment::from_str("host").map_err(|_| TxnError::Unauthorized)?;
-                let key_segment = pathlink::PathSegment::from_str("public_key")
-                    .map_err(|_| TxnError::Unauthorized)?;
-                host.clone().append(host_segment).append(key_segment)
-            };
-
-            let response = self
-                .gateway
-                .get(
-                    target,
-                    // Public-key discovery bootstraps bearer verification. Do not attach the
-                    // unverified bearer token to the lookup request; application dependency calls
-                    // still propagate verified transaction tokens through the kernel gateway.
-                    self.txn.without_bearer_token(),
-                    tc_ir::Scalar::Value(Value::String(actor_id.to_string())),
-                )
-                .await
-                .map_err(|_| TxnError::Unauthorized)?;
-
-            let encoded = match response {
-                tc_state::State::Scalar(tc_ir::Scalar::Value(Value::String(s))) => s,
-                _ => return Err(TxnError::Unauthorized),
-            };
-
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|_| TxnError::Unauthorized)?;
-
-            let verifying_key =
-                verifying_key_from_bytes(bytes.as_slice()).map_err(|_| TxnError::Unauthorized)?;
-
-            Ok(Actor::with_verifying_key(
-                actor_id.to_string(),
-                verifying_key,
-            ))
+                .ok_or_else(|| tc_error::TCError::unauthorized("unknown token actor"))
         }
     }
 
@@ -246,7 +238,7 @@ mod rjwt_token {
             &self,
             host: &Self::HostId,
             actor_id: &Self::ActorId,
-        ) -> impl std::future::Future<Output = Result<Actor<Self::ActorId>, RjwtError>> + Send
+        ) -> impl std::future::Future<Output = Result<RjwtActor<Self::ActorId>, RjwtError>> + Send
         {
             let resolver = self.resolver.clone();
             let host = host.clone();
@@ -264,27 +256,29 @@ mod rjwt_token {
         fn verify(
             &self,
             bearer_token: String,
-        ) -> futures::future::BoxFuture<'static, Result<TokenContext, TxnError>> {
+        ) -> futures::future::BoxFuture<'static, tc_error::TCResult<AuthContext>> {
             let this = self.clone();
             async move {
                 let signed =
                     Resolve::verify(&this, bearer_token.clone(), std::time::SystemTime::now())
                         .await
-                        .map_err(|_| TxnError::Unauthorized)?;
+                        .map_err(|_| tc_error::TCError::unauthorized("invalid bearer token"))?;
 
                 let mut claims = signed.claims().iter();
-                let (owner_host, owner_actor_id, owner_claims) =
-                    claims.next().ok_or(TxnError::Unauthorized)?;
+                let (owner_host, owner_actor_id, owner_claims) = claims
+                    .next()
+                    .ok_or_else(|| tc_error::TCError::unauthorized("bearer token has no owner"))?;
 
                 let owner_id = format!("{owner_host}::{}", owner_actor_id.clone());
-                let mut ctx = TokenContext::new(owner_id, bearer_token);
+                let mut ctx = AuthContext::new(owner_id);
+                ctx.signed = Some(Arc::new(signed.clone()));
 
-                for claim in owner_claims.clone().into_claims() {
+                for claim in claims_from_wire(owner_claims.clone()) {
                     ctx = ctx.with_claim(owner_host.to_string(), owner_actor_id.clone(), claim);
                 }
 
                 for (host, actor_id, claims) in claims {
-                    for claim in claims.clone().into_claims() {
+                    for claim in claims_from_wire(claims.clone()) {
                         ctx = ctx.with_claim(host.to_string(), actor_id.clone(), claim);
                     }
                 }
@@ -296,30 +290,28 @@ mod rjwt_token {
 
         fn grant(
             &self,
-            token: TokenContext,
+            token: AuthContext,
             claim: Claim,
-        ) -> futures::future::BoxFuture<'static, Result<TokenContext, TxnError>> {
+        ) -> futures::future::BoxFuture<'static, tc_error::TCResult<AuthContext>> {
             let required_link = claim.link.clone();
             let required_mode = claim.mask;
             let allowed = token
                 .claims
                 .iter()
-                .any(|(_, _, existing)| existing.allows(&required_link, required_mode));
+                .any(|existing| existing.claim.allows(&required_link, required_mode));
 
             futures::future::ready(if allowed {
                 Ok(token)
             } else {
-                Err(TxnError::Unauthorized)
+                Err(tc_error::TCError::unauthorized("claim is not authorized"))
             })
             .boxed()
         }
     }
 }
 
+pub(crate) use rjwt_token::WireClaims;
 pub use rjwt_token::{
-    ActorResolver as RjwtActorResolver, ActorV1 as Actor, KeyringActorResolver, PublicKeyStore,
-    RjwtTokenVerifier, SignedTokenV1 as SignedToken, TokenV1 as Token, verifying_key_from_bytes,
+    Actor, ActorResolver as RjwtActorResolver, KeyringActorResolver, RjwtTokenVerifier,
+    SignedToken, Token, claims_from_wire, verifying_key_from_bytes, wire_claim,
 };
-
-#[cfg(feature = "http-client")]
-pub use rjwt_token::RpcActorResolver;

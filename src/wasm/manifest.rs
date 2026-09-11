@@ -1,89 +1,121 @@
-use std::str::FromStr;
+use std::io;
 
-use pathlink::PathSegment;
-use serde::Deserialize;
+use bytes::Bytes;
+use destream::de;
+use futures::stream;
+use pathlink::{Link, PathSegment};
 use tc_error::{TCError, TCResult};
-use tc_ir::{LibrarySchema, parse_route_path};
+use tc_ir::Scalar;
 
-#[derive(Debug)]
-pub(super) struct WasmManifest {
-    pub(super) schema: LibrarySchema,
+pub(super) struct WasmEntry {
+    pub(super) identity: Link,
+    pub(super) definition: Scalar,
     pub(super) routes: Vec<RouteBinding>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RouteBinding {
     pub(crate) path: Vec<PathSegment>,
     pub(crate) export: String,
 }
 
-impl WasmManifest {
-    fn new(schema: LibrarySchema, routes: Vec<RouteBinding>) -> Self {
-        Self { schema, routes }
+impl de::FromStream for RouteBinding {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(
+        _context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        struct BindingVisitor;
+        impl de::Visitor for BindingVisitor {
+            type Value = RouteBinding;
+
+            fn expecting() -> &'static str {
+                "a WASM route binding"
+            }
+
+            async fn visit_map<A: de::MapAccess>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut path = None;
+                let mut export = None;
+                while let Some(key) = map.next_key::<String>(()).await? {
+                    match key.as_str() {
+                        "path" => path = Some(map.next_value::<String>(()).await?),
+                        "export" => export = Some(map.next_value(()).await?),
+                        _ => return Err(de::Error::custom(format!("unknown route field {key}"))),
+                    }
+                }
+                let path: Link = path
+                    .ok_or_else(|| de::Error::custom("missing route path"))?
+                    .parse()
+                    .map_err(de::Error::custom)?;
+                if path.host().is_some() || path.path().is_empty() {
+                    return Err(de::Error::custom(
+                        "a WASM route must be a local nonempty path",
+                    ));
+                }
+                Ok(RouteBinding {
+                    path: path.path().to_vec(),
+                    export: export.ok_or_else(|| de::Error::custom("missing route export"))?,
+                })
+            }
+        }
+        decoder.decode_map(BindingVisitor).await
     }
 }
 
-#[derive(Deserialize)]
-struct ManifestSerde {
-    schema: serde_json::Value,
-    routes: Vec<RouteEntrySerde>,
-}
+impl de::FromStream for WasmEntry {
+    type Context = ();
 
-#[derive(Deserialize)]
-struct RouteEntrySerde {
-    path: String,
-    export: String,
-}
+    async fn from_stream<D: de::Decoder>(
+        _context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        struct EntryVisitor;
+        impl de::Visitor for EntryVisitor {
+            type Value = WasmEntry;
 
-pub(super) fn decode_manifest(bytes: Vec<u8>) -> TCResult<WasmManifest> {
-    let manifest: ManifestSerde = serde_json::from_slice(&bytes)
-        .map_err(|err| TCError::bad_request(format!("invalid wasm manifest: {err}")))?;
-    let schema = parse_schema_value(&manifest.schema)?;
-    let routes = manifest
-        .routes
-        .into_iter()
-        .map(|entry| {
-            let path = parse_route_path(&entry.path)
-                .map_err(|err| TCError::bad_request(err.message().to_string()))?;
-            Ok(RouteBinding {
-                path,
-                export: entry.export,
-            })
-        })
-        .collect::<TCResult<Vec<_>>>()?;
-    Ok(WasmManifest::new(schema, routes))
-}
+            fn expecting() -> &'static str {
+                "a canonical WASM Library entry"
+            }
 
-fn parse_schema_value(value: &serde_json::Value) -> TCResult<LibrarySchema> {
-    let id = value
-        .get("id")
-        .and_then(|id| id.as_str())
-        .ok_or_else(|| TCError::bad_request("manifest schema missing id"))?;
-    let version = value
-        .get("version")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| TCError::bad_request("manifest schema missing version"))?;
-    let dependencies = value
-        .get("dependencies")
-        .and_then(|deps| deps.as_array())
-        .ok_or_else(|| TCError::bad_request("manifest schema missing dependencies array"))?;
-
-    let id = pathlink::Link::from_str(id)
-        .map_err(|err| TCError::bad_request(format!("invalid schema id: {err}")))?;
-    let deps = dependencies
-        .iter()
-        .map(|dep| {
-            dep.as_str()
-                .ok_or_else(|| TCError::bad_request("dependency must be a string"))
-                .and_then(|link| {
-                    pathlink::Link::from_str(link).map_err(|err| {
-                        TCError::bad_request(format!("invalid dependency id: {err}"))
-                    })
+            async fn visit_map<A: de::MapAccess>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut definition = None;
+                let mut routes = None;
+                while let Some(key) = map.next_key::<String>(()).await? {
+                    match key.as_str() {
+                        "definition" => {
+                            let crate::literal::Definition(identity, value) =
+                                map.next_value(()).await?;
+                            definition = Some((identity, value));
+                        }
+                        "routes" => routes = Some(map.next_value(()).await?),
+                        _ => return Err(de::Error::custom(format!("unknown WASM field {key}"))),
+                    }
+                }
+                let (identity, definition) =
+                    definition.ok_or_else(|| de::Error::custom("missing Library definition"))?;
+                Ok(WasmEntry {
+                    identity,
+                    definition,
+                    routes: routes.ok_or_else(|| de::Error::custom("missing routes"))?,
                 })
-        })
-        .collect::<TCResult<Vec<_>>>()?;
+            }
+        }
+        decoder.decode_map(EntryVisitor).await
+    }
+}
 
-    Ok(LibrarySchema::new(id, version, deps))
+pub(super) async fn decode_entry(bytes: Vec<u8>) -> TCResult<WasmEntry> {
+    let input = stream::iter([Ok::<_, io::Error>(Bytes::from(bytes))]);
+    destream_json::try_decode((), input)
+        .await
+        .map_err(|err| TCError::bad_request(format!("invalid WASM entry: {err}")))
 }
 
 pub(super) fn format_path(path: &[PathSegment]) -> String {

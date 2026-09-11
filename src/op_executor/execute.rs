@@ -1,129 +1,57 @@
 use crate::State;
-use pathlink::Link;
+use safecast::TryCastFrom;
 use tc_error::{TCError, TCResult};
-use tc_ir::{Map, OpDef, Scalar};
+use tc_ir::OpDef;
 
-use super::Executor;
+use super::executor::Executor;
 
-pub async fn execute_get(txn: &crate::txn::TxnHandle, op: OpDef, key: Scalar) -> TCResult<State> {
-    execute_get_with_self(txn, op, key, None).await
-}
-
-pub async fn execute_get_with_self(
+pub(crate) async fn execute(
     txn: &crate::txn::TxnHandle,
     op: OpDef,
-    key: Scalar,
-    self_link: Option<Link>,
+    args: State,
+    self_state: Option<State>,
 ) -> TCResult<State> {
-    let OpDef::Get((key_name, form)) = op else {
-        return Err(TCError::bad_request(
-            "expected GET op definition".to_string(),
-        ));
+    op.validate()?;
+    let returns_value = matches!(&op, OpDef::Get(_) | OpDef::Post(_));
+    let (data, form) = match op {
+        OpDef::Get((key_name, form)) | OpDef::Delete((key_name, form)) => {
+            let key = tc_ir::Scalar::try_cast_from(args, |_| {
+                TCError::bad_request("GET and DELETE OpDefs expect a scalar key")
+            })?;
+            (vec![(key_name, State::from_scalar(key))], form)
+        }
+        OpDef::Put((key_name, value_name, form)) => {
+            let State::Tuple(mut args) = args else {
+                return Err(TCError::bad_request("PUT OpDef expects [key, value]"));
+            };
+            if args.len() != 2 {
+                return Err(TCError::bad_request("PUT OpDef expects [key, value]"));
+            }
+            let value = args.pop().expect("PUT argument length checked");
+            let key = tc_ir::Scalar::try_cast_from(
+                args.pop().expect("PUT argument length checked"),
+                |_| TCError::bad_request("PUT OpDef expects a scalar key"),
+            )?;
+            (
+                vec![(key_name, State::from_scalar(key)), (value_name, value)],
+                form,
+            )
+        }
+        OpDef::Post(form) => {
+            let State::Map(params) = args else {
+                return Err(TCError::bad_request("POST OpDef expects a parameter map"));
+            };
+            (params.into_iter().collect(), form)
+        }
     };
 
-    let capture = form
-        .last()
-        .map(|(id, _)| id.clone())
-        .unwrap_or_else(|| "_result".parse().expect("Id"));
-
-    let data = [(key_name, State::from_scalar(key))];
-    Executor::new_with_self(txn, data, form, self_link)?
-        .capture(capture)
-        .await
-}
-
-pub async fn execute_put(
-    txn: &crate::txn::TxnHandle,
-    op: OpDef,
-    key: Scalar,
-    value: State,
-) -> TCResult<()> {
-    execute_put_with_self(txn, op, key, value, None).await
-}
-
-pub async fn execute_put_with_self(
-    txn: &crate::txn::TxnHandle,
-    op: OpDef,
-    key: Scalar,
-    value: State,
-    self_link: Option<Link>,
-) -> TCResult<()> {
-    let OpDef::Put((key_name, value_name, form)) = op else {
-        return Err(TCError::bad_request(
-            "expected PUT op definition".to_string(),
-        ));
-    };
-
-    let capture = match form.last() {
-        Some((id, _)) => id.clone(),
-        None => return Ok(()),
-    };
-
-    let data = [(key_name, State::from_scalar(key)), (value_name, value)];
-    Executor::new_with_self(txn, data, form, self_link)?
+    let capture = form.last().expect("validated nonempty OpDef").0.clone();
+    let result = Executor::new_with_self(txn, data, form, self_state)?
         .capture(capture)
         .await?;
-    Ok(())
-}
-
-pub async fn execute_post(
-    txn: &crate::txn::TxnHandle,
-    op: OpDef,
-    params: Map<State>,
-) -> TCResult<State> {
-    execute_post_with_self(txn, op, params, None).await
-}
-
-pub async fn execute_post_with_self(
-    txn: &crate::txn::TxnHandle,
-    op: OpDef,
-    params: Map<State>,
-    self_link: Option<Link>,
-) -> TCResult<State> {
-    let OpDef::Post(form) = op else {
-        return Err(TCError::bad_request(
-            "expected POST op definition".to_string(),
-        ));
-    };
-
-    let capture = form
-        .last()
-        .map(|(id, _)| id.clone())
-        .unwrap_or_else(|| "_result".parse().expect("Id"));
-
-    let mut data = Vec::with_capacity(params.len());
-    for (key, value) in params {
-        data.push((key, value));
-    }
-    Executor::new_with_self(txn, data, form, self_link)?
-        .capture(capture)
-        .await
-}
-
-pub async fn execute_delete(txn: &crate::txn::TxnHandle, op: OpDef, key: Scalar) -> TCResult<()> {
-    execute_delete_with_self(txn, op, key, None).await
-}
-
-pub async fn execute_delete_with_self(
-    txn: &crate::txn::TxnHandle,
-    op: OpDef,
-    key: Scalar,
-    self_link: Option<Link>,
-) -> TCResult<()> {
-    let OpDef::Delete((key_name, form)) = op else {
-        return Err(TCError::bad_request(
-            "expected DELETE op definition".to_string(),
-        ));
-    };
-
-    let capture = match form.last() {
-        Some((id, _)) => id.clone(),
-        None => return Ok(()),
-    };
-
-    let data = [(key_name, State::from_scalar(key))];
-    Executor::new_with_self(txn, data, form, self_link)?
-        .capture(capture)
-        .await?;
-    Ok(())
+    Ok(if returns_value {
+        result
+    } else {
+        State::default()
+    })
 }

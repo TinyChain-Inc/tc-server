@@ -2,7 +2,7 @@ use tc_error::{TCError, TCResult};
 use tc_ir::TxnId;
 use url::form_urlencoded;
 
-const MAX_INBOUND_TXN_CLOCK_SKEW_NANOS: u64 = 3_000_000_000;
+pub(crate) const MAX_INBOUND_TXN_CLOCK_SKEW_NANOS: u64 = 3_000_000_000;
 
 fn validate_inbound_txn_id(txn_id: TxnId) -> TCResult<TxnId> {
     let timestamp = txn_id.timestamp().as_nanos();
@@ -44,7 +44,6 @@ pub(crate) fn parse_txn_id_query(query: Option<&str>) -> TCResult<Option<TxnId>>
     }
 }
 
-#[cfg(feature = "pyo3")]
 pub(crate) fn split_path_and_txn_id(raw: &str) -> TCResult<(String, Option<TxnId>)> {
     if let Some((path, query)) = raw.split_once('?') {
         Ok((path.to_string(), parse_txn_id_query(Some(query))?))
@@ -109,7 +108,6 @@ mod tests {
         assert!(err.message().contains("invalid transaction id"));
     }
 
-    #[cfg(feature = "pyo3")]
     #[test]
     fn split_path_rejects_partial_transaction_id_without_trace() {
         let err =
@@ -117,7 +115,6 @@ mod tests {
         assert!(err.message().contains("invalid transaction id"));
     }
 
-    #[cfg(feature = "pyo3")]
     #[test]
     fn split_path_rejects_zero_timestamp_transaction_id() {
         let txn_id = TxnId::from_parts(NetworkTime::from_nanos(0), 0).with_trace([1; 32]);

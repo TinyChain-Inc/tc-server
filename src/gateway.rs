@@ -28,3 +28,32 @@ pub trait RpcGateway: Send + Sync + 'static {
     fn delete(&self, target: Link, txn: TxnHandle, key: Scalar)
     -> BoxFuture<'static, TCResult<()>>;
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalRpcGateway;
+
+fn local_only<T: Send + 'static>() -> BoxFuture<'static, TCResult<T>> {
+    Box::pin(async {
+        Err(tc_error::TCError::bad_gateway(
+            "local host has no RPC transport",
+        ))
+    })
+}
+
+impl RpcGateway for LocalRpcGateway {
+    fn get(&self, _: Link, _: TxnHandle, _: Scalar) -> BoxFuture<'static, TCResult<State>> {
+        local_only()
+    }
+
+    fn put(&self, _: Link, _: TxnHandle, _: Scalar, _: State) -> BoxFuture<'static, TCResult<()>> {
+        local_only()
+    }
+
+    fn post(&self, _: Link, _: TxnHandle, _: Map<State>) -> BoxFuture<'static, TCResult<State>> {
+        local_only()
+    }
+
+    fn delete(&self, _: Link, _: TxnHandle, _: Scalar) -> BoxFuture<'static, TCResult<()>> {
+        local_only()
+    }
+}

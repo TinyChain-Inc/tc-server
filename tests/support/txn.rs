@@ -1,0 +1,503 @@
+use super::*;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use crate::auth::Actor;
+use tc_collection::StorageContext;
+fn current_txn_id(nonce: u16) -> TxnId {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos() as u64;
+    TxnId::from_parts(NetworkTime::from_nanos(now), nonce)
+}
+
+#[tokio::test]
+async fn a_bound_transaction_deadline_can_only_be_restricted() {
+    let txn = test_txn("deadline-restriction").await;
+    let original = txn.deadline();
+    let later = crate::Deadline::after(Duration::from_secs(60));
+    let unchanged = txn.restrict_deadline(later);
+    assert_eq!(unchanged.deadline().instant(), original.instant());
+
+    let earlier = crate::Deadline::after(Duration::from_millis(1));
+    let restricted = txn.restrict_deadline(earlier);
+    assert_eq!(restricted.deadline().instant(), earlier.instant());
+}
+
+#[tokio::test]
+async fn workspace_subcontexts_preserve_transaction_identity() {
+    let workspace = test_workspace("subcontexts");
+    let txn = test_txn_with_workspace("workspace-test", workspace).await;
+    let named = txn
+        .subcontext("state")
+        .subcontext("collection")
+        .subcontext("btree");
+    let temporary = txn.subcontext_unique();
+    assert_eq!(named.id(), txn.id());
+    assert_eq!(temporary.id(), txn.id());
+    let named = named.context().await.expect("named context");
+    let temporary = temporary.context().await.expect("temporary context");
+    let mut named = named.write().await;
+    named
+        .get_or_create_dir("named-only".to_string())
+        .expect("named child");
+    drop(named);
+    let temporary = temporary.read().await;
+    assert!(temporary.get_dir("named-only").is_none());
+}
+#[tokio::test]
+async fn cluster_claims_are_request_local_and_deterministic() {
+    let root =
+        std::env::temp_dir().join(format!("tc-txn-resource-enlistment-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("workspace root");
+    let first: pathlink::PathBuf = "/lib".parse().expect("path");
+    let second: pathlink::PathBuf = "/class".parse().expect("path");
+    let workspace = crate::HostStorage::new(&crate::HostLimits::default().storage)
+        .workspace(&root)
+        .expect("workspace");
+    let kernel = test_kernel_with(
+        "resource-enlistment",
+        std::time::Duration::from_secs(3),
+        workspace.clone(),
+    )
+    .await;
+    let txn = kernel.test_txn().await;
+    assert!(txn.raw_token().is_none(), "allocation must be ownerless");
+    kernel
+        .test_libraries()
+        .claim(&txn)
+        .await
+        .expect("first claim");
+    kernel
+        .test_classes()
+        .claim(&txn)
+        .await
+        .expect("second claim");
+    kernel
+        .test_libraries()
+        .claim(&txn)
+        .await
+        .expect("idempotent claim");
+    assert!(
+        txn.raw_token().is_some(),
+        "first cluster must claim ownership"
+    );
+    let resources = txn
+        .claimed_paths()
+        .into_iter()
+        .map(|path| path.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        resources,
+        std::collections::BTreeSet::from([first.to_string(), second.to_string()])
+    );
+    assert!(!txn.is_mutated());
+    let ids = workspace.transaction_ids().await.expect("transaction IDs");
+    assert!(
+        ids.is_empty(),
+        "application claims must not create workspaces"
+    );
+    std::fs::remove_dir_all(root).expect("remove workspace root");
+}
+#[tokio::test]
+async fn workspace_cleanup_removes_every_transaction_child_together() {
+    let workspace = test_workspace("cleanup");
+    let ttl = std::time::Duration::from_millis(10);
+    let kernel = test_kernel_with("workspace-cleanup-test", ttl, workspace.clone()).await;
+    let txn = kernel.test_txn().await;
+    txn.subcontext("state")
+        .subcontext("collection")
+        .subcontext("btree")
+        .context()
+        .await
+        .expect("named context");
+    txn.subcontext_unique()
+        .context()
+        .await
+        .expect("temporary context");
+    assert!(
+        workspace
+            .has_transaction(txn.id())
+            .await
+            .expect("transaction exists")
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while workspace
+            .has_transaction(txn.id())
+            .await
+            .expect("transaction state")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("TTL workspace cleanup");
+    assert!(
+        !workspace
+            .has_transaction(txn.id())
+            .await
+            .expect("transaction removed")
+    );
+}
+use crate::auth::{RjwtTokenVerifier, SignedToken, Token, TokenVerifier};
+use tc_ir::{NetworkTime, TxnId};
+
+use crate::Claim;
+use umask::Mode;
+
+fn signed_claim_chain(actor: &Actor, claims: impl IntoIterator<Item = Claim>) -> SignedToken {
+    let host = pathlink::Link::from_str("/host").expect("host link");
+    let now = SystemTime::now();
+    let mut claims = claims.into_iter();
+    let first = claims.next().expect("nonempty claim chain");
+    let token = Token::new(
+        host.clone(),
+        now,
+        Duration::from_secs(30),
+        actor.id().clone(),
+        crate::auth::wire_claim(first),
+    );
+    claims.fold(
+        actor.sign_token(token).expect("signed token"),
+        |token, claim| {
+            actor
+                .consume_and_sign(token, host.clone(), crate::auth::wire_claim(claim), now)
+                .expect("extend signed token")
+        },
+    )
+}
+
+fn claim(path: &str) -> Claim {
+    Claim::new(
+        pathlink::Link::from_str(path).expect("claim link"),
+        umask::USER_EXEC,
+    )
+}
+
+fn snapshot_error(txn_id: TxnId, token: &SignedToken) -> tc_error::TCError {
+    match crate::txn::protocol_snapshot(txn_id, token) {
+        Ok(_) => panic!("invalid protocol claims must fail"),
+        Err(error) => error,
+    }
+}
+
+#[tokio::test]
+async fn mints_host_signed_bearer_token_for_unauthenticated_txn() {
+    let kernel = test_kernel("test-host").await;
+    let server = kernel.test_txn_server();
+    let handle = kernel.test_txn().await;
+    assert!(handle.raw_token().is_none(), "allocation must be ownerless");
+    kernel
+        .test_libraries()
+        .claim(&handle)
+        .await
+        .expect("first cluster claims transaction ownership");
+    let bearer = handle
+        .raw_token()
+        .expect("the first cluster must mint a protocol bearer token");
+    let txn_link =
+        pathlink::Link::from_str(&crate::uri::transaction_path(handle.id())).expect("txn link");
+    assert!(handle.has_claim(&txn_link, umask::USER_EXEC));
+    assert!(!handle.has_claim(&txn_link, umask::USER_WRITE));
+    let keyring = crate::auth::KeyringActorResolver::default();
+    keyring
+        .insert(
+            server.protocol_authority().host().clone(),
+            Actor::with_verifying_key(
+                server.protocol_authority().actor_id().to_string(),
+                server.protocol_authority().verifying_key(),
+            ),
+        )
+        .expect("unique protocol actor");
+    let verifier = RjwtTokenVerifier::new(std::sync::Arc::new(keyring));
+    let ctx = verifier
+        .verify(bearer.to_string())
+        .await
+        .expect("host-signed protocol token verifies");
+    let snapshot = crate::txn::protocol_snapshot(
+        handle.id(),
+        ctx.signed()
+            .map(Arc::as_ref)
+            .expect("verified signed token"),
+    )
+    .expect("protocol claims");
+    assert_eq!(
+        snapshot.owner,
+        Some((
+            server.protocol_authority().host().to_string(),
+            server.protocol_authority().actor_id().to_string(),
+        ))
+    );
+}
+
+#[tokio::test]
+async fn preserves_an_append_only_claim_chain() {
+    let handle = test_txn("test-host").await;
+    let txn_id = handle.id();
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate Falcon-512 actor");
+    let txn_claim = claim(&crate::uri::transaction_path(txn_id));
+    let signed = signed_claim_chain(&actor, [txn_claim.clone(), claim("/lib/auth")]);
+    let updated = handle.with_signed_token(signed).expect("token accepted");
+    assert!(updated.has_claim(&txn_claim.link, txn_claim.mask));
+    handle
+        .with_signed_token(signed_claim_chain(
+            &actor,
+            [txn_claim, claim("/lib/other"), claim("/lib/final")],
+        ))
+        .expect("later resource grants preserve the transaction owner");
+}
+
+#[tokio::test]
+async fn coordinator_is_the_first_claimed_resource_not_the_first_sorted_path() {
+    let handle = test_txn("claim-order").await;
+    let txn_id = handle.id();
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate actor");
+    let signed = signed_claim_chain(
+        &actor,
+        [
+            claim(&crate::uri::transaction_path(txn_id)),
+            claim("/service/z/1.0.0"),
+            claim("/class/a/1.0.0"),
+        ],
+    );
+    let snapshot = crate::txn::protocol_snapshot(txn_id, &signed).expect("protocol snapshot");
+    assert_eq!(
+        snapshot.coordinator.expect("coordinator").to_string(),
+        "/service/z/1.0.0"
+    );
+}
+
+#[tokio::test]
+async fn rejects_resource_leadership_before_transaction_ownership() {
+    let handle = test_txn("claim-order-invalid").await;
+    let txn_id = handle.id();
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate actor");
+    let signed = signed_claim_chain(
+        &actor,
+        [
+            claim("/lib/a/1.0.0"),
+            claim(&crate::uri::transaction_path(txn_id)),
+        ],
+    );
+    let error = snapshot_error(txn_id, &signed);
+    assert!(error.message().contains("precedes transaction ownership"));
+}
+
+#[tokio::test]
+async fn rejects_ambiguous_owners_and_conflicting_leaders() {
+    let txn_id = test_txn("ambiguous-claims").await.id();
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate actor");
+    let txn = claim(&crate::uri::transaction_path(txn_id));
+    let duplicate_owner = signed_claim_chain(&actor, [txn.clone(), txn.clone()]);
+    assert!(
+        snapshot_error(txn_id, &duplicate_owner)
+            .message()
+            .contains("multiple transaction owners")
+    );
+
+    let host = pathlink::Link::from_str("/host").expect("host link");
+    let now = SystemTime::now();
+    let grants = [txn.clone(), claim("/lib/a/1.0.0"), claim("/class/a/1.0.0")]
+        .into_iter()
+        .map(|claim| (claim.link.path().clone(), claim.mask.into()))
+        .collect();
+    let token = Token::new(
+        host.clone(),
+        now,
+        Duration::from_secs(30),
+        actor.id().clone(),
+        grants,
+    );
+    let ambiguous = actor.sign_token(token).expect("sign ambiguous claims");
+    assert!(
+        snapshot_error(txn_id, &ambiguous)
+            .message()
+            .contains("ambiguous")
+    );
+
+    let first = signed_claim_chain(&actor, [txn, claim("/lib/a/1.0.0")]);
+    let other = Actor::new_falcon512("actor-b".to_string()).expect("generate other actor");
+    let conflicting = other
+        .consume_and_sign(
+            first,
+            host,
+            crate::auth::wire_claim(claim("/lib/a/1.0.0")),
+            now,
+        )
+        .expect("append conflicting leader");
+    assert_eq!(
+        snapshot_error(txn_id, &conflicting).code(),
+        tc_error::ErrorKind::Conflict
+    );
+}
+
+#[tokio::test]
+async fn handle_construction_rejects_malformed_protocol_claims() {
+    let kernel = test_kernel("constructor-claims").await;
+    let allocated = kernel.test_txn().await;
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate Falcon-512 actor");
+    let signed = signed_claim_chain(&actor, [claim("/lib/example-devco/a/1.0.0")]);
+    let context = crate::auth::AuthContext::new(actor.id().clone()).with_signed(signed);
+
+    let error = kernel
+        .test_bind(Some(allocated.id()), Some(&context))
+        .await
+        .expect_err("resource leadership before transaction ownership must be rejected");
+    assert_eq!(error.code(), tc_error::ErrorKind::Unauthorized);
+}
+
+#[tokio::test]
+async fn rejects_signed_token_for_different_transaction_id() {
+    use std::time::{Duration, SystemTime};
+
+    use rjwt::Actor;
+
+    let handle = test_txn("test-host").await;
+    let other_txn_id = TxnId::from_parts(NetworkTime::from_nanos(99), 1).with_trace([9; 32]);
+
+    let host = pathlink::Link::from_str("/host").expect("host link");
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate Falcon-512 actor");
+    let now = SystemTime::now();
+    let token = Token::new(
+        host,
+        now,
+        Duration::from_secs(30),
+        actor.id().clone(),
+        crate::auth::wire_claim(Claim::new(
+            pathlink::Link::from_str(&crate::uri::transaction_path(other_txn_id))
+                .expect("other txn claim"),
+            umask::USER_EXEC,
+        )),
+    );
+    let signed = actor.sign_token(token).expect("signed token");
+
+    let err = handle
+        .with_signed_token(signed)
+        .expect_err("token for a different transaction must be rejected");
+    assert!(err.message().contains("another transaction"));
+}
+
+#[tokio::test]
+async fn unknown_txn_continuation_requires_authenticated_owner() {
+    let kernel = test_kernel("test-host").await;
+    let unknown = current_txn_id(7).with_trace([1; 32]);
+    let rejected = kernel.test_bind(Some(unknown), None).await;
+    assert!(rejected.is_err());
+
+    let token = txn_token(unknown, "host-a", "owner-a", "/lib/test/a/1.0.0");
+    let handle = kernel
+        .test_bind(Some(unknown), Some(&token))
+        .await
+        .unwrap_or_else(|err| panic!("authenticated continuation rejected: {err:?}"));
+    assert_eq!(
+        handle.id(),
+        unknown,
+        "peer continuation must reuse the inbound txn ID"
+    );
+}
+
+#[tokio::test]
+async fn inbound_transaction_id_is_not_retraced() {
+    let kernel = test_kernel("test-host").await;
+    let server = kernel.test_txn_server();
+    let inbound = current_txn_id(3);
+    assert!(
+        inbound.trace_bytes().iter().all(|byte| *byte == 0),
+        "test fixture must exercise a zero-trace inbound ID"
+    );
+
+    let token = txn_token(inbound, "host-a", "owner-a", "/lib/test/a/1.0.0");
+    let handle = kernel
+        .test_bind(Some(inbound), Some(&token))
+        .await
+        .unwrap_or_else(|err| panic!("authenticated continuation rejected: {err:?}"));
+
+    assert_eq!(
+        handle.id(),
+        inbound,
+        "peer nodes must preserve the exact inbound transaction ID"
+    );
+    assert!(server.contains(&inbound));
+}
+
+#[tokio::test]
+async fn attaches_structured_auth_context_to_txn_handle() {
+    let handle = test_txn("test-host").await;
+
+    let claim = Claim::new(
+        pathlink::Link::from_str("/lib/example-devco/a/0.1.0").expect("claim link"),
+        Mode::all(),
+    );
+    let mut token = crate::auth::AuthContext::new("http://127.0.0.1:8702::example-admin");
+    token = token.with_claim(
+        "http://127.0.0.1:8702".to_string(),
+        "example-admin".to_string(),
+        claim,
+    );
+
+    let handle = handle.with_auth_context(token);
+    let auth = handle.auth_context().expect("auth context");
+    assert_eq!(auth.principal, "http://127.0.0.1:8702::example-admin");
+    assert_eq!(auth.claims.len(), 1);
+    assert_eq!(
+        auth.token_hosts(),
+        vec!["http://127.0.0.1:8702".to_string()]
+    );
+}
+
+#[test]
+fn authentication_debug_redacts_signed_authority() {
+    let txn_id = current_txn_id(11);
+    let context = txn_token(
+        txn_id,
+        "host-redacted",
+        "actor-redacted",
+        "/lib/example/a/1.0.0",
+    );
+    let debug = format!("{context:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(
+        !debug.contains("eyJ"),
+        "debug output must not contain a JWT"
+    );
+}
+
+fn txn_token(txn_id: TxnId, host: &str, actor: &str, component: &str) -> crate::auth::AuthContext {
+    let signer = Actor::new_falcon512(actor.to_string()).expect("test transaction actor");
+    let host_link: pathlink::Link = format!("http://{host}")
+        .parse()
+        .expect("test transaction host");
+    let txn_link =
+        pathlink::Link::from_str(&crate::uri::transaction_path(txn_id)).expect("transaction claim");
+    let component_link = pathlink::Link::from_str(component).expect("component claim");
+    let claims = std::collections::BTreeMap::from([
+        (
+            txn_link.path().clone(),
+            u32::from(umask::USER_EXEC | umask::USER_WRITE),
+        ),
+        (component_link.path().clone(), u32::from(Mode::all())),
+    ]);
+    let signed = signer
+        .sign_token(Token::new(
+            host_link,
+            SystemTime::now(),
+            Duration::from_secs(30),
+            signer.id().clone(),
+            claims,
+        ))
+        .expect("signed transaction token");
+    crate::auth::AuthContext::new(format!("{host}::{actor}"))
+        .with_signed(signed)
+        .with_claim(
+            host.to_string(),
+            actor.to_string(),
+            Claim::new(txn_link, umask::USER_EXEC | umask::USER_WRITE),
+        )
+        .with_claim(
+            host.to_string(),
+            actor.to_string(),
+            Claim::new(component_link, Mode::all()),
+        )
+}

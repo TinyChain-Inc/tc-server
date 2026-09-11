@@ -25,9 +25,10 @@ pub struct HostLimits {
 #[derive(Clone, Debug)]
 pub struct IngressLimits {
     pub request_body_bytes: usize,
-    pub artifact_body_bytes: usize,
+    pub application_body_bytes: usize,
     pub in_flight_requests: usize,
     pub active_connections: usize,
+    pub application_in_flight_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +36,14 @@ pub struct ExecutionLimits {
     pub request_deadline: Duration,
     pub parallel_graph_ops: usize,
     pub outbound_requests: usize,
+    pub max_graph_nodes: usize,
+    pub max_graph_edges: usize,
+    pub max_execution_depth: usize,
+    pub max_op_invocations: usize,
+    pub wasm_fuel_per_call: u64,
+    pub wasm_memory_bytes: usize,
+    pub wasm_result_bytes: usize,
+    pub wasm_compilations: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -62,14 +71,23 @@ impl Default for HostLimits {
             transaction_ttl: Duration::from_secs(3),
             ingress: IngressLimits {
                 request_body_bytes: MIB,
-                artifact_body_bytes: 64 * MIB,
+                application_body_bytes: 64 * MIB,
                 in_flight_requests: 8.max(4 * cpus),
                 active_connections: 1024,
+                application_in_flight_bytes: 256 * MIB,
             },
             execution: ExecutionLimits {
                 request_deadline: Duration::from_secs(3),
                 parallel_graph_ops: cpus,
                 outbound_requests: 4.max(2 * cpus),
+                max_graph_nodes: 4_096,
+                max_graph_edges: 16_384,
+                max_execution_depth: 64,
+                max_op_invocations: 10_000,
+                wasm_fuel_per_call: 10_000_000,
+                wasm_memory_bytes: 64 * MIB,
+                wasm_result_bytes: MIB,
+                wasm_compilations: 1.max(cpus / 2),
             },
             storage: StorageLimits {
                 collection_cache_bytes: 64 * MIB,
@@ -131,7 +149,7 @@ impl Deadline {
 }
 
 /// A point-in-time view produced by the resource which owns the capacity.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapacitySnapshot {
     pub resource: String,
     pub limit: usize,
@@ -147,17 +165,43 @@ pub struct HostResources {
     inner: Arc<HostResourcesInner>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ApplicationAdmission {
+    resources: HostResources,
+    deadline: Deadline,
+}
+
+impl ApplicationAdmission {
+    pub(crate) async fn acquire(
+        &self,
+        bytes: usize,
+    ) -> TCResult<tokio::sync::OwnedSemaphorePermit> {
+        self.resources
+            .admit_application_bytes(bytes, self.deadline)
+            .await
+    }
+}
+
 struct HostResourcesInner {
     limits: HostLimits,
     requests: Arc<Capacity>,
     connections: Arc<Capacity>,
     graph: Arc<Capacity>,
     outbound: Arc<Capacity>,
+    application_in_flight: Arc<Semaphore>,
     devices: Mutex<BTreeMap<String, Arc<Capacity>>>,
 }
 
 impl HostResources {
-    pub fn new(limits: HostLimits) -> Self {
+    #[cfg(feature = "http-server")]
+    pub(crate) fn application_admission(&self, deadline: Deadline) -> ApplicationAdmission {
+        ApplicationAdmission {
+            resources: self.clone(),
+            deadline,
+        }
+    }
+    pub fn new(limits: HostLimits) -> TCResult<Self> {
+        validate_execution_limits(&limits.execution)?;
         let requests = Capacity::new("/host/resource/request", limits.ingress.in_flight_requests);
         let connections = Capacity::new(
             "/host/resource/connection",
@@ -165,16 +209,19 @@ impl HostResources {
         );
         let graph = Capacity::new("/host/resource/graph", limits.execution.parallel_graph_ops);
         let outbound = Capacity::new("/host/resource/rpc", limits.execution.outbound_requests);
-        Self {
+        let application_in_flight =
+            Arc::new(Semaphore::new(limits.ingress.application_in_flight_bytes));
+        Ok(Self {
             inner: Arc::new(HostResourcesInner {
                 limits,
                 requests,
                 connections,
                 graph,
                 outbound,
+                application_in_flight,
                 devices: Mutex::new(BTreeMap::new()),
             }),
-        }
+        })
     }
 
     pub fn limits(&self) -> &HostLimits {
@@ -199,6 +246,27 @@ impl HostResources {
 
     pub async fn admit_outbound(&self, deadline: Deadline) -> TCResult<CapacityPermit> {
         self.inner.outbound.clone().acquire(deadline).await
+    }
+
+    pub async fn admit_application_bytes(
+        &self,
+        bytes: usize,
+        deadline: Deadline,
+    ) -> TCResult<OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes)
+            .map_err(|_| TCError::bad_request("application body exceeds admission range"))?;
+        deadline
+            .wait(Arc::clone(&self.inner.application_in_flight).acquire_many_owned(bytes))
+            .await?
+            .map_err(|_| {
+                TCError::resource_unavailable(
+                    "application admission is unavailable",
+                    Pressure::new(
+                        "/host/resource/application-in-flight",
+                        PressureReason::Saturated,
+                    ),
+                )
+            })
     }
 
     pub async fn admit_device(
@@ -235,11 +303,84 @@ impl HostResources {
         );
         snapshots
     }
+
+    pub(crate) fn state(&self) -> crate::State {
+        crate::State::Tuple(self.snapshots().into_iter().map(capacity_state).collect())
+    }
+}
+
+fn validate_execution_limits(limits: &ExecutionLimits) -> TCResult<()> {
+    if limits.request_deadline.is_zero() {
+        return Err(TCError::bad_request("request deadline must be nonzero"));
+    }
+    let capacities = [
+        ("parallel graph operations", limits.parallel_graph_ops),
+        ("outbound requests", limits.outbound_requests),
+        ("graph nodes", limits.max_graph_nodes),
+        ("graph edges", limits.max_graph_edges),
+        ("execution depth", limits.max_execution_depth),
+        ("operation invocations", limits.max_op_invocations),
+        ("WASM memory bytes", limits.wasm_memory_bytes),
+        ("WASM result bytes", limits.wasm_result_bytes),
+        ("WASM compilations", limits.wasm_compilations),
+    ];
+    if let Some((name, _)) = capacities.into_iter().find(|(_, value)| *value == 0) {
+        return Err(TCError::bad_request(format!("{name} must be nonzero")));
+    }
+    if limits.wasm_fuel_per_call == 0 {
+        return Err(TCError::bad_request("WASM fuel must be nonzero"));
+    }
+    if limits.wasm_result_bytes > limits.wasm_memory_bytes {
+        return Err(TCError::bad_request(
+            "WASM result limit cannot exceed its memory limit",
+        ));
+    }
+    Ok(())
+}
+
+fn capacity_state(snapshot: CapacitySnapshot) -> crate::State {
+    use number_general::Number;
+    use tc_ir::{Id, Map};
+    use tc_value::Value;
+
+    let entry = |name: &str, value| -> (Id, crate::State) {
+        (name.parse().expect("capacity field"), value)
+    };
+    crate::State::Map(Map::from_iter([
+        entry(
+            "resource",
+            crate::State::from(Value::from(snapshot.resource)),
+        ),
+        entry(
+            "limit",
+            crate::State::from(Value::from(Number::from(snapshot.limit as u64))),
+        ),
+        entry(
+            "in_flight",
+            crate::State::from(Value::from(Number::from(snapshot.in_flight as u64))),
+        ),
+        entry(
+            "wait_count",
+            crate::State::from(Value::from(Number::from(snapshot.wait_count))),
+        ),
+        entry(
+            "wait_time_ms",
+            crate::State::from(Value::from(Number::from(snapshot.wait_time_ms))),
+        ),
+        entry(
+            "rejection_count",
+            crate::State::from(Value::from(Number::from(snapshot.rejection_count))),
+        ),
+        entry(
+            "best_effort_drop_count",
+            crate::State::from(Value::from(Number::from(snapshot.best_effort_drop_count))),
+        ),
+    ]))
 }
 
 impl Default for HostResources {
     fn default() -> Self {
-        Self::new(HostLimits::default())
+        Self::new(HostLimits::default()).expect("default host limits are valid")
     }
 }
 
@@ -370,12 +511,45 @@ mod tests {
         assert_eq!(capacity.snapshot().rejection_count, 1);
     }
 
+    #[tokio::test]
+    async fn application_byte_admission_is_shared_and_released() {
+        let mut limits = HostLimits::default();
+        limits.ingress.application_in_flight_bytes = 4;
+        let resources = HostResources::new(limits).unwrap();
+        let first = resources
+            .admit_application_bytes(4, Deadline::after(Duration::from_secs(1)))
+            .await
+            .expect("first body");
+        assert!(
+            resources
+                .admit_application_bytes(1, Deadline::after(Duration::from_millis(1)))
+                .await
+                .is_err()
+        );
+        drop(first);
+        let _released = resources
+            .admit_application_bytes(4, Deadline::after(Duration::from_secs(1)))
+            .await
+            .expect("released body");
+    }
+
     #[test]
     fn deadline_is_one_absolute_budget() {
         let deadline = Deadline::after(Duration::from_secs(1));
         assert_eq!(deadline.instant(), deadline.instant());
         assert!(!deadline.is_expired());
         assert!(deadline.remaining() <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn execution_limits_must_be_nonzero_and_consistent() {
+        let mut limits = HostLimits::default();
+        limits.execution.parallel_graph_ops = 0;
+        assert!(HostResources::new(limits).is_err());
+
+        let mut limits = HostLimits::default();
+        limits.execution.wasm_result_bytes = limits.execution.wasm_memory_bytes + 1;
+        assert!(HostResources::new(limits).is_err());
     }
 
     #[tokio::test]
