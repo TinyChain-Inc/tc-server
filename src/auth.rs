@@ -52,12 +52,23 @@ pub struct AuthClaimContext {
     pub claim: Claim,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AuthContext {
     pub principal: String,
     pub claims: Vec<AuthClaimContext>,
     pub verified_at_nanos: u64,
-    pub(crate) signed: Option<Arc<SignedToken>>,
+    signed: Option<Arc<SignedToken>>,
+}
+
+impl std::fmt::Debug for AuthContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthContext")
+            .field("principal", &self.principal)
+            .field("claims", &self.claims)
+            .field("verified_at_nanos", &self.verified_at_nanos)
+            .field("signed", &self.signed.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl AuthContext {
@@ -91,6 +102,20 @@ impl AuthContext {
             .into_iter()
             .collect()
     }
+
+    pub(crate) fn signed(&self) -> Option<&Arc<SignedToken>> {
+        self.signed.as_ref()
+    }
+
+    pub(crate) fn take_signed(&mut self) -> Option<Arc<SignedToken>> {
+        self.signed.take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_signed(mut self, signed: SignedToken) -> Self {
+        self.signed = Some(Arc::new(signed));
+        self
+    }
 }
 
 mod rjwt_token {
@@ -108,7 +133,7 @@ mod rjwt_token {
 
     use crate::auth::{AuthContext, Claim, TokenVerifier};
 
-    pub type WireClaims = BTreeMap<PathBuf, u32>;
+    pub(crate) type WireClaims = BTreeMap<PathBuf, u32>;
 
     pub fn claims_from_wire(claims: WireClaims) -> Vec<Claim> {
         claims
@@ -285,6 +310,7 @@ mod rjwt_token {
     }
 }
 
+pub(crate) use rjwt_token::WireClaims;
 pub use rjwt_token::{
     Actor, ActorResolver as RjwtActorResolver, KeyringActorResolver, RjwtTokenVerifier,
     SignedToken, Token, claims_from_wire, verifying_key_from_bytes, wire_claim,

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::auth::Actor;
+use tc_collection::StorageContext;
 fn current_txn_id(nonce: u16) -> TxnId {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -11,6 +12,20 @@ fn current_txn_id(nonce: u16) -> TxnId {
         .as_nanos() as u64;
     TxnId::from_parts(NetworkTime::from_nanos(now), nonce)
 }
+
+#[tokio::test]
+async fn a_bound_transaction_deadline_can_only_be_restricted() {
+    let txn = test_txn("deadline-restriction").await;
+    let original = txn.deadline();
+    let later = crate::Deadline::after(Duration::from_secs(60));
+    let unchanged = txn.restrict_deadline(later);
+    assert_eq!(unchanged.deadline().instant(), original.instant());
+
+    let earlier = crate::Deadline::after(Duration::from_millis(1));
+    let restricted = txn.restrict_deadline(earlier);
+    assert_eq!(restricted.deadline().instant(), earlier.instant());
+}
+
 #[tokio::test]
 async fn workspace_subcontexts_preserve_transaction_identity() {
     let workspace = test_workspace("subcontexts");
@@ -51,20 +66,17 @@ async fn cluster_claims_are_request_local_and_deterministic() {
     let txn = kernel.test_txn().await;
     assert!(txn.raw_token().is_none(), "allocation must be ownerless");
     kernel
-        .inner
-        .libraries
+        .test_libraries()
         .claim(&txn)
         .await
         .expect("first claim");
     kernel
-        .inner
-        .classes
+        .test_classes()
         .claim(&txn)
         .await
         .expect("second claim");
     kernel
-        .inner
-        .libraries
+        .test_libraries()
         .claim(&txn)
         .await
         .expect("idempotent claim");
@@ -81,7 +93,7 @@ async fn cluster_claims_are_request_local_and_deterministic() {
         resources,
         std::collections::BTreeSet::from([first.to_string(), second.to_string()])
     );
-    assert!(!txn.protocol_claims.lock().mutated);
+    assert!(!txn.is_mutated());
     let ids = workspace.transaction_ids().await.expect("transaction IDs");
     assert!(
         ids.is_empty(),
@@ -174,12 +186,11 @@ fn snapshot_error(txn_id: TxnId, token: &SignedToken) -> tc_error::TCError {
 #[tokio::test]
 async fn mints_host_signed_bearer_token_for_unauthenticated_txn() {
     let kernel = test_kernel("test-host").await;
-    let server = &kernel.txn_server;
+    let server = kernel.test_txn_server();
     let handle = kernel.test_txn().await;
     assert!(handle.raw_token().is_none(), "allocation must be ownerless");
     kernel
-        .inner
-        .libraries
+        .test_libraries()
         .claim(&handle)
         .await
         .expect("first cluster claims transaction ownership");
@@ -193,8 +204,11 @@ async fn mints_host_signed_bearer_token_for_unauthenticated_txn() {
     let keyring = crate::auth::KeyringActorResolver::default();
     keyring
         .insert(
-            server.protocol_authority().host.clone(),
-            server.protocol_authority().actor.as_ref().clone(),
+            server.protocol_authority().host().clone(),
+            Actor::with_verifying_key(
+                server.protocol_authority().actor_id().to_string(),
+                server.protocol_authority().verifying_key(),
+            ),
         )
         .expect("unique protocol actor");
     let verifier = RjwtTokenVerifier::new(std::sync::Arc::new(keyring));
@@ -204,14 +218,16 @@ async fn mints_host_signed_bearer_token_for_unauthenticated_txn() {
         .expect("host-signed protocol token verifies");
     let snapshot = crate::txn::protocol_snapshot(
         handle.id(),
-        ctx.signed.as_deref().expect("verified signed token"),
+        ctx.signed()
+            .map(Arc::as_ref)
+            .expect("verified signed token"),
     )
     .expect("protocol claims");
     assert_eq!(
         snapshot.owner,
         Some((
-            server.protocol_authority().host.to_string(),
-            server.protocol_authority().actor.id().to_string(),
+            server.protocol_authority().host().to_string(),
+            server.protocol_authority().actor_id().to_string(),
         ))
     );
 }
@@ -318,6 +334,21 @@ async fn rejects_ambiguous_owners_and_conflicting_leaders() {
 }
 
 #[tokio::test]
+async fn handle_construction_rejects_malformed_protocol_claims() {
+    let kernel = test_kernel("constructor-claims").await;
+    let allocated = kernel.test_txn().await;
+    let actor = Actor::new_falcon512("actor-a".to_string()).expect("generate Falcon-512 actor");
+    let signed = signed_claim_chain(&actor, [claim("/lib/example-devco/a/1.0.0")]);
+    let context = crate::auth::AuthContext::new(actor.id().clone()).with_signed(signed);
+
+    let error = kernel
+        .test_bind(Some(allocated.id()), Some(&context))
+        .await
+        .expect_err("resource leadership before transaction ownership must be rejected");
+    assert_eq!(error.code(), tc_error::ErrorKind::Unauthorized);
+}
+
+#[tokio::test]
 async fn rejects_signed_token_for_different_transaction_id() {
     use std::time::{Duration, SystemTime};
 
@@ -351,16 +382,13 @@ async fn rejects_signed_token_for_different_transaction_id() {
 #[tokio::test]
 async fn unknown_txn_continuation_requires_authenticated_owner() {
     let kernel = test_kernel("test-host").await;
-    let server = &kernel.txn_server;
     let unknown = current_txn_id(7).with_trace([1; 32]);
-    let rejected = server
-        .bind(Some(unknown), None, Arc::clone(&kernel.inner))
-        .await;
+    let rejected = kernel.test_bind(Some(unknown), None).await;
     assert!(rejected.is_err());
 
     let token = txn_token(unknown, "host-a", "owner-a", "/lib/test/a/1.0.0");
-    let handle = server
-        .bind(Some(unknown), Some(&token), Arc::clone(&kernel.inner))
+    let handle = kernel
+        .test_bind(Some(unknown), Some(&token))
         .await
         .unwrap_or_else(|err| panic!("authenticated continuation rejected: {err:?}"));
     assert_eq!(
@@ -373,7 +401,7 @@ async fn unknown_txn_continuation_requires_authenticated_owner() {
 #[tokio::test]
 async fn inbound_transaction_id_is_not_retraced() {
     let kernel = test_kernel("test-host").await;
-    let server = &kernel.txn_server;
+    let server = kernel.test_txn_server();
     let inbound = current_txn_id(3);
     assert!(
         inbound.trace_bytes().iter().all(|byte| *byte == 0),
@@ -381,8 +409,8 @@ async fn inbound_transaction_id_is_not_retraced() {
     );
 
     let token = txn_token(inbound, "host-a", "owner-a", "/lib/test/a/1.0.0");
-    let handle = server
-        .bind(Some(inbound), Some(&token), Arc::clone(&kernel.inner))
+    let handle = kernel
+        .test_bind(Some(inbound), Some(&token))
         .await
         .unwrap_or_else(|err| panic!("authenticated continuation rejected: {err:?}"));
 
@@ -419,6 +447,23 @@ async fn attaches_structured_auth_context_to_txn_handle() {
     );
 }
 
+#[test]
+fn authentication_debug_redacts_signed_authority() {
+    let txn_id = current_txn_id(11);
+    let context = txn_token(
+        txn_id,
+        "host-redacted",
+        "actor-redacted",
+        "/lib/example/a/1.0.0",
+    );
+    let debug = format!("{context:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(
+        !debug.contains("eyJ"),
+        "debug output must not contain a JWT"
+    );
+}
+
 fn txn_token(txn_id: TxnId, host: &str, actor: &str, component: &str) -> crate::auth::AuthContext {
     let signer = Actor::new_falcon512(actor.to_string()).expect("test transaction actor");
     let host_link: pathlink::Link = format!("http://{host}")
@@ -443,9 +488,8 @@ fn txn_token(txn_id: TxnId, host: &str, actor: &str, component: &str) -> crate::
             claims,
         ))
         .expect("signed transaction token");
-    let mut context = crate::auth::AuthContext::new(format!("{host}::{actor}"));
-    context.signed = Some(Arc::new(signed));
-    context
+    crate::auth::AuthContext::new(format!("{host}::{actor}"))
+        .with_signed(signed)
         .with_claim(
             host.to_string(),
             actor.to_string(),

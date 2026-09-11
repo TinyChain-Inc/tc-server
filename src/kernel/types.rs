@@ -9,7 +9,6 @@ pub enum BodyContract {
 
 #[derive(Clone)]
 pub(crate) enum KernelTarget {
-    Health,
     AuthContext,
     Host,
     State(Box<[pathlink::PathSegment]>),
@@ -17,17 +16,28 @@ pub(crate) enum KernelTarget {
 }
 
 pub struct KernelRequestGuard {
-    pub(super) kernel: super::Kernel,
-    pub(super) method: Method,
-    pub(super) target: KernelTarget,
-    pub(super) txn: crate::TxnHandle,
-    pub(super) _permit: crate::resources::CapacityPermit,
+    kernel: super::Kernel,
+    method: Method,
+    target: KernelTarget,
+    txn: crate::TxnHandle,
+    _permit: crate::resources::CapacityPermit,
 }
 
 impl KernelRequestGuard {
-    #[cfg(feature = "http-server")]
-    pub(crate) fn request(&self) -> (Method, &KernelTarget) {
-        (self.method, &self.target)
+    pub(super) fn new(
+        kernel: super::Kernel,
+        method: Method,
+        target: KernelTarget,
+        txn: crate::TxnHandle,
+        permit: crate::resources::CapacityPermit,
+    ) -> Self {
+        Self {
+            kernel,
+            method,
+            target,
+            txn,
+            _permit: permit,
+        }
     }
 
     pub fn txn(&self) -> &crate::TxnHandle {
@@ -44,22 +54,31 @@ impl KernelRequestGuard {
         }
         match &self.target {
             KernelTarget::Application(target)
-                if target.path().len() == 1 && self.method == Method::Put =>
+                if crate::uri::is_application_root(target) && self.method == Method::Put =>
             {
                 BodyContract::Application {
                     max_bytes: if target.path()[0].as_str() == "lib" {
-                        self.txn.resources().limits().ingress.application_body_bytes
+                        self.txn.application_body_limit()
                     } else {
                         crate::class::MAX_CLASS_BYTES
                     },
                 }
             }
             KernelTarget::Application(_)
-            | KernelTarget::Health
             | KernelTarget::Host
             | KernelTarget::AuthContext
             | KernelTarget::State(_) => BodyContract::Native,
         }
+    }
+
+    #[cfg(feature = "http-server")]
+    pub(crate) fn application_admission(&self) -> crate::resources::ApplicationAdmission {
+        self.txn.application_admission()
+    }
+
+    #[cfg(feature = "http-server")]
+    pub(crate) fn native_body_limit(&self) -> usize {
+        self.txn.request_body_limit()
     }
 
     pub fn admit_application_memory(
@@ -68,9 +87,8 @@ impl KernelRequestGuard {
     ) -> impl std::future::Future<Output = tc_error::TCResult<tokio::sync::OwnedSemaphorePermit>>
     + Send
     + 'static {
-        let resources = self.txn.resources().clone();
-        let deadline = self.deadline();
-        async move { resources.admit_application_bytes(bytes, deadline).await }
+        let txn = self.txn.clone();
+        async move { txn.admit_application_memory(bytes).await }
     }
 
     pub async fn execute(&self, body: Option<State>) -> tc_error::TCResult<Option<State>> {
@@ -80,6 +98,7 @@ impl KernelRequestGuard {
                     .execute(self.target.clone(), self.txn.clone(), self.method, body),
             )
             .await
+            .map(|(state, _)| state)
     }
 
     /// Report that routing and terminal response projection both succeeded.
@@ -95,8 +114,14 @@ impl KernelRequestGuard {
     pub async fn execute_bound(
         self,
         body: Option<State>,
-    ) -> tc_error::TCResult<(Option<State>, Self)> {
-        let state = self.execute(body).await?;
-        Ok((state, self))
+    ) -> tc_error::TCResult<(Option<State>, bool, Self)> {
+        let (state, raw_bytes) = self
+            .deadline()
+            .run(
+                self.kernel
+                    .execute(self.target.clone(), self.txn.clone(), self.method, body),
+            )
+            .await?;
+        Ok((state, raw_bytes, self))
     }
 }

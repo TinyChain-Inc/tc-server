@@ -514,7 +514,7 @@ where
         method: tc_ir::Method,
         body: Option<crate::State>,
         namespace: Box<dyn Handler<'a, crate::State> + 'a>,
-    ) -> TCResult<Option<crate::State>> {
+    ) -> TCResult<(Option<crate::State>, bool)> {
         let segments = target.path().get(1..).unwrap_or_default();
         match self.lookup(txn, segments).await? {
             Resolved::Dir { cluster, unmatched } => {
@@ -526,19 +526,21 @@ where
                 {
                     return crate::kernel::invoke_handler(namespace, txn, method, body)
                         .await
-                        .map(Some);
+                        .map(|state| (Some(state), false));
                 }
                 cluster
                     .invoke(txn, unmatched, method, body, &target.to_string())
                     .await
+                    .map(|state| (state, false))
             }
             Resolved::Item {
                 cluster,
                 suffix,
                 ancestors,
             } => {
+                let exact_item = suffix.is_empty();
                 let explicit_delete = method == tc_ir::Method::Delete
-                    && suffix.is_empty()
+                    && exact_item
                     && matches!(
                         &body,
                         Some(crate::State::None)
@@ -563,7 +565,7 @@ where
                         )
                         .await?;
                 }
-                Ok(state)
+                Ok((state, exact_item))
             }
         }
     }
@@ -666,25 +668,20 @@ mod tests {
         let create_txn = kernel.test_txn().await;
         let create_txn_id = create_txn.id();
         kernel
-            .inner
-            .services
-            .clone()
+            .test_services()
             .create_item(&create_txn, &segments, move |storage| {
                 crate::service::Service::create(create_txn_id, storage, identity, definition)
             })
             .await
             .expect("create nested Service");
         kernel
-            .inner
-            .services
+            .test_services()
             .commit(create_txn_id)
             .await
             .expect("commit nested tree");
         let txn = kernel.test_txn().await;
         let Resolved::Item { ancestors, .. } = kernel
-            .inner
-            .services
-            .clone()
+            .test_services()
             .lookup(&txn, &path)
             .await
             .expect("resolve nested Service")
@@ -701,8 +698,7 @@ mod tests {
         };
         insert_replica(parent, txn.id(), replica.clone()).await;
         kernel
-            .inner
-            .services
+            .test_services()
             .commit(txn.id())
             .await
             .expect("recursive commit");
@@ -714,8 +710,7 @@ mod tests {
             .await
             .expect("stage replica removal");
         kernel
-            .inner
-            .services
+            .test_services()
             .rollback(&rollback_txn.id())
             .await
             .expect("recursive rollback");
@@ -727,8 +722,7 @@ mod tests {
         };
         insert_replica(parent, pending_txn.id(), pending.clone()).await;
         kernel
-            .inner
-            .services
+            .test_services()
             .finalize(&pending_txn.id())
             .await
             .expect("recursive finalization");

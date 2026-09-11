@@ -8,7 +8,7 @@ pub(crate) async fn bootstrap_seed(
     resource: &pathlink::Link,
     identity: &super::Replica,
     issuer: &super::ReplicationIssuer,
-) -> TCResult<super::issuer::BootstrapSession> {
+) -> TCResult<crate::cluster::BootstrapSession> {
     let seed = super::normalize_peer(seed)?;
     let url = crate::http_client::peer_txn_url(&seed, crate::uri::HOST_ROOT, txn_id)?;
     let requests = issuer

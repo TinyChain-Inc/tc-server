@@ -7,10 +7,6 @@ pub(crate) fn method_not_allowed() -> Response {
     tc_error_response(TCError::method_not_allowed("HTTP method", "host route"))
 }
 
-pub(crate) fn not_found() -> Response {
-    tc_error_response(TCError::not_found("host route"))
-}
-
 pub(crate) fn bad_request_response(msg: &str) -> Response {
     tc_error_response(TCError::bad_request(msg))
 }

@@ -57,19 +57,19 @@ struct Active {
 
 impl TxnServer {
     pub(crate) fn resources(&self) -> &crate::HostResources {
-        &self.state.config.resources
+        self.state.config.resources()
     }
 
     pub(super) fn workspace(&self) -> &crate::Workspace {
-        &self.state.config.workspace
+        self.state.config.workspace()
     }
 
     pub(super) fn ttl(&self) -> Duration {
-        self.state.config.ttl
+        self.state.config.ttl()
     }
 
     pub(crate) fn protocol_authority(&self) -> &crate::ProtocolAuthority {
-        &self.state.config.protocol
+        self.state.config.protocol()
     }
 
     pub(crate) fn verifier(&self) -> &Arc<dyn TokenVerifier> {
@@ -121,8 +121,8 @@ impl TxnServer {
                 let token =
                     token.ok_or_else(|| TCError::unauthorized("missing transaction authority"))?;
                 let signed = token
-                    .signed
-                    .as_deref()
+                    .signed()
+                    .map(Arc::as_ref)
                     .ok_or_else(|| TCError::unauthorized("missing signed transaction authority"))?;
                 validate_signed_token(txn_id, signed)
                     .map_err(|_| TCError::unauthorized("invalid transaction authority"))?;
@@ -150,53 +150,11 @@ impl TxnServer {
         context: Option<&AuthContext>,
         kernel: Arc<crate::kernel::KernelInner>,
     ) -> TCResult<TxnHandle> {
-        let snapshot = context
-            .and_then(|context| context.signed.as_deref())
-            .and_then(|token| super::protocol_snapshot(id, token).ok());
-        let coordinates = snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.owner.as_ref())
-            .is_some_and(|(host, actor)| {
-                host.as_str() == self.state.config.protocol.host.to_string()
-                    && actor == self.state.config.protocol.actor.id().as_str()
-            });
-        let protocol = super::handle::ClaimContext {
-            signed: if autocommit {
-                None
-            } else {
-                context.and_then(|context| context.signed.clone())
-            },
-            mutated: false,
-        };
-        Ok(TxnHandle {
-            id,
-            server: self.clone(),
-            kernel,
-            scope: super::handle::ExecutionScope::Host,
-            auth_context: context.cloned().map(|mut context| {
-                // The evolving protocol chain has one owner after binding.
-                context.signed = None;
-                context
-            }),
-            protocol_claims: Arc::new(parking_lot::Mutex::new(protocol)),
-            autocommit: autocommit || coordinates,
-            workspace_path: Vec::new(),
-            deadline: self.state.config.resources.deadline(),
-            graph_admitted: false,
-            execution_budget: Arc::new(super::handle::ExecutionBudget::new(
-                self.state
-                    .config
-                    .resources
-                    .limits()
-                    .execution
-                    .max_op_invocations,
-            )),
-            execution_depth: 0,
-        })
+        TxnHandle::new(id, self.clone(), kernel, context, autocommit)
     }
 
     fn observe(&self, txn_id: TxnId) {
-        let expires = expiry(txn_id, self.state.config.ttl, self.state.config.grace);
+        let expires = expiry(txn_id, self.state.config.ttl(), self.state.config.grace());
         self.state
             .inner
             .lock()
@@ -235,7 +193,7 @@ impl TxnServer {
             };
             let timestamp = NetworkTime::from_nanos(timestamp);
             TxnId::from_parts(timestamp, nonce).with_trace(compute_trace(
-                self.state.config.protocol.actor.id(),
+                self.state.config.protocol().actor_id(),
                 timestamp,
                 nonce,
             ))
@@ -243,13 +201,13 @@ impl TxnServer {
         if let Err(error) = self
             .state
             .config
-            .workspace
+            .workspace()
             .write_last_allocated(txn_id)
             .await
         {
             self.state.ready.store(false, Ordering::Release);
             if let Ok((latest_finalized, last_allocated)) =
-                self.state.config.workspace.frontiers().await
+                self.state.config.workspace().frontiers().await
             {
                 let mut inner = self.state.inner.lock();
                 inner.latest_finalized = latest_finalized;
@@ -263,20 +221,24 @@ impl TxnServer {
         Ok(txn_id)
     }
 
-    pub(crate) fn start_expiry(
-        &self,
-        runtime: &tokio::runtime::Handle,
-        host: Arc<crate::kernel::KernelInner>,
-    ) {
+    pub(crate) fn start_expiry<F, Fut>(&self, runtime: &tokio::runtime::Handle, finalize: F)
+    where
+        F: Fn(TxnId) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = TCResult<()>> + Send + 'static,
+    {
         let server = self.clone();
-        runtime.spawn(async move { server.run_expiry(host).await });
+        runtime.spawn(async move { server.run_expiry(finalize).await });
     }
 
-    async fn run_expiry(self, host: Arc<crate::kernel::KernelInner>) {
+    async fn run_expiry<F, Fut>(self, finalize: F)
+    where
+        F: Fn(TxnId) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = TCResult<()>> + Send,
+    {
         loop {
             match self.next_expiry() {
                 Some(deadline) => tokio::select! {
-                    _ = tokio::time::sleep_until(deadline) => self.expire_due(Instant::now(), &host).await,
+                    _ = tokio::time::sleep_until(deadline) => self.expire_due(Instant::now(), &finalize).await,
                     _ = self.state.notify.notified() => {}
                 },
                 None => self.state.notify.notified().await,
@@ -293,7 +255,11 @@ impl TxnServer {
             .map(|(_, active)| active.retry.unwrap_or(active.expires))
     }
 
-    async fn expire_due(&self, now: Instant, host: &crate::kernel::KernelInner) {
+    async fn expire_due<F, Fut>(&self, now: Instant, finalize: &F)
+    where
+        F: Fn(TxnId) -> Fut,
+        Fut: std::future::Future<Output = TCResult<()>>,
+    {
         let due = self
             .state
             .inner
@@ -304,21 +270,21 @@ impl TxnServer {
                 (active.retry.unwrap_or(active.expires) <= now).then_some(*id)
             });
         let Some(cutoff) = due else { return };
-        if let Err(error) = host.finalize(&cutoff).await {
+        if let Err(error) = finalize(cutoff).await {
             self.defer(cutoff, "finalize resources", error);
             return;
         }
         if let Err(error) = self
             .state
             .config
-            .workspace
+            .workspace()
             .write_latest_finalized(cutoff)
             .await
         {
             self.defer(cutoff, "persist finalized cutoff", error);
             return;
         }
-        if let Err(error) = self.state.config.workspace.remove_through(cutoff).await {
+        if let Err(error) = self.state.config.workspace().remove_through(cutoff).await {
             self.defer(cutoff, "clean transaction workspaces", error);
             return;
         }
@@ -341,8 +307,8 @@ impl TxnServer {
     }
 
     async fn restore_frontier(&self) -> TCResult<()> {
-        let (latest_finalized, last_allocated) = self.state.config.workspace.frontiers().await?;
-        let workspaces = self.state.config.workspace.transaction_ids().await?;
+        let (latest_finalized, last_allocated) = self.state.config.workspace().frontiers().await?;
+        let workspaces = self.state.config.workspace().transaction_ids().await?;
         {
             let mut inner = self.state.inner.lock();
             inner.latest_finalized = latest_finalized;
@@ -352,7 +318,11 @@ impl TxnServer {
                     inner.active.insert(
                         txn_id,
                         Active {
-                            expires: expiry(txn_id, self.state.config.ttl, self.state.config.grace),
+                            expires: expiry(
+                                txn_id,
+                                self.state.config.ttl(),
+                                self.state.config.grace(),
+                            ),
                             retry: None,
                         },
                     );
@@ -360,7 +330,7 @@ impl TxnServer {
             }
         }
         if let Some(cutoff) = latest_finalized {
-            self.state.config.workspace.remove_through(cutoff).await?;
+            self.state.config.workspace().remove_through(cutoff).await?;
         }
         self.state.ready.store(true, Ordering::Release);
         self.state.notify.notify_one();
@@ -384,7 +354,7 @@ impl TxnServer {
     }
 
     fn reject_expired(&self, txn_id: TxnId) -> TCResult<()> {
-        if expiry(txn_id, self.state.config.ttl, self.state.config.grace) <= Instant::now() {
+        if expiry(txn_id, self.state.config.ttl(), self.state.config.grace()) <= Instant::now() {
             Err(TCError::conflict(format!(
                 "transaction {txn_id} has expired"
             )))
@@ -435,12 +405,12 @@ fn compute_trace(host_id: &str, timestamp: NetworkTime, nonce: u16) -> [u8; 32] 
 #[cfg(test)]
 pub(super) fn test_verifier(config: &TxnConfig) -> Arc<dyn TokenVerifier> {
     let actor = rjwt::Actor::with_verifying_key(
-        config.protocol.actor.id().clone(),
-        config.protocol.actor.verifying_key(),
+        config.protocol().actor_id().to_string(),
+        config.protocol().verifying_key(),
     );
     let keyring = crate::auth::KeyringActorResolver::default();
     keyring
-        .insert(config.protocol.host.clone(), actor)
+        .insert(config.protocol().host().clone(), actor)
         .expect("test protocol actor is unique");
     Arc::new(crate::auth::RjwtTokenVerifier::new(Arc::new(keyring)))
 }

@@ -15,8 +15,6 @@ const FANOUT_CONCURRENCY: usize = 8;
 #[cfg(feature = "http-client")]
 pub(crate) use client::{bootstrap_seed, read_seed_state};
 pub use gateway::{ClusterGateway, LocalClusterGateway};
-#[cfg(feature = "http-client")]
-pub(crate) use issuer::BootstrapSession;
 pub use issuer::{ReplicationIssuer, parse_psk_keys};
 pub use membership::Replica;
 
@@ -132,19 +130,89 @@ pub(crate) async fn forward_resource_decision(
         }
     })
     .await?;
-    if result.failed.is_empty() {
-        Ok(())
-    } else {
-        Err(result
-            .first_error
-            .unwrap_or_else(|| TCError::bad_gateway("failed to deliver transaction decision")))
-    }
+    result.complete("failed to deliver transaction decision")
 }
 
 pub(crate) struct Fanout {
-    pub(crate) delivered: std::collections::BTreeSet<String>,
-    pub(crate) failed: std::collections::BTreeSet<String>,
-    pub(crate) first_error: Option<TCError>,
+    outcomes: std::collections::BTreeMap<String, TCResult<()>>,
+}
+
+impl Fanout {
+    pub(crate) fn complete(self, message: &'static str) -> TCResult<()> {
+        let (_, failed, error) = self.partition();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(error.unwrap_or_else(|| TCError::bad_gateway(message)))
+        }
+    }
+
+    pub(crate) fn strict_majority(self) -> TCResult<ReplicaEvictions> {
+        let replica_count = self.outcomes.len() + 1;
+        let (delivered, failed, error) = self.partition();
+        if error
+            .as_ref()
+            .is_some_and(|error| error.code() == tc_error::ErrorKind::Conflict)
+        {
+            return Err(error.expect("checked conflict"));
+        }
+        if delivered.len() + 1 <= replica_count / 2 {
+            return Err(error.unwrap_or_else(|| {
+                TCError::bad_gateway("replica write lost its strict majority")
+            }));
+        }
+
+        Ok(ReplicaEvictions { delivered, failed })
+    }
+
+    fn partition(
+        self,
+    ) -> (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+        Option<TCError>,
+    ) {
+        let mut delivered = std::collections::BTreeSet::new();
+        let mut failed = std::collections::BTreeSet::new();
+        let mut first_error = None;
+        let mut first_conflict = None;
+        for (peer, result) in self.outcomes {
+            match result {
+                Ok(()) => {
+                    delivered.insert(peer);
+                }
+                Err(error) => {
+                    failed.insert(peer);
+                    if error.code() == tc_error::ErrorKind::Conflict && first_conflict.is_none() {
+                        first_conflict = Some(error);
+                    } else if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        (delivered, failed, first_conflict.or(first_error))
+    }
+}
+
+pub(crate) struct ReplicaEvictions {
+    delivered: std::collections::BTreeSet<String>,
+    failed: std::collections::BTreeSet<String>,
+}
+
+impl ReplicaEvictions {
+    pub(crate) fn delivered(&self) -> &std::collections::BTreeSet<String> {
+        &self.delivered
+    }
+
+    pub(crate) fn failed(&self) -> &std::collections::BTreeSet<String> {
+        &self.failed
+    }
+
+    pub(crate) fn into_failed(self) -> std::collections::BTreeSet<String> {
+        self.failed
+    }
 }
 
 async fn fanout_attempt<F, Fut>(
@@ -162,23 +230,62 @@ where
     .buffer_unordered(FANOUT_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
-    let mut delivered = std::collections::BTreeSet::new();
-    let mut failed = std::collections::BTreeSet::new();
-    let mut first_error = None;
-    for (peer, result) in results {
-        match result {
-            Ok(()) => {
-                delivered.insert(peer);
-            }
-            Err(error) => {
-                failed.insert(peer);
-                first_error.get_or_insert(error);
-            }
-        }
-    }
     Ok(Fanout {
-        delivered,
-        failed,
-        first_error,
+        outcomes: results.into_iter().collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fanout_interprets_failures_in_endpoint_order() {
+        let peers = std::collections::BTreeSet::from(["a".to_string(), "b".to_string()]);
+        let result = fanout_attempt(&peers, |peer| async move {
+            if peer == "a" {
+                tokio::task::yield_now().await;
+            }
+            Err(TCError::bad_gateway(peer))
+        })
+        .await
+        .expect("fanout");
+
+        assert_eq!(
+            result
+                .complete("fanout failed")
+                .expect_err("failure")
+                .message(),
+            "a"
+        );
+    }
+
+    #[test]
+    fn fanout_derives_replica_evictions_only_from_a_strict_majority() {
+        let majority = Fanout {
+            outcomes: std::collections::BTreeMap::from([
+                ("a".to_string(), Ok(())),
+                ("b".to_string(), Err(TCError::bad_gateway("b"))),
+            ]),
+        }
+        .strict_majority()
+        .expect("local host and one peer form a strict majority of three");
+        assert_eq!(
+            majority.delivered(),
+            &std::collections::BTreeSet::from(["a".to_string()])
+        );
+        assert_eq!(
+            majority.failed(),
+            &std::collections::BTreeSet::from(["b".to_string()])
+        );
+
+        let tie = Fanout {
+            outcomes: std::collections::BTreeMap::from([
+                ("a".to_string(), Ok(())),
+                ("b".to_string(), Err(TCError::bad_gateway("b"))),
+                ("c".to_string(), Err(TCError::bad_gateway("c"))),
+            ]),
+        };
+        assert!(tie.strict_majority().is_err());
+    }
 }

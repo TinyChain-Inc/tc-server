@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures::{TryStreamExt, stream, stream::BoxStream};
 use safecast::TryCastFrom;
 use tc_error::{TCError, TCResult};
-use tc_ir::{IntoView, Method, Scalar};
+use tc_ir::{IntoView, Scalar};
 
 use super::{Body, Response, StatusCode, header};
 
@@ -13,17 +13,10 @@ use super::{Body, Response, StatusCode, header};
 pub(crate) async fn native_state_response(
     state: State,
     txn: TxnHandle,
+    raw_application_bytes: bool,
     request: Option<crate::KernelRequestGuard>,
 ) -> TCResult<Response> {
-    if request.as_ref().is_some_and(|request| {
-        let (method, target) = request.request();
-        method == Method::Get
-            && matches!(target, crate::kernel::KernelTarget::Application(target) if target.path().first().is_some_and(|root| root.as_str() == "lib"))
-            && matches!(
-                state,
-                State::Scalar(Scalar::Value(tc_value::Value::Bytes(_)))
-            )
-    }) {
+    if raw_application_bytes {
         let State::Scalar(Scalar::Value(tc_value::Value::Bytes(bytes))) = state else {
             unreachable!("the HTTP representation check matched a byte value")
         };

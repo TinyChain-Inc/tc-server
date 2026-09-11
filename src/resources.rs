@@ -165,6 +165,23 @@ pub struct HostResources {
     inner: Arc<HostResourcesInner>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ApplicationAdmission {
+    resources: HostResources,
+    deadline: Deadline,
+}
+
+impl ApplicationAdmission {
+    pub(crate) async fn acquire(
+        &self,
+        bytes: usize,
+    ) -> TCResult<tokio::sync::OwnedSemaphorePermit> {
+        self.resources
+            .admit_application_bytes(bytes, self.deadline)
+            .await
+    }
+}
+
 struct HostResourcesInner {
     limits: HostLimits,
     requests: Arc<Capacity>,
@@ -176,6 +193,13 @@ struct HostResourcesInner {
 }
 
 impl HostResources {
+    #[cfg(feature = "http-server")]
+    pub(crate) fn application_admission(&self, deadline: Deadline) -> ApplicationAdmission {
+        ApplicationAdmission {
+            resources: self.clone(),
+            deadline,
+        }
+    }
     pub fn new(limits: HostLimits) -> TCResult<Self> {
         validate_execution_limits(&limits.execution)?;
         let requests = Capacity::new("/host/resource/request", limits.ingress.in_flight_requests);

@@ -6,6 +6,15 @@ pub(crate) const HOST_PUBLIC_KEY: &str = "/host/public_key";
 pub(crate) const HOST_AUTH_CONTEXT: &str = "/host/auth/context";
 pub const HOST_TXN_PREFIX: &str = "/host/txn/";
 
+pub(crate) fn application_root(target: &pathlink::Link) -> Option<&str> {
+    let root = target.path().first()?.as_str();
+    matches!(root, "lib" | "class" | "service").then_some(root)
+}
+
+pub(crate) fn is_application_root(target: &pathlink::Link) -> bool {
+    target.path().len() == 1 && application_root(target).is_some()
+}
+
 pub(crate) fn validate_identity(
     identity: &pathlink::Link,
     expected_root: &str,

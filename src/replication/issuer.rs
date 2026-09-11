@@ -16,13 +16,6 @@ use super::crypto::{decrypt, encrypt_with_key};
 
 const MAX_BOOTSTRAP_MESSAGE_BYTES: usize = 1024 * 1024;
 
-#[cfg(feature = "http-client")]
-pub(crate) struct BootstrapSession {
-    pub(crate) token: String,
-    pub(crate) replica: crate::replication::Replica,
-    pub(crate) state_hash: String,
-}
-
 pub fn parse_psk_keys(values: &[String]) -> tc_error::TCResult<Vec<Key<Aes256GcmSiv>>> {
     values
         .iter()
@@ -57,10 +50,10 @@ impl ReplicationIssuer {
         keys: Vec<Key<Aes256GcmSiv>>,
         keyring: KeyringActorResolver,
     ) -> tc_error::TCResult<Self> {
-        let signer_public = authority.actor.verifying_key();
-        let signer_id = authority.actor.id().clone();
+        let signer_public = authority.verifying_key();
+        let signer_id = authority.actor_id().to_string();
         keyring.insert(
-            authority.host.clone(),
+            authority.host().clone(),
             Actor::with_verifying_key(signer_id, signer_public),
         )?;
 
@@ -72,12 +65,12 @@ impl ReplicationIssuer {
     }
 
     pub fn self_identity(&self, endpoint: String) -> tc_error::TCResult<Replica> {
-        let public_key_b64 = BASE64.encode(self.authority.actor.verifying_key().to_bytes());
+        let public_key_b64 = BASE64.encode(self.authority.verifying_key().to_bytes());
         Ok(Replica {
             endpoint,
-            host: self.authority.host.to_string(),
-            actor_id: self.authority.actor.id().clone(),
-            algorithm: self.authority.actor.verifying_key().alg(),
+            host: self.authority.host().to_string(),
+            actor_id: self.authority.actor_id().to_string(),
+            algorithm: self.authority.verifying_key().alg(),
             public_key_b64,
         })
     }
@@ -182,36 +175,28 @@ impl ReplicationIssuer {
         ));
         let signed = self
             .authority
-            .actor
-            .sign_token(crate::auth::Token::new(
-                self.authority.host.clone(),
+            .sign(crate::auth::Token::new(
+                self.authority.host().clone(),
                 std::time::SystemTime::now(),
                 std::time::Duration::from_secs(30),
-                self.authority.actor.id().clone(),
+                self.authority.actor_id().to_string(),
                 grants,
             ))
             .map_err(|error| TCError::unauthorized(error.to_string()))?;
         let signed = self
             .authority
-            .actor
-            .consume_and_sign(
+            .extend(
                 signed,
-                self.authority.host.clone(),
                 crate::auth::wire_claim(Claim::new(resource, USER_EXEC)),
                 std::time::SystemTime::now(),
             )
             .map_err(|error| TCError::unauthorized(error.to_string()))?;
         let response = (
             signed.into_jwt(),
-            self.authority.host.to_string(),
-            self.authority.actor.id().clone(),
-            self.authority
-                .actor
-                .verifying_key()
-                .alg()
-                .name()
-                .to_string(),
-            BASE64.encode(self.authority.actor.verifying_key().to_bytes()),
+            self.authority.host().to_string(),
+            self.authority.actor_id().to_string(),
+            self.authority.verifying_key().alg().name().to_string(),
+            BASE64.encode(self.authority.verifying_key().to_bytes()),
             hex::encode(state_hash),
         );
         let response = encode_message(&response).await?;
@@ -247,7 +232,7 @@ impl ReplicationIssuer {
         endpoint: String,
         nonce: &[u8],
         ciphertext: &[u8],
-    ) -> tc_error::TCResult<BootstrapSession> {
+    ) -> tc_error::TCResult<crate::cluster::BootstrapSession> {
         let (response, _) = self.decrypt_with_key(nonce, ciphertext)?;
         let (token, host, actor_id, algorithm, public_key_b64, state_hash): (
             String,
@@ -267,11 +252,9 @@ impl ReplicationIssuer {
             public_key_b64,
         };
         self.register_peer_identity(&replica)?;
-        Ok(BootstrapSession {
-            token,
-            replica,
-            state_hash,
-        })
+        Ok(crate::cluster::BootstrapSession::new(
+            token, replica, state_hash,
+        ))
     }
 }
 

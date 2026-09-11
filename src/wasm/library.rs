@@ -137,11 +137,11 @@ impl WasmLibrary {
         })
     }
 
-    pub fn identity(&self) -> &pathlink::Link {
+    pub(crate) fn identity(&self) -> &pathlink::Link {
         &self.identity
     }
 
-    pub fn definition(&self) -> &Scalar {
+    pub(crate) fn definition(&self) -> &Scalar {
         &self.definition
     }
 
@@ -398,7 +398,7 @@ pub(crate) async fn invoke(
     let body = match body {
         Some(body) => {
             let view = body.into_view(txn.clone()).await?;
-            encode_guest_json(view, txn.resources().limits().ingress.request_body_bytes).await?
+            encode_guest_json(view, txn.request_body_limit()).await?
         }
         None => Vec::new(),
     };

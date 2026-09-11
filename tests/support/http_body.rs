@@ -26,10 +26,7 @@ async fn admitted_stream_decodes_fragmented_json_and_merges_capacity() {
     let mut body = BoundedBody::new(
         Body::wrap_stream(input),
         encoded.len(),
-        Some((
-            resources,
-            Deadline::after(std::time::Duration::from_secs(1)),
-        )),
+        Some(resources.application_admission(Deadline::after(std::time::Duration::from_secs(1)))),
     );
 
     let crate::literal::Definition(identity, definition) = destream_json::try_decode((), &mut body)
@@ -50,10 +47,7 @@ async fn admitted_stream_preserves_payload_limit_errors() {
     let mut body = BoundedBody::new(
         Body::wrap_stream(input),
         4,
-        Some((
-            resources,
-            Deadline::after(std::time::Duration::from_secs(1)),
-        )),
+        Some(resources.application_admission(Deadline::after(std::time::Duration::from_secs(1)))),
     );
 
     let error = (&mut body)
@@ -74,7 +68,11 @@ async fn admitted_stream_preserves_admission_saturation() {
         .await
         .expect("occupy application admission");
     let input = stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"a"))]);
-    let mut body = BoundedBody::new(Body::wrap_stream(input), 1, Some((resources, deadline)));
+    let mut body = BoundedBody::new(
+        Body::wrap_stream(input),
+        1,
+        Some(resources.application_admission(deadline)),
+    );
 
     let error = (&mut body)
         .try_collect::<Vec<_>>()
@@ -92,10 +90,9 @@ async fn malformed_json_releases_its_admission_with_the_stream() {
         let mut body = BoundedBody::new(
             Body::wrap_stream(input),
             1,
-            Some((
-                resources.clone(),
-                Deadline::after(std::time::Duration::from_secs(1)),
-            )),
+            Some(
+                resources.application_admission(Deadline::after(std::time::Duration::from_secs(1))),
+            ),
         );
         destream_json::try_decode::<_, _, crate::literal::Definition>((), &mut body)
             .await

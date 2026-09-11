@@ -1,4 +1,5 @@
 use super::*;
+use crate::KernelRequestGuard;
 use tc_ir::Public;
 async fn stage_service(
     kernel: &Kernel,
@@ -6,18 +7,17 @@ async fn stage_service(
     identity: pathlink::Link,
     definition: tc_ir::Scalar,
 ) -> KernelRequestGuard {
-    let deadline = txn.deadline();
-    let guard = KernelRequestGuard {
-        kernel: kernel.clone(),
-        method: Method::Put,
-        target: KernelTarget::Application("/service".parse().expect("application target")),
-        txn: txn.clone(),
-        _permit: kernel
-            .resources()
-            .admit_request(deadline)
-            .await
-            .expect("request admission"),
-    };
+    let (_, permit) = kernel
+        .admit_host_request()
+        .await
+        .expect("request admission");
+    let guard = KernelRequestGuard::new(
+        kernel.clone(),
+        Method::Put,
+        KernelTarget::Application("/service".parse().expect("application target")),
+        txn.clone(),
+        permit,
+    );
     guard
         .execute(Some(crate::State::Tuple(vec![
             crate::State::from(tc_value::Value::Link(identity)),
@@ -41,15 +41,11 @@ async fn execute(
     kernel
         .execute(target, txn, method, body)
         .await?
+        .0
         .ok_or_else(|| tc_error::TCError::internal("ordinary request returned no response"))
 }
 async fn bind(kernel: &Kernel) -> crate::TxnHandle {
-    kernel
-        .txn_server
-        .bind(None, None, std::sync::Arc::clone(&kernel.inner))
-        .await
-        .expect("bind transaction")
-        .with_deadline(kernel.resources().deadline())
+    kernel.test_txn().await
 }
 async fn complete(kernel: &Kernel, txn: crate::TxnHandle, outcome: crate::txn::TransactionOutcome) {
     kernel
@@ -289,31 +285,22 @@ async fn class_instance_routes_bound_methods_with_concrete_self() {
 #[tokio::test]
 async fn binds_an_ownerless_transaction_for_native_execution() {
     let kernel = kernel("ownerless").await;
-    let deadline = kernel.resources().deadline();
+    let deadline = kernel.deadline();
     let guard = kernel
-        .begin_request(
-            Method::Get,
-            "/state/scalar/value/number/add",
-            false,
-            None,
-            deadline,
-        )
+        .begin_request(Method::Get, "/state/scalar/value/number/add", false, None)
         .await
         .expect("bind transaction");
-    assert_eq!(guard.txn().deadline().instant(), deadline.instant());
+    let upper_bound = kernel.deadline();
+    assert!(guard.txn().deadline().instant() >= deadline.instant());
+    assert!(guard.txn().deadline().instant() <= upper_bound.instant());
 }
 #[tokio::test]
 async fn ttl_worker_finalizes_an_abandoned_transaction() {
     let kernel = setup_with_ttl("ttl", std::time::Duration::from_millis(10)).await;
-    let txn = kernel
-        .txn_server
-        .bind(None, None, std::sync::Arc::clone(&kernel.inner))
-        .await
-        .expect("bind transaction")
-        .with_deadline(kernel.resources().deadline());
+    let txn = kernel.test_txn().await;
     let txn_id = txn.id();
     tokio::time::timeout(std::time::Duration::from_secs(4), async {
-        while kernel.txn_server.contains(&txn_id) {
+        while kernel.test_txn_server().contains(&txn_id) {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     })
@@ -323,16 +310,10 @@ async fn ttl_worker_finalizes_an_abandoned_transaction() {
 #[tokio::test]
 async fn decisions_delegate_repeatedly_until_time_based_finalization() {
     let kernel = kernel("finalize").await;
-    let txn = kernel
-        .txn_server
-        .bind(None, None, std::sync::Arc::clone(&kernel.inner))
-        .await
-        .expect("bind transaction")
-        .with_deadline(kernel.resources().deadline());
+    let txn = kernel.test_txn().await;
     let txn_id = txn.id();
     kernel
-        .inner
-        .libraries
+        .test_libraries()
         .claim(&txn)
         .await
         .expect("claim resource");
@@ -349,14 +330,13 @@ async fn decisions_delegate_repeatedly_until_time_based_finalization() {
         .await
         .expect("opposite decision delegates to the idempotent resource lifecycle");
     let error = kernel
-        .inner
-        .classes
+        .test_classes()
         .claim(&txn)
         .await
         .expect_err("decided transactions cannot accept more work");
     assert_eq!(error.code(), tc_error::ErrorKind::Conflict);
     drop(txn);
-    assert!(kernel.txn_server.contains(&txn_id));
+    assert!(kernel.test_txn_server().contains(&txn_id));
 }
 #[tokio::test]
 async fn a_locked_empty_put_decides_only_its_exact_resource() {
@@ -378,7 +358,6 @@ async fn a_locked_empty_put_decides_only_its_exact_resource() {
             &format!("{identity}?txn_id={}", txn.id()),
             true,
             Some(active_bearer),
-            kernel.resources().deadline(),
         )
         .await
     {
@@ -386,7 +365,7 @@ async fn a_locked_empty_put_decides_only_its_exact_resource() {
         Err(error) => error,
     };
     assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
-    let bearer = kernel.txn_server.test_decision_bearer(&txn);
+    let bearer = kernel.test_txn_server().test_decision_bearer(&txn);
     let resources = txn.claimed_paths();
     let guard = kernel
         .begin_request(
@@ -394,7 +373,6 @@ async fn a_locked_empty_put_decides_only_its_exact_resource() {
             &format!("{identity}/suffix?txn_id={}", txn.id()),
             true,
             Some(bearer.clone()),
-            kernel.resources().deadline(),
         )
         .await
         .expect("bind suffix decision");
@@ -409,7 +387,6 @@ async fn a_locked_empty_put_decides_only_its_exact_resource() {
             &format!("/service/example-devco/other/1.0.0?txn_id={}", txn.id()),
             true,
             Some(bearer.clone()),
-            kernel.resources().deadline(),
         )
         .await
         .expect("bind missing decision");
@@ -424,7 +401,6 @@ async fn a_locked_empty_put_decides_only_its_exact_resource() {
             &format!("{identity}?txn_id={}", txn.id()),
             true,
             Some(bearer.clone()),
-            kernel.resources().deadline(),
         )
         .await
         .expect("bind resource decision");
@@ -441,7 +417,6 @@ async fn a_locked_empty_put_decides_only_its_exact_resource() {
             &format!("{identity}?txn_id={}", txn.id()),
             true,
             Some(bearer.clone()),
-            kernel.resources().deadline(),
         )
         .await
         .expect("bind duplicate resource decision");
@@ -459,7 +434,6 @@ async fn a_locked_empty_put_decides_only_its_exact_resource() {
                 &format!("{resource}?txn_id={}", txn.id()),
                 true,
                 Some(bearer.clone()),
-                kernel.resources().deadline(),
             )
             .await
             .expect("bind resource decision");
@@ -486,13 +460,7 @@ async fn an_unlocked_empty_mutation_is_ordinary_invalid_input() {
     let kernel = kernel("unlocked-empty-mutation").await;
     for method in [Method::Put, Method::Delete] {
         let error = match kernel
-            .begin_request(
-                method,
-                "/service/example-devco/catalog/1.0.0",
-                true,
-                None,
-                kernel.resources().deadline(),
-            )
+            .begin_request(method, "/service/example-devco/catalog/1.0.0", true, None)
             .await
         {
             Ok(_) => panic!("unlocked empty mutation must be rejected"),
@@ -506,7 +474,6 @@ async fn an_unlocked_empty_mutation_is_ordinary_invalid_input() {
             "/service/example-devco/catalog/1.0.0",
             false,
             None,
-            kernel.resources().deadline(),
         )
         .await
         .expect("explicit null body binds ordinary deletion");
@@ -524,21 +491,19 @@ async fn a_locked_decision_excludes_new_work() {
     )]);
     let definition = tc_ir::Scalar::Map(tc_ir::Map::new());
     stage_service(&kernel, &txn, identity.clone(), definition).await;
-    let bearer = kernel.txn_server.test_decision_bearer(&txn);
+    let bearer = kernel.test_txn_server().test_decision_bearer(&txn);
     let guard = kernel
         .begin_request(
             Method::Put,
             &format!("{identity}?txn_id={}", txn.id()),
             true,
             Some(bearer),
-            crate::Deadline::after(std::time::Duration::from_secs(1)),
         )
         .await
         .expect("bind decision");
     assert!(guard.execute(None).await.expect("decision").is_none());
     let error = kernel
-        .inner
-        .classes
+        .test_classes()
         .claim(&txn)
         .await
         .expect_err("locked work must fail");

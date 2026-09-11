@@ -7,7 +7,7 @@ use tc_ir::{Transaction, TxnId};
 use umask::Mode;
 
 use crate::Claim;
-use crate::auth::{Actor, AuthContext, SignedToken, Token};
+use crate::auth::{AuthContext, SignedToken, Token};
 
 fn execution_unavailable(message: impl std::fmt::Display) -> TCError {
     TCError::resource_unavailable(
@@ -17,22 +17,22 @@ fn execution_unavailable(message: impl std::fmt::Display) -> TCError {
 }
 
 #[derive(Clone)]
-pub(crate) enum ExecutionScope {
+enum ExecutionScope {
     Host,
     Application(Arc<crate::txn::DependencyScope>),
 }
 
-pub(super) struct ClaimContext {
-    pub(super) signed: Option<Arc<SignedToken>>,
-    pub(super) mutated: bool,
+struct ClaimContext {
+    signed: Option<Arc<SignedToken>>,
+    mutated: bool,
 }
 
-pub(super) struct ExecutionBudget {
+struct ExecutionBudget {
     remaining: AtomicUsize,
 }
 
 impl ExecutionBudget {
-    pub(super) fn new(invocations: usize) -> Self {
+    fn new(invocations: usize) -> Self {
         Self {
             remaining: AtomicUsize::new(invocations),
         }
@@ -41,21 +41,69 @@ impl ExecutionBudget {
 
 #[derive(Clone)]
 pub struct TxnHandle {
-    pub(super) id: TxnId,
-    pub(super) server: super::TxnServer,
-    pub(crate) kernel: Arc<crate::kernel::KernelInner>,
-    pub(super) scope: ExecutionScope,
-    pub(super) auth_context: Option<AuthContext>,
-    pub(super) protocol_claims: Arc<parking_lot::Mutex<ClaimContext>>,
-    pub(super) autocommit: bool,
-    pub(super) workspace_path: Vec<String>,
-    pub(super) deadline: crate::Deadline,
-    pub(super) graph_admitted: bool,
-    pub(super) execution_budget: Arc<ExecutionBudget>,
-    pub(super) execution_depth: usize,
+    id: TxnId,
+    server: super::TxnServer,
+    kernel: Arc<crate::kernel::KernelInner>,
+    scope: ExecutionScope,
+    auth_context: Option<AuthContext>,
+    protocol_claims: Arc<parking_lot::Mutex<ClaimContext>>,
+    autocommit: bool,
+    workspace_path: Vec<String>,
+    deadline: crate::Deadline,
+    graph_admitted: bool,
+    execution_budget: Arc<ExecutionBudget>,
+    execution_depth: usize,
 }
 
 impl TxnHandle {
+    pub(super) fn new(
+        id: TxnId,
+        server: super::TxnServer,
+        kernel: Arc<crate::kernel::KernelInner>,
+        context: Option<&AuthContext>,
+        autocommit: bool,
+    ) -> tc_error::TCResult<Self> {
+        let snapshot = match context.and_then(AuthContext::signed) {
+            Some(token) => Some(super::protocol_snapshot(id, token)?),
+            None => None,
+        };
+        let authority = server.protocol_authority();
+        let coordinates = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.owner.as_ref())
+            .is_some_and(|(host, actor)| {
+                host.as_str() == authority.host().to_string() && actor == authority.actor_id()
+            });
+        let mut auth_context = context.cloned();
+        if let Some(context) = auth_context.as_mut() {
+            context.take_signed();
+        }
+
+        Ok(Self {
+            id,
+            server: server.clone(),
+            kernel,
+            scope: ExecutionScope::Host,
+            auth_context,
+            protocol_claims: Arc::new(parking_lot::Mutex::new(ClaimContext {
+                signed: if autocommit {
+                    None
+                } else {
+                    context.and_then(AuthContext::signed).cloned()
+                },
+                mutated: false,
+            })),
+            autocommit: autocommit || coordinates,
+            workspace_path: Vec::new(),
+            deadline: server.resources().deadline(),
+            graph_admitted: false,
+            execution_budget: Arc::new(ExecutionBudget::new(
+                server.resources().limits().execution.max_op_invocations,
+            )),
+            execution_depth: 0,
+        })
+    }
+
     fn protocol_snapshot(&self) -> Option<super::token::ProtocolSnapshot> {
         self.protocol_claims
             .lock()
@@ -78,6 +126,11 @@ impl TxnHandle {
         self.protocol_snapshot()
             .map(|claims| claims.leaders.into_keys().collect())
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_mutated(&self) -> bool {
+        self.protocol_claims.lock().mutated
     }
 
     pub(crate) fn mark_resource_mutated(&self, path: &pathlink::PathBuf) -> tc_error::TCResult<()> {
@@ -133,17 +186,15 @@ impl TxnHandle {
             let now = SystemTime::now();
             let signed = if let Some(token) = &claims.signed {
                 authority
-                    .actor
-                    .consume_and_sign((**token).clone(), authority.host.clone(), grants, now)
+                    .extend((**token).clone(), grants, now)
                     .map_err(|error| TCError::unauthorized(error.to_string()))?
             } else {
                 authority
-                    .actor
-                    .sign_token(Token::new(
-                        authority.host.clone(),
+                    .sign(Token::new(
+                        authority.host().clone(),
                         now,
                         self.server.ttl(),
-                        authority.actor.id().clone(),
+                        authority.actor_id().to_string(),
                         grants,
                     ))
                     .map_err(|error| TCError::unauthorized(error.to_string()))?
@@ -173,7 +224,7 @@ impl TxnHandle {
         let owner = snapshot
             .owner
             .ok_or_else(|| TCError::conflict("cannot decide an ownerless transaction"))?;
-        if owner.1 != self.server.protocol_authority().actor.id().as_str() {
+        if owner.1 != self.server.protocol_authority().actor_id() {
             return Err(TCError::unauthorized(
                 "only the transaction-owning resource may coordinate a decision",
             ));
@@ -181,10 +232,8 @@ impl TxnHandle {
         if !snapshot.locked {
             let authority = self.server.protocol_authority();
             let signed = authority
-                .actor
-                .consume_and_sign(
+                .extend(
                     (**claims.signed.as_ref().expect("snapshot has a token")).clone(),
-                    authority.host.clone(),
                     crate::auth::wire_claim(crate::Claim::new(
                         crate::uri::transaction_path(self.id)
                             .parse()
@@ -199,25 +248,66 @@ impl TxnHandle {
         Ok(Some(coordinator))
     }
 
-    pub fn subcontext(&self, name: impl Into<String>) -> Self {
+    fn subcontext(&self, name: impl Into<String>) -> Self {
         let mut txn = self.clone();
         txn.workspace_path.push(name.into());
         txn
     }
 
-    pub fn subcontext_unique(&self) -> Self {
+    fn subcontext_unique(&self) -> Self {
         self.subcontext("tmp")
             .subcontext(self.server.workspace().unique_name())
     }
 
-    pub(crate) fn with_deadline(&self, deadline: crate::Deadline) -> Self {
+    pub(crate) fn restrict_deadline(&self, deadline: crate::Deadline) -> Self {
         let mut txn = self.clone();
-        txn.deadline = deadline;
+        if deadline.instant() < txn.deadline.instant() {
+            txn.deadline = deadline;
+        }
         txn
     }
 
-    pub(crate) fn resources(&self) -> &crate::HostResources {
-        self.server.resources()
+    pub(crate) fn request_body_limit(&self) -> usize {
+        self.server.resources().limits().ingress.request_body_bytes
+    }
+
+    pub(crate) fn application_body_limit(&self) -> usize {
+        self.server
+            .resources()
+            .limits()
+            .ingress
+            .application_body_bytes
+    }
+
+    #[cfg(feature = "http-server")]
+    pub(crate) fn application_admission(&self) -> crate::resources::ApplicationAdmission {
+        self.server.resources().application_admission(self.deadline)
+    }
+
+    pub(crate) async fn admit_application_memory(
+        &self,
+        bytes: usize,
+    ) -> tc_error::TCResult<tokio::sync::OwnedSemaphorePermit> {
+        self.server
+            .resources()
+            .admit_application_bytes(bytes, self.deadline)
+            .await
+    }
+
+    pub(crate) fn execution_limits(&self) -> crate::ExecutionLimits {
+        self.server.resources().limits().execution.clone()
+    }
+
+    pub(crate) async fn admit_graph_op(
+        &self,
+    ) -> tc_error::TCResult<crate::resources::CapacityPermit> {
+        self.server.resources().admit_graph_op(self.deadline).await
+    }
+
+    pub(crate) async fn admit_outbound(
+        &self,
+    ) -> tc_error::TCResult<crate::resources::CapacityPermit> {
+        self.server.resources().admit_outbound(self.deadline).await
     }
 
     pub(crate) fn deadline(&self) -> crate::Deadline {
@@ -238,7 +328,7 @@ impl TxnHandle {
         if self.deadline.is_expired() {
             return Err(self.deadline.exceeded());
         }
-        let limits = &self.resources().limits().execution;
+        let limits = &self.server.resources().limits().execution;
         if self.execution_depth >= limits.max_execution_depth {
             return Err(execution_unavailable(format!(
                 "operation nesting exceeds the {}-level limit",
@@ -277,20 +367,14 @@ impl TxnHandle {
         &self,
         identity: &Link,
     ) -> tc_error::TCResult<crate::cluster::Cluster<crate::class::Class>> {
-        self.kernel
-            .classes
-            .clone()
-            .lookup(self, &identity.path()[1..])
-            .await?
-            .exact_item()?
-            .ok_or_else(|| TCError::not_found(identity.to_string()))
+        self.kernel.resolve_class(self, identity).await
     }
 
     pub fn id(&self) -> TxnId {
         self.id
     }
 
-    pub fn has_claim(&self, link: &Link, required: Mode) -> bool {
+    pub(crate) fn has_claim(&self, link: &Link, required: Mode) -> bool {
         let snapshot = self.protocol_snapshot();
         let protocol_allows = if link.path()
             == &crate::uri::transaction_path(self.id)
@@ -324,7 +408,7 @@ impl TxnHandle {
             || (!self.autocommit && self.leader(resource).is_some())
     }
 
-    pub fn auth_context(&self) -> Option<&AuthContext> {
+    pub(crate) fn auth_context(&self) -> Option<&AuthContext> {
         self.auth_context.as_ref()
     }
 
@@ -343,17 +427,10 @@ impl TxnHandle {
 
     pub(crate) async fn grant_claim(&self, claim: Claim) -> tc_error::TCResult<Self> {
         let authority = self.server.protocol_authority();
-        self.grant(
-            authority.actor.as_ref(),
-            authority.host.clone(),
-            claim.link,
-            claim.mask,
-        )
+        self.grant(authority, claim.link, claim.mask)
     }
 
-    pub async fn context(
-        &self,
-    ) -> tc_error::TCResult<freqfs::DirLock<tc_collection::PersistentFile>> {
+    async fn context(&self) -> tc_error::TCResult<freqfs::DirLock<tc_collection::PersistentFile>> {
         self.server
             .workspace()
             .transaction_child(self.id, &self.workspace_path)
@@ -363,19 +440,13 @@ impl TxnHandle {
     #[cfg(test)]
     pub(crate) fn with_claims(&self, claims: Vec<Claim>) -> Self {
         let mut txn = self.clone();
-        txn.auth_context = Some(AuthContext {
-            principal: "test".into(),
-            verified_at_nanos: 0,
-            claims: claims
+        txn.auth_context = Some(
+            claims
                 .into_iter()
-                .map(|claim| crate::auth::AuthClaimContext {
-                    host: "test".into(),
-                    actor_id: "test".into(),
-                    claim,
-                })
-                .collect(),
-            signed: None,
-        });
+                .fold(AuthContext::new("test"), |context, claim| {
+                    context.with_claim("test".into(), "test".into(), claim)
+                }),
+        );
         txn
     }
 
@@ -390,8 +461,7 @@ impl TxnHandle {
     pub(crate) fn lock_for_test(&self) -> tc_error::TCResult<Self> {
         let authority = self.server.protocol_authority();
         let txn = self.grant(
-            authority.actor.as_ref(),
-            authority.host.clone(),
+            authority,
             crate::uri::transaction_path(self.id)
                 .parse()
                 .expect("transaction path"),
@@ -409,8 +479,7 @@ impl TxnHandle {
 
     pub(super) fn grant(
         &self,
-        actor: &Actor,
-        host: Link,
+        authority: &crate::ProtocolAuthority,
         resource: Link,
         mode: Mode,
     ) -> tc_error::TCResult<Self> {
@@ -419,19 +488,19 @@ impl TxnHandle {
 
         let current = self.protocol_claims.lock().signed.clone();
         let signed = match current {
-            Some(token) => actor
-                .consume_and_sign((*token).clone(), host, crate::auth::wire_claim(claim), now)
+            Some(token) => authority
+                .extend((*token).clone(), crate::auth::wire_claim(claim), now)
                 .map_err(|err| TCError::unauthorized(err.to_string()))?,
             None => {
                 let token = Token::new(
-                    host,
+                    authority.host().clone(),
                     now,
                     self.server.ttl(),
-                    actor.id().clone(),
+                    authority.actor_id().to_string(),
                     crate::auth::wire_claim(claim),
                 );
-                actor
-                    .sign_token(token)
+                authority
+                    .sign(token)
                     .map_err(|err| TCError::unauthorized(err.to_string()))?
             }
         };
@@ -459,7 +528,11 @@ impl tc_collection::StorageContext for TxnHandle {
     }
 
     fn materialized_tensor_bytes(&self) -> usize {
-        self.resources().limits().device.materialized_tensor_bytes
+        self.server
+            .resources()
+            .limits()
+            .device
+            .materialized_tensor_bytes
     }
 }
 

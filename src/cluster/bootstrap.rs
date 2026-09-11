@@ -1,9 +1,41 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use tc_error::{TCError, TCResult};
-use tc_ir::{Method, Scalar};
+use tc_ir::Scalar;
 
 use super::{Cluster, Dir, DirItem, replica_put_state};
+
+pub(crate) struct BootstrapSession {
+    token: String,
+    replica: crate::replication::Replica,
+    state_hash: String,
+}
+
+impl BootstrapSession {
+    pub(crate) fn new(
+        token: String,
+        replica: crate::replication::Replica,
+        state_hash: String,
+    ) -> Self {
+        Self {
+            token,
+            replica,
+            state_hash,
+        }
+    }
+
+    fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn replica(&self) -> &crate::replication::Replica {
+        &self.replica
+    }
+
+    fn state_hash(&self) -> &str {
+        &self.state_hash
+    }
+}
 
 impl<T: DirItem> Cluster<Dir<T>> {
     pub(crate) async fn bootstrap(
@@ -14,7 +46,7 @@ impl<T: DirItem> Cluster<Dir<T>> {
     ) -> TCResult<BTreeSet<String>> {
         let root = pathlink::Link::from(self.path().clone());
         let (txn, session) = kernel.bootstrap_resource(seed, &root, identity).await?;
-        let resources = seed_tree(kernel, seed, identity, &session.token, &txn, &root).await?;
+        let resources = seed_tree(kernel, seed, identity, session.token(), &txn, &root).await?;
         kernel
             .coordinate(&txn, crate::txn::TransactionOutcome::Commit, true)
             .await?;
@@ -42,24 +74,23 @@ impl<T: DirItem> Cluster<Dir<T>> {
             ),
         );
         let local_value = crate::State::Tuple(vec![
-            crate::State::from(tc_value::Value::String(session.replica.endpoint.clone())),
-            replica_put_state(&session.replica, session.state_hash.clone()),
+            crate::State::from(tc_value::Value::String(session.replica().endpoint.clone())),
+            replica_put_state(session.replica(), session.state_hash().to_string()),
         ]);
         let peers =
-            seed_replica_endpoints(seed, &session.token, txn.id(), &replicas, txn.deadline())
+            seed_replica_endpoints(seed, session.token(), txn.id(), &replicas, txn.deadline())
                 .await?;
         kernel
-            .inner
-            .dispatch(&txn, &replicas, Method::Put, Some(local_value))
+            .update_bootstrap_membership(&txn, &replicas, local_value)
             .await?;
         self.gateway
             .put(
-                &session.replica.endpoint,
-                &session.token,
+                &session.replica().endpoint,
+                session.token(),
                 txn.id(),
                 &replicas,
                 Scalar::Value(tc_value::Value::String(identity.endpoint.clone())),
-                replica_put_state(identity, session.state_hash),
+                replica_put_state(identity, session.state_hash().to_string()),
                 txn.deadline(),
             )
             .await?;
@@ -89,7 +120,7 @@ async fn seed_tree(
             txn.id(),
             &directory,
             txn.deadline(),
-            txn.resources().limits().ingress.request_body_bytes,
+            txn.request_body_limit(),
         )
         .await?;
         let crate::State::Map(entries) = state else {
@@ -99,24 +130,17 @@ async fn seed_tree(
         };
         for (name, is_directory) in entries.into_iter().rev() {
             let child: pathlink::Link = directory.path().clone().append(name).into();
-            let session = crate::replication::bootstrap_seed(
-                seed,
-                txn.id(),
-                &child,
-                identity,
-                &kernel.inner.bootstrap,
-            )
-            .await?;
+            let session = kernel.bootstrap_child(seed, txn, &child, identity).await?;
             if state_bool(is_directory)? {
-                directories.push_back((child, session.token));
+                directories.push_back((child, session.token().to_string()));
             } else {
                 let state = crate::replication::read_seed_state(
                     seed,
-                    &session.token,
+                    session.token(),
                     txn.id(),
                     &child,
                     txn.deadline(),
-                    txn.resources().limits().ingress.application_body_bytes,
+                    txn.application_body_limit(),
                 )
                 .await?;
                 kernel.install_seed_item(txn, child.clone(), state).await?;

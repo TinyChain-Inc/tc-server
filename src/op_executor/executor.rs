@@ -17,7 +17,7 @@ pub(super) async fn resolve_with_admission(
         return resolve(provider, values, txn, self_state).await;
     }
 
-    let _permit = txn.resources().admit_graph_op(txn.deadline()).await?;
+    let _permit = txn.admit_graph_op().await?;
     let txn = txn.with_graph_admission();
     resolve(provider, values, &txn, self_state).await
 }
@@ -87,7 +87,7 @@ impl<'a> Executor<'a> {
             )));
         }
 
-        let limits = &self.txn.resources().limits().execution;
+        let limits = self.txn.execution_limits();
         let mut schedule = Schedule::build(
             &capture,
             &self.bindings,
@@ -120,7 +120,7 @@ impl<'a> Executor<'a> {
                 let limit = if self.txn.graph_admitted() {
                     1
                 } else {
-                    self.txn.resources().limits().execution.parallel_graph_ops
+                    limits.parallel_graph_ops
                 };
                 let mut futures = stream::iter(pending)
                     .map(|(id, provider)| {

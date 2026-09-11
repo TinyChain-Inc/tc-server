@@ -15,8 +15,8 @@ impl<T> Cluster<T> {
     fn leads(&self, txn: &crate::TxnHandle) -> bool {
         txn.leader(&self.path)
             == Some((
-                self.protocol.host.to_string(),
-                self.protocol.actor.id().to_string(),
+                self.protocol.host().to_string(),
+                self.protocol.actor_id().to_string(),
             ))
     }
 
@@ -105,24 +105,9 @@ impl<T> Cluster<T> {
         txn: &crate::TxnHandle,
         result: crate::replication::Fanout,
     ) -> TCResult<()> {
-        if result.failed.is_empty() {
-            return Ok(());
-        }
-        if result
-            .first_error
-            .as_ref()
-            .is_some_and(|error| error.code() == tc_error::ErrorKind::Conflict)
-        {
-            return Err(result.first_error.expect("checked conflict"));
-        }
-        let replica_count = result.delivered.len() + result.failed.len() + 1;
-        if result.delivered.len() + 1 <= replica_count / 2 {
-            return Err(result.first_error.unwrap_or_else(|| {
-                TCError::bad_gateway("replica write lost its strict majority")
-            }));
-        }
+        let evictions = result.strict_majority()?;
 
-        for endpoint in &result.failed {
+        for endpoint in evictions.failed() {
             self.replicas
                 .remove(txn.id(), endpoint)
                 .await
@@ -130,22 +115,19 @@ impl<T> Cluster<T> {
         }
         txn.mark_resource_mutated(self.path())?;
 
-        if !result.delivered.is_empty() {
+        if !evictions.delivered().is_empty() {
             let target = replicas_link(&self.path);
-            for endpoint in result.failed {
+            let delivered = evictions.delivered().clone();
+            for endpoint in evictions.into_failed() {
                 let removal = crate::replication::forward_delete_to_peers(
-                    &result.delivered,
+                    &delivered,
                     txn,
                     &target,
                     Scalar::Value(tc_value::Value::String(endpoint)),
                     self.gateway.as_ref(),
                 )
                 .await?;
-                if !removal.failed.is_empty() {
-                    return Err(removal.first_error.unwrap_or_else(|| {
-                        TCError::bad_gateway("failed to propagate replica eviction")
-                    }));
-                }
+                removal.complete("failed to propagate replica eviction")?;
             }
         }
         Ok(())

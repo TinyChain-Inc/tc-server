@@ -18,11 +18,7 @@ async fn nested_graph_resolution_inherits_admission() {
     )
     .await;
     let txn = kernel.test_txn().await;
-    let _permit = txn
-        .resources()
-        .admit_graph_op(txn.deadline())
-        .await
-        .expect("outer graph admission");
+    let _permit = txn.admit_graph_op().await.expect("outer graph admission");
     let txn = txn.with_graph_admission();
     let state = resolve_with_admission(
         Scalar::from(Value::from(1_u64)),

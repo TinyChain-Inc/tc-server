@@ -5,7 +5,7 @@ use futures::{TryStreamExt, future::BoxFuture};
 use tower::Service;
 
 use super::parse::{decode_native_body, parse_bearer_token};
-use super::response::{method_not_allowed, not_found};
+use super::response::method_not_allowed;
 use super::{Request, Response};
 use crate::{Kernel, Method};
 
@@ -68,33 +68,23 @@ impl Service<Request> for KernelService {
         let method = req.method().clone();
         let path = uri.path().to_owned();
         let kernel = self.kernel.clone();
-        let resources = self.kernel.resources().clone();
 
         Box::pin(async move {
-            let deadline = resources.deadline();
+            let deadline = kernel.deadline();
             let method = match to_kernel_method(&method) {
                 Some(method) => method,
                 None => return Ok(method_not_allowed()),
             };
 
-            let mut req = req;
-            req.extensions_mut().insert(resources.clone());
-
             if path == crate::uri::HOST_HEALTH
                 || path == crate::uri::HOST_METRICS
                 || path == crate::uri::HOST_PUBLIC_KEY
             {
-                let _request = match resources.admit_request(deadline).await {
-                    Ok(permit) => permit,
+                let _request = match kernel.admit_host_request().await {
+                    Ok((_, permit)) => permit,
                     Err(err) => return Ok(super::response::tc_error_response(err)),
                 };
                 if path == crate::uri::HOST_HEALTH {
-                    if !kernel.is_ready() {
-                        return Ok(super::response::tc_error_response(tc_error::TCError::new(
-                            tc_error::ErrorKind::Unavailable,
-                            "host is not ready",
-                        )));
-                    }
                     return Ok(match kernel.health(method) {
                         Ok(health) => super::state_response(health),
                         Err(error) => super::response::tc_error_response(error),
@@ -126,7 +116,7 @@ impl Service<Request> for KernelService {
                 .unwrap_or(&path);
 
             let guard = match deadline
-                .wait(kernel.begin_request(method, raw_path, body_is_none, bearer, deadline))
+                .wait(kernel.begin_request(method, raw_path, body_is_none, bearer))
                 .await
             {
                 Err(err) => return Ok(super::response::tc_error_response(err)),
@@ -137,8 +127,8 @@ impl Service<Request> for KernelService {
             {
                 let contract = guard.body_contract();
                 let txn = guard.txn().clone();
-                req.extensions_mut().insert(txn.clone());
                 if let crate::BodyContract::Application { max_bytes: limit } = contract {
+                    let admission = guard.application_admission();
                     let content_type = req
                         .headers()
                         .get(http::header::CONTENT_TYPE)
@@ -155,11 +145,8 @@ impl Service<Request> for KernelService {
                             ));
                         }
                     };
-                    let mut body = crate::http_body::BoundedBody::new(
-                        req.into_body(),
-                        limit,
-                        Some((resources.clone(), deadline)),
-                    );
+                    let mut body =
+                        crate::http_body::BoundedBody::new(req.into_body(), limit, Some(admission));
                     let state = if is_wasm {
                         match (&mut body)
                             .try_fold(Vec::new(), |mut bytes, chunk| async move {
@@ -207,12 +194,9 @@ impl Service<Request> for KernelService {
                         Err(error) => super::response::tc_error_response(error),
                     });
                 }
+                let native_body_limit = guard.native_body_limit();
                 let body = match deadline
-                    .wait(decode_native_body(
-                        req,
-                        txn.clone(),
-                        resources.limits().ingress.request_body_bytes,
-                    ))
+                    .wait(decode_native_body(req, txn.clone(), native_body_limit))
                     .await
                 {
                     Err(err) => {
@@ -230,9 +214,14 @@ impl Service<Request> for KernelService {
                     .await
                     .unwrap_or_else(Err);
                 match result {
-                    Ok((Some(state), guard)) => {
+                    Ok((Some(state), raw_application_bytes, guard)) => {
                         match deadline
-                            .wait(super::native_state_response(state, txn, Some(guard)))
+                            .wait(super::native_state_response(
+                                state,
+                                txn,
+                                raw_application_bytes,
+                                Some(guard),
+                            ))
                             .await
                             .unwrap_or_else(Err)
                         {
@@ -240,8 +229,7 @@ impl Service<Request> for KernelService {
                             Err(err) => Ok(super::response::tc_error_response(err)),
                         }
                     }
-                    Ok((None, _guard)) => Ok(super::response::no_content()),
-                    Err(err) if err.code() == tc_error::ErrorKind::NotFound => Ok(not_found()),
+                    Ok((None, _, _guard)) => Ok(super::response::no_content()),
                     Err(err) => Ok(super::response::tc_error_response(err)),
                 }
             }
@@ -271,9 +259,8 @@ impl<T> Service<T> for MakeKernelService {
 
     fn call(&mut self, _target: T) -> Self::Future {
         let service = self.service.clone();
-        let resources = service.kernel.resources().clone();
         Box::pin(async move {
-            let permit = resources.admit_connection(resources.deadline()).await?;
+            let permit = service.kernel.admit_connection().await?;
             Ok(ConnectionService {
                 service,
                 _permit: permit,

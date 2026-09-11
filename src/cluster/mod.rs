@@ -10,6 +10,8 @@ use crate::replication::ClusterGateway;
 
 #[cfg(feature = "http-client")]
 mod bootstrap;
+#[cfg(feature = "http-client")]
+pub(crate) use bootstrap::BootstrapSession;
 mod dir;
 mod replicas;
 pub(crate) use dir::Dir;
@@ -131,7 +133,7 @@ where
         let (host, actor) = txn
             .leader(&self.path)
             .ok_or_else(|| TCError::conflict("resource was not claimed"))?;
-        if host == self.protocol.host.to_string() && actor == self.protocol.actor.id().as_str() {
+        if host == self.protocol.host().to_string() && actor == self.protocol.actor_id() {
             return Ok(());
         }
         self.replica_snapshot(txn.id())

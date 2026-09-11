@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+#![warn(unreachable_pub)]
 
 pub mod auth;
 pub use auth::Claim;

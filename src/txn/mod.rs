@@ -6,6 +6,7 @@ mod token;
 pub(crate) mod wire;
 
 #[cfg(test)]
+#[path = "../../tests/support/txn.rs"]
 mod tests;
 
 #[cfg(test)]

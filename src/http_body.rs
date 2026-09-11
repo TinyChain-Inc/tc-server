@@ -11,7 +11,7 @@ use hyper::body::HttpBody;
 use tc_error::{Pressure, PressureReason, TCError, TCResult};
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::{Deadline, HostResources};
+use crate::resources::ApplicationAdmission;
 
 pub(crate) fn json_stream<T>(value: T) -> futures::stream::BoxStream<'static, io::Result<Bytes>>
 where
@@ -37,7 +37,7 @@ pub(crate) struct BoundedBody {
     body: hyper::Body,
     read: usize,
     limit: usize,
-    admission: Option<(HostResources, Deadline)>,
+    admission: Option<ApplicationAdmission>,
     pub(crate) permit: Option<OwnedSemaphorePermit>,
     pending: Option<Pin<Box<dyn Future<Output = TCResult<(OwnedSemaphorePermit, Bytes)>> + Send>>>,
     failure: Option<TCError>,
@@ -47,7 +47,7 @@ impl BoundedBody {
     pub(crate) fn new(
         body: hyper::Body,
         limit: usize,
-        admission: Option<(HostResources, Deadline)>,
+        admission: Option<ApplicationAdmission>,
     ) -> Self {
         Self {
             body,
@@ -123,14 +123,14 @@ impl Stream for BoundedBody {
                         return Poll::Ready(Some(Ok(chunk)));
                     }
 
-                    let (resources, deadline) = self
+                    let admission = self
                         .admission
                         .as_ref()
                         .expect("admission was checked above")
                         .clone();
                     let bytes = chunk.len();
                     self.pending = Some(Box::pin(async move {
-                        let permit = resources.admit_application_bytes(bytes, deadline).await?;
+                        let permit = admission.acquire(bytes).await?;
                         Ok((permit, chunk))
                     }));
                 }

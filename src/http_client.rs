@@ -55,7 +55,7 @@ impl RpcGateway for HttpGateway {
     ) -> BoxFuture<'static, TCResult<()>> {
         let client = self.client.clone();
         async move {
-            let (content_type, body) = if target.path().len() == 1 {
+            let (content_type, body) = if crate::uri::is_application_root(&target) {
                 encode_application_put(key, value).await?
             } else {
                 (
@@ -69,13 +69,8 @@ impl RpcGateway for HttpGateway {
             };
             let response =
                 send_request(&client, Method::Put, target, &txn, content_type, body).await?;
-            crate::outbound_http::consume(
-                response,
-                txn.deadline(),
-                txn.resources().limits().ingress.request_body_bytes,
-                false,
-            )
-            .await
+            crate::outbound_http::consume(response, txn.deadline(), txn.request_body_limit(), false)
+                .await
         }
         .boxed()
     }
@@ -102,7 +97,7 @@ impl RpcGateway for HttpGateway {
                 response,
                 txn.clone(),
                 txn.deadline(),
-                txn.resources().limits().ingress.request_body_bytes,
+                txn.request_body_limit(),
             )
             .await
         }
@@ -127,13 +122,8 @@ impl RpcGateway for HttpGateway {
                 body,
             )
             .await?;
-            crate::outbound_http::consume(
-                response,
-                txn.deadline(),
-                txn.resources().limits().ingress.request_body_bytes,
-                false,
-            )
-            .await
+            crate::outbound_http::consume(response, txn.deadline(), txn.request_body_limit(), false)
+                .await
         }
         .boxed()
     }
@@ -180,7 +170,7 @@ impl crate::replication::ClusterGateway for HttpGateway {
         value: State,
         deadline: crate::Deadline,
     ) -> TCResult<()> {
-        let (content_type, body) = if target.path().len() == 1 {
+        let (content_type, body) = if crate::uri::is_application_root(target) {
             encode_application_put(key, value).await?
         } else {
             let value = Scalar::try_cast_from(value, |_| {
@@ -399,7 +389,7 @@ async fn decode_state_response(
         let bytes = crate::outbound_http::collect_bytes(
             response,
             txn.deadline(),
-            txn.resources().limits().ingress.application_body_bytes,
+            txn.application_body_limit(),
         )
         .await?;
         return Ok(State::from(tc_value::Value::Bytes(bytes)));
@@ -409,7 +399,7 @@ async fn decode_state_response(
         response,
         txn.clone(),
         txn.deadline(),
-        txn.resources().limits().ingress.request_body_bytes,
+        txn.request_body_limit(),
     )
     .await
 }

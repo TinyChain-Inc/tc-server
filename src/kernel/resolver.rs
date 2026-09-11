@@ -51,6 +51,7 @@ impl super::KernelInner {
     ) -> tc_error::TCResult<State> {
         self.dispatch(txn, target, method, Some(body))
             .await?
+            .0
             .ok_or_else(|| {
                 tc_error::TCError::internal(
                     "nested application dispatch returned a transaction decision",
@@ -72,7 +73,7 @@ impl super::KernelInner {
                     .await
             }
             Target::Remote(target) => {
-                let _permit = txn.resources().admit_outbound(txn.deadline()).await?;
+                let _permit = txn.admit_outbound().await?;
                 self.rpc.get(target, txn, key).await
             }
         }
@@ -101,7 +102,7 @@ impl super::KernelInner {
                 .await
                 .map(|_| ()),
             Target::Remote(target) => {
-                let _permit = txn.resources().admit_outbound(txn.deadline()).await?;
+                let _permit = txn.admit_outbound().await?;
                 self.rpc.put(target, txn, key, value).await
             }
         }
@@ -124,7 +125,7 @@ impl super::KernelInner {
                     .await
             }
             Target::Remote(target) => {
-                let _permit = txn.resources().admit_outbound(txn.deadline()).await?;
+                let _permit = txn.admit_outbound().await?;
                 self.rpc.post(target, txn, params).await
             }
         }
@@ -147,7 +148,7 @@ impl super::KernelInner {
                 .await
                 .map(|_| ()),
             Target::Remote(target) => {
-                let _permit = txn.resources().admit_outbound(txn.deadline()).await?;
+                let _permit = txn.admit_outbound().await?;
                 self.rpc.delete(target, txn, key).await
             }
         }

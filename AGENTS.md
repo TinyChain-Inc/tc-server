@@ -10,6 +10,11 @@ provide additional, non-normative integration context.
 - Bootstrap creates one complete `Kernel`, `TxnServer`, `HostServices`,
   `HostResources`, `HostStorage`, and protocol authority. There
   are no optional production owners, gateways, finalizers, or hidden defaults.
+- `HostServices`, `TxnHandle`, and `StateExecutor` are trusted in-process
+  capabilities. Their authority-bearing state is privately constructed and
+  exposed only through semantic operations. Crate visibility is not an
+  ownership boundary: do not add generic `inner`, `server`, `resources`,
+  signer, token, or application-root getters.
 - `HostStorage` creates one application-data cache, one host-control cache, and
   one collection-workspace cache. Application code receives delegated roots
   and never constructs caches or filesystem paths. The superproject's
@@ -40,6 +45,10 @@ provide additional, non-normative integration context.
 - `Kernel::begin_request` and `KernelRequestGuard` are the single bound request
   path. HTTP and PyO3 do not bind transactions, route applications, select
   outcomes, or stage resources independently.
+- `Kernel::begin_request` derives the host's absolute deadline. Callers may
+  cancel earlier but cannot extend execution beyond host policy. The guard's
+  transaction accessor is the deliberate trusted-native capability edge used
+  by native response handles; decoded or foreign values never construct one.
 - `Cluster<Dir<T>>::lookup` claims every traversed directory and item before
   reading transactional state. Directory membership determines the terminal
   item; live routing never scans for a semantic-version boundary. Missing
@@ -52,7 +61,10 @@ provide additional, non-normative integration context.
   network boundary; WASM encodes at the sandbox boundary; PyO3 projection lives
   only in `client/rust`.
 - HTTP owns parsing, bounded bodies, response streaming, and wire codecs. It has
-  no semantic fallback callback. Unknown kernel targets return `NotFound`.
+  no semantic fallback callback. Readiness, canonical target classification,
+  and semantic response kind belong to the kernel; adapters only project those
+  decisions into status, MIME, and encoding. Unknown kernel targets return
+  `NotFound`.
 - HTTP pull-decodes application JSON directly into its canonical `(Link, Scalar)`
   definition. Admission is a request-local capacity lease, never a binary body
   carrier. Only raw WASM is materialized as bytes because those bytes are the
