@@ -12,11 +12,12 @@ async-hash = { path = "../deps/async-hash", version = "0.6" }
 futures = "0.3"
 pathlink = { path = "../deps/pathlink", features = ["serialize"] }
 tc-ir = { path = "../tc-ir" }
-tc-error = { path = "../tc-error" }
+tc-error = { path = "../tc-error", features = ["txfs"] }
 tc-value = { path = "../tc-value", features = ["serialize"] }
 tc-state = { path = "../tc-state" }
 tc-collection = { path = "../tc-collection" }
 txn_lock = { path = "../deps/txn_lock" }
+txfs = { path = "../deps/txfs" }
 umask = "2.1"
 parking_lot = "0.12"
 url = "2"
@@ -47,10 +48,12 @@ default-features = false
 
 [dependencies.http]
 version = "0.2"
+optional = true
 
 [dependencies.hyper]
 version = "0.14"
 features = ["full"]
+optional = true
 
 [dependencies.tokio]
 version = "1"
@@ -64,9 +67,9 @@ optional = true
 [features]
 default = ["http-client", "http-server", "wasm"]
 # Outbound HTTP client support (for proxying requests to remote hosts).
-http-client = []
+http-client = ["dep:http", "dep:hyper"]
 # Inbound HTTP server support (Hyper server + tower make_service wiring).
-http-server = ["dep:tower"]
+http-server = ["dep:http", "dep:hyper", "dep:tower"]
 wasm = ["dep:wasmtime"]
 mdns = ["dep:mdns-sd"]
 

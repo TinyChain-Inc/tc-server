@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs;
+use std::io::Read;
 use std::str::FromStr;
 
 use base64::Engine as _;
@@ -7,38 +7,31 @@ use futures::FutureExt;
 use pathlink::Link;
 use serde::Deserialize;
 use tc_error::{TCError, TCResult};
-use tinychain::auth::{
-    KeyringActorResolver, PublicKeyStore, RjwtTokenVerifier, TokenContext, TokenVerifier,
-};
-use tinychain::replication::{
-    PeerMembership, is_supported_replicated_path, normalize_replicated_prefix,
-};
+use tinychain::auth::{AuthContext, KeyringActorResolver, RjwtTokenVerifier, TokenVerifier};
+use tinychain::replication::normalize_replicated_prefix;
 
 use super::config::Config;
+
+const MAX_TRUSTED_INSTALLERS_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct TrustedInstaller {
     pub(crate) host: String,
     pub(crate) actor_id: String,
+    pub(crate) algorithm: rjwt::AlgKind,
     pub(crate) public_key_b64: String,
-    #[serde(default)]
-    pub(crate) allowed_lib_prefixes: Vec<String>,
+    pub(crate) allowed_prefixes: Vec<String>,
 }
 
 #[derive(Clone)]
 pub(crate) struct TrustedInstallerPolicy {
     by_actor: HashMap<(String, String), Vec<String>>,
-    replication_root: String,
 }
 
 impl TrustedInstallerPolicy {
-    pub(crate) fn from_installers(
-        installers: &[TrustedInstaller],
-        cluster_root: &str,
-    ) -> TCResult<Self> {
+    pub(crate) fn from_installers(installers: &[TrustedInstaller]) -> TCResult<Self> {
         let mut policy = Self {
             by_actor: HashMap::new(),
-            replication_root: normalize_replicated_prefix(cluster_root)?,
         };
 
         for installer in installers {
@@ -53,13 +46,13 @@ impl TrustedInstallerPolicy {
             }
 
             let mut prefixes = Vec::new();
-            for prefix in &installer.allowed_lib_prefixes {
+            for prefix in &installer.allowed_prefixes {
                 prefixes.push(normalize_replicated_prefix(prefix)?);
             }
 
             if prefixes.is_empty() {
                 return Err(TCError::bad_request(format!(
-                    "trusted installer {actor_id} must define at least one allowed_lib_prefix"
+                    "trusted installer {actor_id} must define at least one allowed_prefix"
                 )));
             }
 
@@ -71,38 +64,36 @@ impl TrustedInstallerPolicy {
         Ok(policy)
     }
 
-    pub(crate) fn replication_root(&self) -> &str {
-        &self.replication_root
-    }
-
-    fn validate_external_context(
-        &self,
-        ctx: &TokenContext,
-    ) -> Result<(), tinychain::txn::TxnError> {
-        for (host, actor_id, claim) in &ctx.claims {
-            let path = claim.link.to_string();
+    fn validate_external_context(&self, ctx: &AuthContext) -> TCResult<()> {
+        for claim in &ctx.claims {
+            let path = claim.claim.link.to_string();
 
             if path.starts_with(tinychain::uri::HOST_TXN_PREFIX) {
                 continue;
             }
 
-            if host == "/host" {
+            if claim.host == "/host" {
                 continue;
             }
 
-            let Some(prefixes) = self.by_actor.get(&(host.clone(), actor_id.clone())) else {
-                return Err(tinychain::txn::TxnError::Unauthorized);
+            let Some(prefixes) = self
+                .by_actor
+                .get(&(claim.host.clone(), claim.actor_id.clone()))
+            else {
+                return Err(TCError::unauthorized("untrusted installer actor"));
             };
 
-            if !is_supported_replicated_path(&path) {
-                return Err(tinychain::txn::TxnError::Unauthorized);
+            if normalize_replicated_prefix(&path).is_err() {
+                return Err(TCError::unauthorized("invalid installer claim"));
             }
 
             if !prefixes
                 .iter()
                 .any(|prefix| path_matches_prefix(&path, prefix))
             {
-                return Err(tinychain::txn::TxnError::Unauthorized);
+                return Err(TCError::unauthorized(
+                    "installer claim is outside its policy",
+                ));
             }
         }
 
@@ -114,23 +105,11 @@ impl TrustedInstallerPolicy {
 pub(crate) struct TrustedInstallerTokenVerifier {
     inner: RjwtTokenVerifier,
     policy: TrustedInstallerPolicy,
-    replication_membership: PeerMembership,
-    local_replication_actor_id: String,
 }
 
 impl TrustedInstallerTokenVerifier {
-    pub(crate) fn new(
-        inner: RjwtTokenVerifier,
-        policy: TrustedInstallerPolicy,
-        replication_membership: PeerMembership,
-        local_replication_actor_id: String,
-    ) -> Self {
-        Self {
-            inner,
-            policy,
-            replication_membership,
-            local_replication_actor_id,
-        }
+    pub(crate) fn new(inner: RjwtTokenVerifier, policy: TrustedInstallerPolicy) -> Self {
+        Self { inner, policy }
     }
 }
 
@@ -138,38 +117,12 @@ impl TokenVerifier for TrustedInstallerTokenVerifier {
     fn verify(
         &self,
         bearer_token: String,
-    ) -> futures::future::BoxFuture<'static, Result<TokenContext, tinychain::txn::TxnError>> {
+    ) -> futures::future::BoxFuture<'static, TCResult<AuthContext>> {
         let inner = self.inner.clone();
         let policy = self.policy.clone();
-        let replication_membership = self.replication_membership.clone();
-        let local_replication_actor_id = self.local_replication_actor_id.clone();
         async move {
             let ctx = inner.verify(bearer_token).await?;
             policy.validate_external_context(&ctx)?;
-
-            for (host, actor_id, claim) in &ctx.claims {
-                let path = claim.link.to_string();
-                if path.starts_with(tinychain::uri::HOST_TXN_PREFIX) {
-                    continue;
-                }
-
-                if host == "/host" {
-                    let from_known_replica = actor_id == &local_replication_actor_id
-                        || replication_membership
-                            .peer_descriptors()
-                            .iter()
-                            .any(|peer| peer.actor_id.as_deref() == Some(actor_id.as_str()));
-
-                    if !from_known_replica {
-                        return Err(tinychain::txn::TxnError::Unauthorized);
-                    }
-
-                    if !path_matches_prefix(&path, policy.replication_root()) {
-                        return Err(tinychain::txn::TxnError::Unauthorized);
-                    }
-                }
-            }
-
             Ok(ctx)
         }
         .boxed()
@@ -177,9 +130,9 @@ impl TokenVerifier for TrustedInstallerTokenVerifier {
 
     fn grant(
         &self,
-        token: TokenContext,
-        claim: tc_ir::Claim,
-    ) -> futures::future::BoxFuture<'static, Result<TokenContext, tinychain::txn::TxnError>> {
+        token: AuthContext,
+        claim: tinychain::Claim,
+    ) -> futures::future::BoxFuture<'static, TCResult<AuthContext>> {
         self.inner.grant(token, claim)
     }
 }
@@ -190,9 +143,7 @@ pub(crate) fn load_trusted_installers(config: &Config) -> TCResult<Vec<TrustedIn
         config.trusted_installers_json_path.as_ref(),
     ) {
         (Some(json), None) => Some(json.clone()),
-        (None, Some(path)) => Some(fs::read_to_string(path).map_err(|err| {
-            TCError::bad_request(format!("failed to read trusted installers file: {err}"))
-        })?),
+        (None, Some(path)) => Some(read_trusted_installers(path)?),
         (None, None) => None,
         (Some(_), Some(_)) => {
             return Err(TCError::bad_request(
@@ -217,9 +168,28 @@ pub(crate) fn load_trusted_installers(config: &Config) -> TCResult<Vec<TrustedIn
     })
 }
 
+fn read_trusted_installers(path: &std::path::Path) -> TCResult<String> {
+    // DIRECT_FS_BOOTSTRAP: this bounded, one-shot configuration read happens
+    // before HostStorage publishes any freqfs cache and is outside its roots.
+    let file = std::fs::File::open(path).map_err(|err| {
+        TCError::bad_request(format!("failed to open trusted installers file: {err}"))
+    })?;
+    let mut raw = String::new();
+    file.take(MAX_TRUSTED_INSTALLERS_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|err| {
+            TCError::bad_request(format!("failed to read trusted installers file: {err}"))
+        })?;
+    if raw.len() as u64 > MAX_TRUSTED_INSTALLERS_BYTES {
+        return Err(TCError::bad_request(
+            "trusted installers file exceeds its 1 MiB limit",
+        ));
+    }
+    Ok(raw)
+}
+
 pub(crate) fn bootstrap_trusted_installers(
-    mut keyring: KeyringActorResolver,
-    public_keys: &PublicKeyStore,
+    keyring: KeyringActorResolver,
     installers: &[TrustedInstaller],
 ) -> TCResult<KeyringActorResolver> {
     for installer in installers {
@@ -240,26 +210,24 @@ pub(crate) fn bootstrap_trusted_installers(
                 TCError::bad_request(format!("invalid installer public_key_b64: {err}"))
             })?;
 
-        let verifying_key = tinychain::auth::verifying_key_from_bytes(key_bytes.as_slice())
-            .map_err(|err| {
-                TCError::bad_request(format!("invalid installer public key bytes: {err}"))
-            })?;
+        let verifying_key =
+            tinychain::auth::verifying_key_from_bytes(installer.algorithm, key_bytes.as_slice())
+                .map_err(|err| {
+                    TCError::bad_request(format!("invalid installer public key bytes: {err}"))
+                })?;
 
         let actor =
             tinychain::auth::Actor::with_verifying_key(actor_id.to_string(), verifying_key.clone());
 
-        keyring = keyring.with_actor(host, actor);
-        public_keys.insert(actor_id.to_string(), verifying_key);
+        keyring.insert(host, actor)?;
     }
 
     Ok(keyring)
 }
 
 fn path_matches_prefix(path: &str, prefix: &str) -> bool {
-    if path == prefix {
-        return true;
-    }
-
-    path.strip_prefix(prefix)
-        .is_some_and(|rest| rest.starts_with('/'))
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
 }

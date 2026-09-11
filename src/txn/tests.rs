@@ -51,22 +51,19 @@ async fn cluster_claims_are_request_local_and_deterministic() {
     let txn = kernel.test_txn().await;
     assert!(txn.raw_token().is_none(), "allocation must be ownerless");
     kernel
-        .runtime
-        .applications
+        .inner
         .libraries
         .claim(&txn)
         .await
         .expect("first claim");
     kernel
-        .runtime
-        .applications
+        .inner
         .classes
         .claim(&txn)
         .await
         .expect("second claim");
     kernel
-        .runtime
-        .applications
+        .inner
         .libraries
         .claim(&txn)
         .await
@@ -84,19 +81,12 @@ async fn cluster_claims_are_request_local_and_deterministic() {
         resources,
         std::collections::BTreeSet::from([first.to_string(), second.to_string()])
     );
-    assert!(
-        txn.protocol_claims
-            .lock()
-            .resources
-            .values()
-            .all(|(_, mutated)| !mutated)
-    );
+    assert!(!txn.protocol_claims.lock().mutated);
     let ids = workspace.transaction_ids().await.expect("transaction IDs");
-    assert_eq!(ids, [txn.id()]);
-    workspace
-        .remove_transaction(txn.id())
-        .await
-        .expect("cleanup");
+    assert!(
+        ids.is_empty(),
+        "application claims must not create workspaces"
+    );
     std::fs::remove_dir_all(root).expect("remove workspace root");
 }
 #[tokio::test]
@@ -140,17 +130,18 @@ async fn workspace_cleanup_removes_every_transaction_child_together() {
     );
 }
 use crate::auth::{RjwtTokenVerifier, Token, TokenVerifier};
-use tc_ir::{Claim, NetworkTime, TxnId};
+use tc_ir::{NetworkTime, TxnId};
+
+use crate::Claim;
 use umask::Mode;
 #[tokio::test]
 async fn mints_host_signed_bearer_token_for_unauthenticated_txn() {
     let kernel = test_kernel("test-host").await;
-    let server = kernel.txn_server();
+    let server = &kernel.txn_server;
     let handle = kernel.test_txn().await;
     assert!(handle.raw_token().is_none(), "allocation must be ownerless");
     kernel
-        .runtime
-        .applications
+        .inner
         .libraries
         .claim(&handle)
         .await
@@ -162,10 +153,13 @@ async fn mints_host_signed_bearer_token_for_unauthenticated_txn() {
         pathlink::Link::from_str(&crate::uri::transaction_path(handle.id())).expect("txn link");
     assert!(handle.has_claim(&txn_link, umask::USER_EXEC));
     assert!(!handle.has_claim(&txn_link, umask::USER_WRITE));
-    let keyring = crate::auth::KeyringActorResolver::default().with_actor(
-        server.protocol_host().clone(),
-        server.protocol_actor().as_ref().clone(),
-    );
+    let keyring = crate::auth::KeyringActorResolver::default();
+    keyring
+        .insert(
+            server.protocol_authority().host.clone(),
+            server.protocol_authority().actor.as_ref().clone(),
+        )
+        .expect("unique protocol actor");
     let verifier = RjwtTokenVerifier::new(std::sync::Arc::new(keyring));
     let ctx = verifier
         .verify(bearer.to_string())
@@ -179,8 +173,8 @@ async fn mints_host_signed_bearer_token_for_unauthenticated_txn() {
     assert_eq!(
         snapshot.owner,
         Some((
-            server.protocol_host().to_string(),
-            server.protocol_actor().id().to_string(),
+            server.protocol_authority().host.to_string(),
+            server.protocol_authority().actor.id().to_string(),
         ))
     );
 }
@@ -225,7 +219,7 @@ async fn preserves_an_append_only_claim_chain() {
         )
         .expect("consume token");
     let updated = handle.with_signed_token(signed).expect("token accepted");
-    assert_eq!(updated.claim(), &txn_claim);
+    assert!(updated.has_claim(&txn_claim.link, txn_claim.mask));
 
     let other_claim = Claim::new(
         pathlink::Link::from_str("/lib/other").expect("other link"),
@@ -293,16 +287,16 @@ async fn rejects_signed_token_for_different_transaction_id() {
 #[tokio::test]
 async fn unknown_txn_continuation_requires_authenticated_owner() {
     let kernel = test_kernel("test-host").await;
-    let server = kernel.txn_server();
+    let server = &kernel.txn_server;
     let unknown = current_txn_id(7).with_trace([1; 32]);
     let rejected = server
-        .bind(Some(unknown), None, Arc::clone(&kernel.runtime))
+        .bind(Some(unknown), None, Arc::clone(&kernel.inner))
         .await;
     assert!(rejected.is_err());
 
     let token = txn_token(unknown, "host-a", "owner-a", "/lib/test/a/1.0.0");
     let handle = server
-        .bind(Some(unknown), Some(&token), Arc::clone(&kernel.runtime))
+        .bind(Some(unknown), Some(&token), Arc::clone(&kernel.inner))
         .await
         .unwrap_or_else(|err| panic!("authenticated continuation rejected: {err:?}"));
     assert_eq!(
@@ -315,7 +309,7 @@ async fn unknown_txn_continuation_requires_authenticated_owner() {
 #[tokio::test]
 async fn inbound_transaction_id_is_not_retraced() {
     let kernel = test_kernel("test-host").await;
-    let server = kernel.txn_server();
+    let server = &kernel.txn_server;
     let inbound = current_txn_id(3);
     assert!(
         inbound.trace_bytes().iter().all(|byte| *byte == 0),
@@ -324,7 +318,7 @@ async fn inbound_transaction_id_is_not_retraced() {
 
     let token = txn_token(inbound, "host-a", "owner-a", "/lib/test/a/1.0.0");
     let handle = server
-        .bind(Some(inbound), Some(&token), Arc::clone(&kernel.runtime))
+        .bind(Some(inbound), Some(&token), Arc::clone(&kernel.inner))
         .await
         .unwrap_or_else(|err| panic!("authenticated continuation rejected: {err:?}"));
 
@@ -344,14 +338,14 @@ async fn attaches_structured_auth_context_to_txn_handle() {
         pathlink::Link::from_str("/lib/example-devco/a/0.1.0").expect("claim link"),
         Mode::all(),
     );
-    let mut token = crate::auth::TokenContext::new("http://127.0.0.1:8702::example-admin", "token");
+    let mut token = crate::auth::AuthContext::new("http://127.0.0.1:8702::example-admin");
     token = token.with_claim(
         "http://127.0.0.1:8702".to_string(),
         "example-admin".to_string(),
         claim,
     );
 
-    let handle = handle.with_auth_context(AuthContext::from_token_context(&token));
+    let handle = handle.with_auth_context(token);
     let auth = handle.auth_context().expect("auth context");
     assert_eq!(auth.principal, "http://127.0.0.1:8702::example-admin");
     assert_eq!(auth.claims.len(), 1);
@@ -361,7 +355,7 @@ async fn attaches_structured_auth_context_to_txn_handle() {
     );
 }
 
-fn txn_token(txn_id: TxnId, host: &str, actor: &str, component: &str) -> crate::auth::TokenContext {
+fn txn_token(txn_id: TxnId, host: &str, actor: &str, component: &str) -> crate::auth::AuthContext {
     let signer = Actor::new_falcon512(actor.to_string()).expect("test transaction actor");
     let host_link: pathlink::Link = format!("http://{host}")
         .parse()
@@ -385,7 +379,7 @@ fn txn_token(txn_id: TxnId, host: &str, actor: &str, component: &str) -> crate::
             claims,
         ))
         .expect("signed transaction token");
-    let mut context = crate::auth::TokenContext::new(format!("{host}::{actor}"), signed.jwt());
+    let mut context = crate::auth::AuthContext::new(format!("{host}::{actor}"));
     context.signed = Some(Arc::new(signed));
     context
         .with_claim(

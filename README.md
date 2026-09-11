@@ -17,9 +17,13 @@ KernelRequestGuard
   -> Transact
 ```
 
-Directories own recursive membership. Concrete applications own validation,
-staging, committed persistence, routing, replication, and lifecycle. HTTP and
+Directories own recursive membership and delegated `txfs` storage. Concrete
+applications own validation, file handles, routing, replication, and lifecycle. HTTP and
 other adapters only project this native path.
+
+“Application” is descriptive vocabulary, not a server abstraction. The runtime
+owns the Library, Class, and Service roots directly; there is no aggregate app
+owner or generic application payload.
 
 ## Applications
 
@@ -31,8 +35,9 @@ other adapters only project this native path.
   different content at the same identity conflicts.
 - Service persistence and discovery are supported. Service execution is not.
 
-The committed identity maps directly beneath `data_dir`; staging is delegated
-beneath `workspace`. The superproject
+The identity maps directly beneath `data_dir`; transactional versions are owned
+by the recursive `txfs` directory. The workspace contains host-control and
+collection transaction state, not a second application representation. The superproject
 [storage contract](https://github.com/TinyChain-Inc/tcv2/blob/main/docs/storage.md)
 is non-normative integration context.
 
@@ -56,8 +61,12 @@ cargo check --no-default-features
 cargo check --no-default-features --features http-client
 cargo check --no-default-features --features http-server
 cargo check --no-default-features --features wasm
-cargo check --no-default-features --features mdns
+cargo test --no-default-features --features http-client,http-server,mdns --bin tc-server
 ```
+
+The HTTP features are included in the mDNS command because the `tc-server`
+binary requires them; testing `mdns` alone would compile only the library and
+would not exercise discovery or advertisement.
 
 Build and test the `tinychain_local` PyO3 extension from `client/rust`; there is
 no PyO3 feature or module in this crate.

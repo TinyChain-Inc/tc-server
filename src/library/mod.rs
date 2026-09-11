@@ -2,4 +2,6 @@ pub(crate) mod compiler;
 mod value;
 
 pub use value::Library;
-pub(crate) use value::{LibraryDraft, MAX_LIBRARY_BYTES};
+#[cfg(feature = "http-client")]
+pub(crate) use value::MAX_LIBRARY_BYTES;
+pub(crate) use value::Root;

@@ -1,5 +1,6 @@
 mod config;
 mod handle;
+mod scope;
 pub(crate) mod server;
 mod token;
 pub(crate) mod wire;
@@ -50,60 +51,40 @@ pub(crate) async fn test_kernel_with_limits(
 ) -> crate::Kernel {
     let (authority, _) = workspace
         .load_or_create_protocol_authority(
-            host_id,
+            &host_id.parse().expect("test host ID"),
             crate::uri::HOST_ROOT.parse().expect("host root"),
         )
         .await
         .expect("test protocol authority");
-    let applications = test_applications_with(host_id, authority.clone()).await;
+    let storage = crate::HostStorage::new(&crate::HostLimits::default().storage);
+    let application_roots = storage
+        .application_roots(test_path(&format!("apps-{host_id}")))
+        .await
+        .expect("test application roots");
     let config = TxnConfig::new(authority.clone(), workspace.clone(), resources.clone(), ttl);
     let verifier = server::test_verifier(&config);
+    let actors = crate::auth::KeyringActorResolver::default();
+    let bootstrap = std::sync::Arc::new(
+        crate::replication::ReplicationIssuer::local(&authority, actors.clone())
+            .expect("test replication issuer"),
+    );
     crate::Kernel::new(
         crate::HostServices {
-            applications,
+            application_roots,
+            replication: std::sync::Arc::new(crate::replication::LocalClusterGateway),
             rpc: std::sync::Arc::new(crate::gateway::LocalRpcGateway),
             resources,
             protocol: authority,
             verifier,
-            public_keys: crate::auth::PublicKeyStore::default(),
+            actors,
+            bootstrap,
+            bootstrap_required: false,
         },
         workspace,
         ttl,
     )
     .await
     .expect("construct test kernel")
-}
-
-#[cfg(all(test, not(feature = "wasm")))]
-pub(crate) async fn test_applications(name: &str) -> std::sync::Arc<crate::ApplicationOwners> {
-    let workspace = test_workspace(&format!("apps-{name}"));
-    let (authority, _) = workspace
-        .load_or_create_protocol_authority(name, crate::uri::HOST_ROOT.parse().expect("host root"))
-        .await
-        .expect("test protocol authority");
-    test_applications_with(name, authority).await
-}
-
-#[cfg(test)]
-pub(crate) async fn test_applications_with(
-    name: &str,
-    authority: crate::ProtocolAuthority,
-) -> std::sync::Arc<crate::ApplicationOwners> {
-    let root = test_path(&format!("apps-{name}"));
-    let storage = crate::HostStorage::new(&crate::HostLimits::default().storage);
-    let roots = storage
-        .application_roots(root)
-        .await
-        .expect("test application roots");
-    std::sync::Arc::new(
-        crate::ApplicationOwners::new(
-            roots,
-            authority,
-            std::sync::Arc::new(crate::replication::LocalClusterGateway),
-        )
-        .await
-        .expect("test applications"),
-    )
 }
 
 #[cfg(test)]
@@ -124,8 +105,10 @@ pub(crate) fn test_workspace(name: &str) -> crate::Workspace {
         .expect("test workspace")
 }
 
+pub use crate::auth::AuthContext;
+pub use config::ProtocolAuthority;
 pub(crate) use config::TxnConfig;
-pub use config::{ProtocolAuthority, TxnError};
-pub use handle::{AuthContext, TxnHandle};
+pub use handle::TxnHandle;
+pub(crate) use scope::{DependencyScope, Requirements};
 pub(crate) use server::{TransactionOutcome, TxnServer};
 pub(crate) use token::{protocol_snapshot, validate_signed_token};

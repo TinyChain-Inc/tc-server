@@ -13,7 +13,7 @@ pub(super) struct WasmEntry {
     pub(super) routes: Vec<RouteBinding>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RouteBinding {
     pub(crate) path: Vec<PathSegment>,
     pub(crate) export: String,
@@ -90,7 +90,8 @@ impl de::FromStream for WasmEntry {
                 while let Some(key) = map.next_key::<String>(()).await? {
                     match key.as_str() {
                         "definition" => {
-                            let EmbeddedDefinition(identity, value) = map.next_value(()).await?;
+                            let crate::literal::Definition(identity, value) =
+                                map.next_value(()).await?;
                             definition = Some((identity, value));
                         }
                         "routes" => routes = Some(map.next_value(()).await?),
@@ -107,41 +108,6 @@ impl de::FromStream for WasmEntry {
             }
         }
         decoder.decode_map(EntryVisitor).await
-    }
-}
-
-struct EmbeddedDefinition(Link, Scalar);
-
-impl de::FromStream for EmbeddedDefinition {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(_context: (), decoder: &mut D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl de::Visitor for Visitor {
-            type Value = EmbeddedDefinition;
-            fn expecting() -> &'static str {
-                "one Library URI mapped to its definition"
-            }
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let identity = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("empty Library definition"))?
-                    .parse()
-                    .map_err(de::Error::custom)?;
-                let definition = map.next_value(()).await?;
-                if map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                    return Err(de::Error::custom(
-                        "a Library definition must contain exactly one URI",
-                    ));
-                }
-                Ok(EmbeddedDefinition(identity, definition))
-            }
-        }
-        decoder.decode_map(Visitor).await
     }
 }
 

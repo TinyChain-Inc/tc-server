@@ -8,15 +8,14 @@ use std::{
 };
 
 use parking_lot::Mutex;
-#[cfg(test)]
-use pathlink::Link;
 use sha2::{Digest, Sha256};
 use tc_error::{TCError, TCResult};
-use tc_ir::{Claim, NetworkTime, TxnId};
+use tc_ir::{NetworkTime, TxnId};
+
 use tokio::time::Instant;
 
-use super::{AuthContext, TxnConfig, TxnError, TxnHandle, validate_signed_token};
-use crate::auth::{TokenContext, TokenVerifier};
+use super::{TxnConfig, TxnHandle, validate_signed_token};
+use crate::auth::{AuthContext, TokenVerifier};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransactionOutcome {
@@ -40,7 +39,6 @@ struct TxnState {
     allocation: tokio::sync::Mutex<()>,
     inner: Mutex<Inner>,
     notify: tokio::sync::Notify,
-    worker_started: AtomicBool,
     ready: AtomicBool,
     verifier: Arc<dyn TokenVerifier>,
 }
@@ -70,20 +68,19 @@ impl TxnServer {
         self.state.config.ttl
     }
 
-    pub(crate) fn protocol_authority(&self) -> crate::ProtocolAuthority {
-        crate::ProtocolAuthority {
-            host_id: Arc::clone(&self.state.config.host_id),
-            host: self.state.config.protocol_host.clone(),
-            actor: Arc::clone(&self.state.config.protocol_actor),
-        }
+    pub(crate) fn protocol_authority(&self) -> &crate::ProtocolAuthority {
+        &self.state.config.protocol
     }
 
     pub(crate) fn verifier(&self) -> &Arc<dyn TokenVerifier> {
         &self.state.verifier
     }
 
-    pub(crate) fn new(config: TxnConfig, verifier: Arc<dyn TokenVerifier>) -> Self {
-        Self {
+    pub(crate) async fn load(
+        config: TxnConfig,
+        verifier: Arc<dyn TokenVerifier>,
+    ) -> TCResult<Self> {
+        let server = Self {
             state: Arc::new(TxnState {
                 config,
                 allocation: tokio::sync::Mutex::new(()),
@@ -93,18 +90,19 @@ impl TxnServer {
                     last_allocated: None,
                 }),
                 notify: tokio::sync::Notify::new(),
-                worker_started: AtomicBool::new(false),
                 ready: AtomicBool::new(false),
                 verifier,
             }),
-        }
+        };
+        server.restore_frontier().await?;
+        Ok(server)
     }
 
     pub(crate) async fn bind(
         &self,
         txn_id: Option<TxnId>,
-        token: Option<&TokenContext>,
-        runtime: Arc<crate::kernel::HostRuntime>,
+        token: Option<&AuthContext>,
+        kernel: Arc<crate::kernel::KernelInner>,
     ) -> TCResult<TxnHandle> {
         if !self.is_ready() {
             return Err(TCError::new(
@@ -113,57 +111,76 @@ impl TxnServer {
             ));
         }
         match txn_id {
-            None => self.begin(token, runtime).await,
+            None => {
+                let txn_id = self.allocate().await?;
+                self.handle(txn_id, true, token, kernel)
+            }
             Some(txn_id) => {
                 self.reject_finalized(txn_id)?;
                 self.reject_expired(txn_id)?;
-                let token = token.ok_or(TxnError::Unauthorized)?;
-                let signed = token.signed.as_deref().ok_or(TxnError::Unauthorized)?;
-                validate_signed_token(txn_id, signed).map_err(|_| TxnError::Unauthorized)?;
+                let token =
+                    token.ok_or_else(|| TCError::unauthorized("missing transaction authority"))?;
+                let signed = token
+                    .signed
+                    .as_deref()
+                    .ok_or_else(|| TCError::unauthorized("missing signed transaction authority"))?;
+                validate_signed_token(txn_id, signed)
+                    .map_err(|_| TCError::unauthorized("invalid transaction authority"))?;
                 self.observe(txn_id);
-                self.handle(txn_id, false, Some(token), runtime)
+                self.handle(txn_id, false, Some(token), kernel)
             }
         }
     }
 
-    async fn begin(
+    pub(crate) fn bind_seed(
         &self,
-        auth: Option<&TokenContext>,
-        runtime: Arc<crate::kernel::HostRuntime>,
+        txn_id: TxnId,
+        kernel: Arc<crate::kernel::KernelInner>,
     ) -> TCResult<TxnHandle> {
-        let txn_id = self.allocate_id().await?;
+        self.reject_finalized(txn_id)?;
+        self.reject_expired(txn_id)?;
         self.observe(txn_id);
-        self.handle(txn_id, true, auth, runtime)
+        self.handle(txn_id, false, None, kernel)
     }
 
     fn handle(
         &self,
         id: TxnId,
         autocommit: bool,
-        context: Option<&TokenContext>,
-        runtime: Arc<crate::kernel::HostRuntime>,
+        context: Option<&AuthContext>,
+        kernel: Arc<crate::kernel::KernelInner>,
     ) -> TCResult<TxnHandle> {
+        let snapshot = context
+            .and_then(|context| context.signed.as_deref())
+            .and_then(|token| super::protocol_snapshot(id, token).ok());
+        let coordinates = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.owner.as_ref())
+            .is_some_and(|(host, actor)| {
+                host.as_str() == self.state.config.protocol.host.to_string()
+                    && actor == self.state.config.protocol.actor.id().as_str()
+            });
         let mut protocol = crate::cluster::ClaimState {
             signed: None,
-            coordinator: None,
-            resources: BTreeMap::new(),
-            autocommit,
+            coordinator: coordinates
+                .then(|| snapshot.as_ref()?.leaders.keys().next().cloned())
+                .flatten(),
+            mutated: false,
+            autocommit: autocommit || coordinates,
         };
         if let Some(context) = context {
             protocol.signed = context.signed.clone();
         }
         Ok(TxnHandle {
             id,
-            claim: Claim::new(
-                crate::uri::transaction_path(id)
-                    .parse()
-                    .expect("transaction path"),
-                umask::Mode::new(),
-            ),
             server: self.clone(),
-            runtime,
+            kernel,
             scope: super::handle::ExecutionScope::Host,
-            auth_context: context.map(AuthContext::from_token_context),
+            auth_context: context.cloned().map(|mut context| {
+                // The evolving protocol chain has one owner after binding.
+                context.signed = None;
+                context
+            }),
             protocol_claims: Arc::new(parking_lot::Mutex::new(protocol)),
             workspace_path: Vec::new(),
             deadline: self.state.config.resources.deadline(),
@@ -185,7 +202,7 @@ impl TxnServer {
         self.state.notify.notify_one();
     }
 
-    async fn allocate_id(&self) -> TCResult<TxnId> {
+    pub(crate) async fn allocate(&self) -> TCResult<TxnId> {
         let _allocation = self.state.allocation.lock().await;
         let txn_id = {
             let inner = self.state.inner.lock();
@@ -211,7 +228,7 @@ impl TxnServer {
             };
             let timestamp = NetworkTime::from_nanos(timestamp);
             TxnId::from_parts(timestamp, nonce).with_trace(compute_trace(
-                &self.state.config.host_id,
+                self.state.config.protocol.actor.id(),
                 timestamp,
                 nonce,
             ))
@@ -220,35 +237,35 @@ impl TxnServer {
             .state
             .config
             .workspace
-            .update_host_frontier(None, Some(txn_id))
+            .write_last_allocated(txn_id)
             .await
         {
             self.state.ready.store(false, Ordering::Release);
-            if let Ok(Some(host)) = self.state.config.workspace.host_record().await {
+            if let Ok((latest_finalized, last_allocated)) =
+                self.state.config.workspace.frontiers().await
+            {
                 let mut inner = self.state.inner.lock();
-                inner.latest_finalized = host.latest_finalized;
-                inner.last_allocated = host.last_allocated;
+                inner.latest_finalized = latest_finalized;
+                inner.last_allocated = last_allocated;
                 self.state.ready.store(true, Ordering::Release);
             }
             return Err(error);
         }
         self.state.inner.lock().last_allocated = Some(txn_id);
+        self.observe(txn_id);
         Ok(txn_id)
     }
 
-    pub fn start_expiry(
+    pub(crate) fn start_expiry(
         &self,
         runtime: &tokio::runtime::Handle,
-        host: Arc<crate::kernel::HostRuntime>,
+        host: Arc<crate::kernel::KernelInner>,
     ) {
-        if self.state.worker_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
         let server = self.clone();
         runtime.spawn(async move { server.run_expiry(host).await });
     }
 
-    async fn run_expiry(self, host: Arc<crate::kernel::HostRuntime>) {
+    async fn run_expiry(self, host: Arc<crate::kernel::KernelInner>) {
         loop {
             match self.next_expiry() {
                 Some(deadline) => tokio::select! {
@@ -269,7 +286,7 @@ impl TxnServer {
             .map(|(_, active)| active.retry.unwrap_or(active.expires))
     }
 
-    async fn expire_due(&self, now: Instant, host: &crate::kernel::HostRuntime) {
+    async fn expire_due(&self, now: Instant, host: &crate::kernel::KernelInner) {
         let due = self
             .state
             .inner
@@ -288,7 +305,7 @@ impl TxnServer {
             .state
             .config
             .workspace
-            .update_host_frontier(Some(cutoff), None)
+            .write_latest_finalized(cutoff)
             .await
         {
             self.defer(cutoff, "persist finalized cutoff", error);
@@ -298,11 +315,12 @@ impl TxnServer {
             self.defer(cutoff, "clean transaction workspaces", error);
             return;
         }
-        let mut inner = self.state.inner.lock();
-        inner.latest_finalized = Some(cutoff);
-        inner.active.retain(|id, _| *id > cutoff);
-        self.state.ready.store(true, Ordering::Release);
-        drop(inner);
+        {
+            let mut inner = self.state.inner.lock();
+            inner.latest_finalized = Some(cutoff);
+            inner.active.retain(|id, _| *id > cutoff);
+            self.state.ready.store(true, Ordering::Release);
+        }
         self.state.notify.notify_one();
     }
 
@@ -315,21 +333,15 @@ impl TxnServer {
         self.state.notify.notify_one();
     }
 
-    pub(crate) async fn recover(&self) -> TCResult<()> {
-        let host = self
-            .state
-            .config
-            .workspace
-            .host_record()
-            .await?
-            .ok_or_else(|| TCError::internal("missing workspace protocol authority"))?;
+    async fn restore_frontier(&self) -> TCResult<()> {
+        let (latest_finalized, last_allocated) = self.state.config.workspace.frontiers().await?;
         let workspaces = self.state.config.workspace.transaction_ids().await?;
         {
             let mut inner = self.state.inner.lock();
-            inner.latest_finalized = host.latest_finalized;
-            inner.last_allocated = host.last_allocated;
+            inner.latest_finalized = latest_finalized;
+            inner.last_allocated = last_allocated;
             for txn_id in workspaces.iter().copied() {
-                if host.latest_finalized.is_none_or(|cutoff| txn_id > cutoff) {
+                if latest_finalized.is_none_or(|cutoff| txn_id > cutoff) {
                     inner.active.insert(
                         txn_id,
                         Active {
@@ -340,7 +352,7 @@ impl TxnServer {
                 }
             }
         }
-        if let Some(cutoff) = host.latest_finalized {
+        if let Some(cutoff) = latest_finalized {
             self.state.config.workspace.remove_through(cutoff).await?;
         }
         self.state.ready.store(true, Ordering::Release);
@@ -372,16 +384,6 @@ impl TxnServer {
         } else {
             Ok(())
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn protocol_host(&self) -> &Link {
-        &self.state.config.protocol_host
-    }
-
-    #[cfg(test)]
-    pub(crate) fn protocol_actor(&self) -> &Arc<crate::auth::Actor> {
-        &self.state.config.protocol_actor
     }
 
     #[cfg(test)]
@@ -426,11 +428,13 @@ fn compute_trace(host_id: &str, timestamp: NetworkTime, nonce: u16) -> [u8; 32] 
 #[cfg(test)]
 pub(super) fn test_verifier(config: &TxnConfig) -> Arc<dyn TokenVerifier> {
     let actor = rjwt::Actor::with_verifying_key(
-        config.protocol_actor.id().clone(),
-        config.protocol_actor.verifying_key(),
+        config.protocol.actor.id().clone(),
+        config.protocol.actor.verifying_key(),
     );
-    let keyring = crate::auth::KeyringActorResolver::default()
-        .with_actor(config.protocol_host.clone(), actor);
+    let keyring = crate::auth::KeyringActorResolver::default();
+    keyring
+        .insert(config.protocol.host.clone(), actor)
+        .expect("test protocol actor is unique");
     Arc::new(crate::auth::RjwtTokenVerifier::new(Arc::new(keyring)))
 }
 
@@ -446,7 +450,7 @@ mod tests {
             super::super::test_workspace("fixed-expiry"),
         )
         .await;
-        let server = kernel.txn_server();
+        let server = &kernel.txn_server;
         let txn = kernel.test_txn().await;
         let first = server.state.inner.lock().active[&txn.id()].expires;
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -459,15 +463,17 @@ mod tests {
         let kernel = super::super::test_kernel("concurrent-allocation").await;
         let (first, second) = tokio::join!(kernel.test_txn(), kernel.test_txn());
         let latest = std::cmp::max(first.id(), second.id());
-        let record = kernel
-            .txn_server()
-            .state
-            .config
-            .workspace
-            .host_record()
+        let server = &kernel.txn_server;
+        let config = server.state.config.clone();
+        let workspace = config.workspace.clone();
+        let (_, last_allocated) = workspace.frontiers().await.expect("durable host frontier");
+        assert_eq!(last_allocated, Some(latest));
+        assert!(workspace.transaction_ids().await.unwrap().is_empty());
+        let restarted = TxnServer::load(config.clone(), test_verifier(&config))
             .await
-            .expect("host record")
-            .expect("durable host frontier");
-        assert_eq!(record.last_allocated, Some(latest));
+            .unwrap();
+        let next = restarted.allocate().await.unwrap();
+        assert!(next > latest);
+        assert_eq!(workspace.frontiers().await.unwrap().1, Some(next));
     }
 }

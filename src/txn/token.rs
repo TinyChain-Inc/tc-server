@@ -1,12 +1,11 @@
 use std::str::FromStr;
 
 use pathlink::Link;
-use tc_ir::{Claim, TxnId};
+use tc_ir::TxnId;
 
 pub(crate) struct ProtocolSnapshot {
     pub owner: Option<(String, String)>,
     pub locked: bool,
-    pub claim: Option<Claim>,
     pub leaders: std::collections::BTreeMap<pathlink::PathBuf, (String, String)>,
 }
 
@@ -19,7 +18,6 @@ pub(crate) fn protocol_snapshot(
     let mut snapshot = ProtocolSnapshot {
         owner: None,
         locked: false,
-        claim: None,
         leaders: std::collections::BTreeMap::new(),
     };
     let mut owner_seen = false;
@@ -28,7 +26,6 @@ pub(crate) fn protocol_snapshot(
         let claims = crate::auth::claims_from_wire(claims.clone());
         for claim in claims.iter().filter(|claim| claim.link == txn_link) {
             if claim.link == txn_link {
-                snapshot.claim.get_or_insert_with(|| claim.clone());
                 let principal = (host.to_string(), actor.to_string());
                 if claim.mask.has(umask::USER_EXEC) {
                     if snapshot.owner.replace(principal.clone()).is_some() {
@@ -83,12 +80,10 @@ pub(crate) fn protocol_snapshot(
 pub(crate) fn validate_signed_token(
     txn_id: TxnId,
     token: &crate::auth::SignedToken,
-) -> tc_error::TCResult<Claim> {
+) -> tc_error::TCResult<()> {
     let snapshot = protocol_snapshot(txn_id, token)?;
     snapshot
         .owner
         .ok_or_else(|| tc_error::TCError::bad_request("transaction has no owner"))?;
-    snapshot
-        .claim
-        .ok_or_else(|| tc_error::TCError::bad_request("missing transaction claim"))
+    Ok(())
 }

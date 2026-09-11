@@ -129,18 +129,32 @@ impl<'a> Handler<'a, State> for RefHandler {
 
 pub(crate) struct LibraryAnalysis {
     pub(crate) members: Map<Scalar>,
-    pub(crate) requirements: crate::application::Requirements,
+    pub(crate) requirements: crate::txn::Requirements,
 }
 
 pub(crate) fn compile_ir_library(definition: Scalar) -> TCResult<LibraryAnalysis> {
     let Scalar::Map(members) = definition else {
         return Err(TCError::bad_request("a Library definition must be a map"));
     };
-    let requirements = crate::application::application_requirements(members.values());
+    let requirements = application_requirements(members.values());
     Ok(LibraryAnalysis {
         members,
         requirements,
     })
+}
+
+fn application_requirements<'a>(
+    values: impl IntoIterator<Item = &'a Scalar>,
+) -> crate::txn::Requirements {
+    let mut requirements = crate::txn::Requirements::new();
+    for value in values {
+        value.visit_referenced_methods(&mut |target, method| {
+            if let Ok(identity) = crate::uri::application_identity(target) {
+                requirements.entry(identity).or_default().insert(method);
+            }
+        });
+    }
+    requirements
 }
 
 pub(crate) fn member<'a>(members: &'a Map<Scalar>, path: &[PathSegment]) -> Option<&'a Scalar> {

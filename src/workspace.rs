@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use freqfs::DirLock;
 use get_size::GetSize;
@@ -6,64 +9,76 @@ use pathlink::Link;
 use tc_error::{TCError, TCResult};
 use tc_ir::TxnId;
 
-use crate::storage::{HostRecord, WorkspaceFile};
+use crate::storage::{AuthorityRecord, ControlFile};
 
-const TXN: &str = "txn";
-const HOST_RECORD: &str = "host";
+const AUTHORITY: &str = "authority";
+const LATEST_FINALIZED: &str = "latest_finalized";
+const LAST_ALLOCATED: &str = "last_allocated";
 
 /// This is created exactly once at bootstrap. Lower layers receive child
 /// directories and never reconstruct host or transaction paths themselves.
 #[derive(Clone)]
 pub struct Workspace {
-    root: DirLock<WorkspaceFile>,
-    temp_seed: Arc<String>,
-    host_updates: Arc<tokio::sync::Mutex<()>>,
+    control: DirLock<ControlFile>,
+    transactions: DirLock<tc_collection::PersistentFile>,
+    next_temp: Arc<AtomicU64>,
 }
 
 impl Workspace {
-    pub(crate) fn from_root(root: DirLock<WorkspaceFile>) -> Self {
+    pub(crate) fn from_roots(
+        control: DirLock<ControlFile>,
+        transactions: DirLock<tc_collection::PersistentFile>,
+    ) -> Self {
         Self {
-            root,
-            temp_seed: Arc::new(format!(
-                "{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            )),
-            host_updates: Arc::new(tokio::sync::Mutex::new(())),
+            control,
+            transactions,
+            next_temp: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub(crate) async fn host_record(&self) -> TCResult<Option<HostRecord>> {
+    async fn control_file(&self, name: &str) -> TCResult<Option<ControlFile>> {
         let file = {
-            let root = self.root.read().await;
-            root.get_file(HOST_RECORD).cloned()
+            let root = self.control.read().await;
+            root.get_file(name).cloned()
         };
         let Some(file) = file else {
             return Ok(None);
         };
-        let file = file.read_owned::<WorkspaceFile>().await.map_err(map_io)?;
-        let WorkspaceFile::Host(record) = &*file else {
-            return Err(TCError::internal("invalid host workspace record"));
-        };
-        Ok(Some(record.clone()))
+        let file = file.read_owned::<ControlFile>().await.map_err(map_io)?;
+        Ok(Some((*file).clone()))
     }
 
-    pub(crate) async fn write_host_record(&self, record: &HostRecord) -> TCResult<()> {
-        write_record(&self.root, HOST_RECORD, WorkspaceFile::Host(record.clone())).await
+    async fn authority(&self) -> TCResult<Option<AuthorityRecord>> {
+        self.control_file(AUTHORITY)
+            .await?
+            .map_or(Ok(None), |file| {
+                let ControlFile::Authority(record) = file else {
+                    return Err(TCError::internal("invalid protocol authority record"));
+                };
+                Ok(Some(record))
+            })
+    }
+
+    pub(crate) async fn frontiers(&self) -> TCResult<(Option<TxnId>, Option<TxnId>)> {
+        let read = |file| match file {
+            None => Ok(None),
+            Some(ControlFile::Frontier(txn_id)) => Ok(Some(txn_id)),
+            Some(_) => Err(TCError::internal("invalid transaction frontier record")),
+        };
+        Ok((
+            read(self.control_file(LATEST_FINALIZED).await?)?,
+            read(self.control_file(LAST_ALLOCATED).await?)?,
+        ))
     }
 
     pub async fn load_or_create_protocol_authority(
         &self,
-        host_id: &str,
+        actor_id: &tc_ir::Id,
         host: Link,
     ) -> TCResult<(crate::txn::ProtocolAuthority, rjwt::Actor<String>)> {
-        let expected_actor = format!("replication:{host_id}");
-        let record = match self.host_record().await? {
+        let record = match self.authority().await? {
             Some(record) => {
-                if record.actor_id != expected_actor || record.algorithm != "falcon512" {
+                if &record.actor_id != actor_id || record.algorithm != rjwt::AlgKind::Falcon512 {
                     return Err(TCError::internal(
                         "workspace protocol authority does not match this host",
                     ));
@@ -71,71 +86,63 @@ impl Workspace {
                 record
             }
             None => {
-                let actor = rjwt::Actor::new_falcon512(expected_actor.clone())
+                let actor = rjwt::Actor::new_falcon512(actor_id.to_string())
                     .map_err(|err| TCError::internal(err.to_string()))?;
-                let record = HostRecord {
-                    actor_id: expected_actor,
-                    algorithm: "falcon512".into(),
+                let record = AuthorityRecord {
+                    actor_id: actor_id.clone(),
+                    algorithm: rjwt::AlgKind::Falcon512,
                     signing_key: actor
                         .signing_key_bytes()
                         .map_err(|err| TCError::internal(err.to_string()))?,
-                    latest_finalized: None,
-                    last_allocated: None,
                 };
-                self.write_host_record(&record).await?;
+                write_record(
+                    &self.control,
+                    AUTHORITY,
+                    ControlFile::Authority(record.clone()),
+                )
+                .await?;
                 record
             }
         };
-        let signing_key =
-            rjwt::SigningKey::from_bytes(rjwt::AlgKind::Falcon512, &record.signing_key)
-                .map_err(|err| TCError::internal(err.to_string()))?;
-        let replication_actor = rjwt::Actor::with_signing_key(record.actor_id.clone(), signing_key);
-        let protocol_key =
-            rjwt::SigningKey::from_bytes(rjwt::AlgKind::Falcon512, &record.signing_key)
-                .map_err(|err| TCError::internal(err.to_string()))?;
-        let protocol_actor = rjwt::Actor::with_signing_key(record.actor_id, protocol_key);
+        let signing_key = rjwt::SigningKey::from_bytes(record.algorithm, &record.signing_key)
+            .map_err(|err| TCError::internal(err.to_string()))?;
+        let replication_actor =
+            rjwt::Actor::with_signing_key(record.actor_id.to_string(), signing_key);
+        let protocol_key = rjwt::SigningKey::from_bytes(record.algorithm, &record.signing_key)
+            .map_err(|err| TCError::internal(err.to_string()))?;
+        let protocol_actor =
+            rjwt::Actor::with_signing_key(record.actor_id.to_string(), protocol_key);
         Ok((
-            crate::txn::ProtocolAuthority::new(host_id, host, protocol_actor),
+            crate::txn::ProtocolAuthority::new(host, protocol_actor),
             replication_actor,
         ))
     }
 
-    pub(crate) async fn update_host_frontier(
-        &self,
-        latest_finalized: Option<TxnId>,
-        last_allocated: Option<TxnId>,
-    ) -> TCResult<()> {
-        let _update = self.host_updates.lock().await;
-        let mut record = self
-            .host_record()
-            .await?
-            .ok_or_else(|| TCError::internal("missing workspace protocol authority"))?;
-        if let Some(latest) = latest_finalized {
-            if record
-                .latest_finalized
-                .is_none_or(|current| latest > current)
-            {
-                record.latest_finalized = Some(latest);
-            }
-        }
-        if let Some(last) = last_allocated {
-            if record.last_allocated.is_none_or(|current| last > current) {
-                record.last_allocated = Some(last);
-            }
-        }
-        self.write_host_record(&record).await
+    pub(crate) async fn write_latest_finalized(&self, txn_id: TxnId) -> TCResult<()> {
+        write_record(
+            &self.control,
+            LATEST_FINALIZED,
+            ControlFile::Frontier(txn_id),
+        )
+        .await
     }
 
-    pub async fn transaction(&self, txn_id: TxnId) -> TCResult<DirLock<WorkspaceFile>> {
-        let txns = child(self.root.clone(), TXN).await?;
-        child(txns, txn_id.to_string()).await
+    pub(crate) async fn write_last_allocated(&self, txn_id: TxnId) -> TCResult<()> {
+        write_record(&self.control, LAST_ALLOCATED, ControlFile::Frontier(txn_id)).await
+    }
+
+    pub async fn transaction(
+        &self,
+        txn_id: TxnId,
+    ) -> TCResult<DirLock<tc_collection::PersistentFile>> {
+        child(self.transactions.clone(), txn_id.to_string()).await
     }
 
     pub async fn transaction_child(
         &self,
         txn_id: TxnId,
         path: &[String],
-    ) -> TCResult<DirLock<WorkspaceFile>> {
+    ) -> TCResult<DirLock<tc_collection::PersistentFile>> {
         let mut dir = self.transaction(txn_id).await?;
         for segment in path {
             dir = child(dir, segment.clone()).await?;
@@ -144,14 +151,8 @@ impl Workspace {
     }
 
     pub(crate) async fn transaction_ids(&self) -> TCResult<Vec<TxnId>> {
-        let Some(txns) = ({
-            let root = self.root.read().await;
-            root.get_dir(TXN).cloned()
-        }) else {
-            return Ok(Vec::new());
-        };
         let entries = {
-            let txns = txns.read().await;
+            let txns = self.transactions.read().await;
             txns.iter()
                 .map(|(name, entry)| match entry {
                     freqfs::DirEntry::Dir(_) => name.parse::<TxnId>().map_err(|error| {
@@ -169,33 +170,12 @@ impl Workspace {
     }
 
     pub fn unique_name(&self) -> String {
-        format!(
-            "{}-{}",
-            self.temp_seed,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn remove_transaction(&self, txn_id: TxnId) -> TCResult<()> {
-        let txns = child(self.root.clone(), TXN).await?;
-        let mut txns = txns.write().await;
-        txns.delete(&txn_id.to_string()).await;
-        txns.sync().await.map_err(map_io)
+        format!("tmp-{}", self.next_temp.fetch_add(1, Ordering::Relaxed))
     }
 
     pub(crate) async fn remove_through(&self, cutoff: TxnId) -> TCResult<()> {
-        let Some(txns) = ({
-            let root = self.root.read().await;
-            root.get_dir(TXN).cloned()
-        }) else {
-            return Ok(());
-        };
         let names = {
-            let txns = txns.read().await;
+            let txns = self.transactions.read().await;
             txns.iter()
                 .map(|(name, entry)| match entry {
                     freqfs::DirEntry::Dir(_) => name
@@ -212,7 +192,7 @@ impl Workspace {
                 })
                 .collect::<TCResult<Vec<_>>>()?
         };
-        let mut txns = txns.write().await;
+        let mut txns = self.transactions.write().await;
         for (_, name) in names.into_iter().filter(|(id, _)| *id <= cutoff) {
             txns.delete(&name).await;
         }
@@ -221,26 +201,22 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) async fn has_transaction(&self, txn_id: TxnId) -> TCResult<bool> {
-        let txns = child(self.root.clone(), TXN).await?;
-        let txns = txns.read().await;
+        let txns = self.transactions.read().await;
         Ok(txns.get_dir(&txn_id.to_string()).is_some())
     }
 }
 
-async fn write_record(
-    dir: &DirLock<WorkspaceFile>,
-    name: &str,
-    record: WorkspaceFile,
-) -> TCResult<()> {
+async fn write_record(dir: &DirLock<ControlFile>, name: &str, record: ControlFile) -> TCResult<()> {
     let size = record.get_size();
     let existing = {
         let dir = dir.read().await;
         dir.get_file(name).cloned()
     };
     if let Some(file) = existing {
-        let mut contents = file.write_owned::<WorkspaceFile>().await.map_err(map_io)?;
-        *contents = record;
-        drop(contents);
+        {
+            let mut contents = file.write_owned::<ControlFile>().await.map_err(map_io)?;
+            *contents = record;
+        }
     } else {
         let mut dir = dir.write().await;
         dir.create_file(name.to_string(), record, size)
@@ -251,9 +227,9 @@ async fn write_record(
 }
 
 async fn child(
-    dir: DirLock<WorkspaceFile>,
+    dir: DirLock<tc_collection::PersistentFile>,
     name: impl Into<String>,
-) -> TCResult<DirLock<WorkspaceFile>> {
+) -> TCResult<DirLock<tc_collection::PersistentFile>> {
     let mut dir = dir.write().await;
     let child = dir.get_or_create_dir(name.into()).map_err(map_io)?;
     dir.sync().await.map_err(map_io)?;

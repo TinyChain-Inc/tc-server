@@ -16,6 +16,24 @@ pub(crate) async fn native_state_response(
     txn: TxnHandle,
     request: Option<crate::KernelRequestGuard>,
 ) -> TCResult<Response> {
+    if request
+        .as_ref()
+        .is_some_and(|request| request.returns_wasm(&state))
+    {
+        let State::Scalar(Scalar::Value(tc_value::Value::Bytes(bytes))) = state else {
+            unreachable!("returns_wasm checked the State variant")
+        };
+        let stream = stream::once(async move { Ok(Bytes::from_owner(bytes)) });
+        let stream = Box::pin(CompletionStream::new(
+            Box::pin(stream),
+            request.expect("request"),
+        ));
+        return Ok(http::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/wasm")
+            .body(Body::wrap_stream(stream))
+            .expect("WASM response"));
+    }
     let view = state.into_view(txn.clone()).await?;
     let stream = json_stream(view);
     let stream: BoxStream<'static, Result<Bytes, io::Error>> = match request {

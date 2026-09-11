@@ -1,3 +1,4 @@
+use async_hash::{Digest as _, Sha256};
 use bytes::Bytes;
 use futures::stream;
 use pathlink::PathSegment;
@@ -8,26 +9,30 @@ use wasmtime::{Engine, Func, Instance, Memory, Module, Store};
 use super::manifest::{RouteBinding, decode_entry, format_path};
 
 /// Loads a TinyChain-compatible Library embedded in a WASM module.
+#[derive(Clone)]
 pub struct WasmLibrary {
+    identity: pathlink::Link,
+    definition: Scalar,
+    module_hash: [u8; 32],
+    bindings: std::sync::Arc<[RouteBinding]>,
+    instance: std::sync::Arc<tokio::sync::Mutex<WasmInstance>>,
+}
+
+struct WasmInstance {
     store: Store<()>,
     memory: Memory,
     alloc: Func,
     free: Func,
-    identity: pathlink::Link,
-    definition: Scalar,
     routes: Vec<(RouteBinding, Func)>,
 }
 
 pub(crate) struct WasmRoute {
-    library: std::sync::Arc<tokio::sync::Mutex<WasmLibrary>>,
+    library: WasmLibrary,
     path: Vec<PathSegment>,
 }
 
 impl WasmRoute {
-    pub(crate) fn new(
-        library: std::sync::Arc<tokio::sync::Mutex<WasmLibrary>>,
-        path: Vec<PathSegment>,
-    ) -> Self {
+    pub(crate) fn new(library: WasmLibrary, path: Vec<PathSegment>) -> Self {
         Self { library, path }
     }
 }
@@ -38,7 +43,7 @@ impl<'a> tc_ir::Handler<'a, crate::State> for WasmRoute {
         'txn: 'a,
     {
         Some(Box::new(move |txn, key| {
-            let library = std::sync::Arc::clone(&self.library);
+            let library = self.library;
             let path = self.path;
             Box::pin(async move {
                 invoke(
@@ -71,7 +76,7 @@ impl WasmLibrary {
             .ok_or_else(|| TCError::internal("WASM module must export free"))?;
 
         let (identity, definition, bindings) =
-            Self::load_entry(&mut store, &instance, &memory).await?;
+            WasmInstance::load_entry(&mut store, &instance, &memory).await?;
 
         let mut routes = Vec::with_capacity(bindings.len());
         for binding in bindings {
@@ -88,13 +93,17 @@ impl WasmLibrary {
         }
 
         Ok(Self {
-            store,
-            memory,
-            alloc,
-            free,
             identity,
             definition,
-            routes,
+            module_hash: Sha256::digest(bytes).into(),
+            bindings: routes.iter().map(|(binding, _)| binding.clone()).collect(),
+            instance: std::sync::Arc::new(tokio::sync::Mutex::new(WasmInstance {
+                store,
+                memory,
+                alloc,
+                free,
+                routes,
+            })),
         })
     }
 
@@ -106,15 +115,31 @@ impl WasmLibrary {
         &self.definition
     }
 
+    pub(crate) fn module_hash(&self) -> [u8; 32] {
+        self.module_hash
+    }
+
     pub fn routes(&self) -> impl Iterator<Item = &Vec<PathSegment>> {
-        self.routes.iter().map(|(binding, _)| &binding.path)
+        self.bindings.iter().map(|binding| &binding.path)
     }
 
     pub(crate) fn bindings(&self) -> impl ExactSizeIterator<Item = &RouteBinding> {
-        self.routes.iter().map(|(binding, _)| binding)
+        self.bindings.iter()
     }
 
-    pub fn call_route(
+    pub async fn call_route(
+        &self,
+        path: &[PathSegment],
+        txn_id: &[u8],
+        body: &[u8],
+    ) -> TCResult<Vec<u8>> {
+        let mut instance = self.instance.lock().await;
+        instance.call_route(path, txn_id, body)
+    }
+}
+
+impl WasmInstance {
+    fn call_route(
         &mut self,
         path: &[PathSegment],
         txn_id: &[u8],
@@ -211,7 +236,7 @@ impl WasmLibrary {
 
 /// Cross the WASM ABI once while keeping routing and transaction ownership native.
 pub(crate) async fn invoke(
-    wasm: std::sync::Arc<tokio::sync::Mutex<WasmLibrary>>,
+    wasm: WasmLibrary,
     path: &[PathSegment],
     txn: &crate::TxnHandle,
     method: crate::Method,
@@ -223,19 +248,13 @@ pub(crate) async fn invoke(
     let body = match body {
         Some(body) => {
             let view = body.into_view(txn.clone()).await?;
-            crate::application::encode_json(
-                view,
-                txn.resources().limits().ingress.request_body_bytes,
-            )
-            .await?
+            crate::literal::encode_json(view, txn.resources().limits().ingress.request_body_bytes)
+                .await?
         }
         None => Vec::new(),
     };
     let txn_id = txn.id().to_string();
-    let bytes = {
-        let mut wasm = wasm.lock().await;
-        wasm.call_route(path, txn_id.as_bytes(), &body)?
-    };
+    let bytes = wasm.call_route(path, txn_id.as_bytes(), &body).await?;
     let input = stream::iter([Ok::<_, std::io::Error>(Bytes::from(bytes))]);
     destream_json::try_decode(txn.clone(), input)
         .await
@@ -290,7 +309,7 @@ mod tests {
             wat_bytes(response),
         );
 
-        let mut library = WasmLibrary::from_bytes(&Engine::default(), wat.as_bytes())
+        let library = WasmLibrary::from_bytes(&Engine::default(), wat.as_bytes())
             .await
             .expect("load literal WASM Library");
         assert_eq!(
@@ -301,6 +320,7 @@ mod tests {
         let txn_id = txn.id().to_string();
         let output = library
             .call_route(&["answer".parse().unwrap()], txn_id.as_bytes(), &[])
+            .await
             .expect("execute bound export");
         assert_eq!(output, response);
     }

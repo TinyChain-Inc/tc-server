@@ -4,10 +4,10 @@ use crate::State;
 enum Target {
     Host,
     Application(pathlink::Link),
-    Remote(crate::gateway::RpcTarget),
+    Remote(pathlink::Link),
 }
 
-impl super::HostRuntime {
+impl super::KernelInner {
     async fn prepare(
         &self,
         method: Method,
@@ -17,13 +17,10 @@ impl super::HostRuntime {
         let scope = txn.application_scope().ok_or_else(|| {
             tc_error::TCError::unauthorized("application dependency call has no execution scope")
         })?;
-        let uri: http::Uri = target
-            .to_string()
-            .parse()
-            .map_err(|err| tc_error::TCError::bad_request(format!("invalid target URI: {err}")))?;
-        let path = crate::uri::normalize_path(uri.path());
+        let path_string = target.path().to_string();
+        let path = crate::uri::normalize_path(&path_string);
         if path == crate::uri::HOST_ROOT || path.starts_with(crate::uri::HOST_ROOT_PREFIX) {
-            if uri.authority().is_some() {
+            if target.host().is_some() {
                 return Err(tc_error::TCError::unauthorized(
                     "cross-host /host access is not allowed from application routes",
                 ));
@@ -31,24 +28,18 @@ impl super::HostRuntime {
             return Ok((Target::Host, txn.clone()));
         }
 
-        let identity = crate::application::application_identity(target)?;
-        let Some(expected_digest) = scope.authorize(&identity, method).copied() else {
+        let identity = crate::uri::application_identity(target)?;
+        if !scope.authorize(&identity, method) {
             return Err(tc_error::TCError::unauthorized(format!(
                 "unauthorized dependency {identity}"
             )));
-        };
-        if uri.authority().is_none() {
+        }
+        if target.host().is_none() {
             return Ok((Target::Application(target.clone()), txn.clone()));
         }
-        let claim = tc_ir::Claim::new(identity, umask::Mode::all());
+        let claim = crate::Claim::new(identity, umask::Mode::all());
         let txn = txn.grant_claim(claim).await?;
-        Ok((
-            Target::Remote(crate::gateway::RpcTarget::Application {
-                link: target.clone(),
-                expected_digest,
-            }),
-            txn,
-        ))
+        Ok((Target::Remote(target.clone()), txn))
     }
 
     async fn application(
@@ -58,8 +49,7 @@ impl super::HostRuntime {
         method: Method,
         body: State,
     ) -> tc_error::TCResult<State> {
-        self.applications
-            .dispatch(txn, target, None, method, Some(body))
+        self.dispatch(txn, target, method, Some(body))
             .await?
             .ok_or_else(|| {
                 tc_error::TCError::internal(
@@ -109,7 +99,7 @@ impl super::HostRuntime {
                     State::Tuple(vec![State::from_scalar(key), value]),
                 )
                 .await
-                .map(drop),
+                .map(|_| ()),
             Target::Remote(target) => {
                 let _permit = txn.resources().admit_outbound(txn.deadline()).await?;
                 self.rpc.put(target, txn, key, value).await
@@ -155,7 +145,7 @@ impl super::HostRuntime {
             Target::Application(application) => self
                 .application(&txn, &application, Method::Delete, State::from_scalar(key))
                 .await
-                .map(drop),
+                .map(|_| ()),
             Target::Remote(target) => {
                 let _permit = txn.resources().admit_outbound(txn.deadline()).await?;
                 self.rpc.delete(target, txn, key).await

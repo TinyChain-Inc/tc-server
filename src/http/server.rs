@@ -1,69 +1,30 @@
-use std::net::{SocketAddr, TcpListener};
-use std::sync::Arc;
+use std::net::TcpListener;
 use std::task::{Context, Poll};
 
 use futures::{TryStreamExt, future::BoxFuture};
 use tower::Service;
 
 use super::parse::{decode_native_body, parse_bearer_token};
-use super::response::{bad_request_response, method_not_allowed, not_found};
+use super::response::{method_not_allowed, not_found};
 use super::{Request, Response};
 use crate::{Kernel, Method};
 
-/// HTTP-only endpoint routing. Native kernel routes are deliberately absent
-/// from this type.
-#[derive(Clone)]
-pub struct HttpRouter {
-    peers: Arc<dyn super::HttpHandler>,
-}
-
-impl HttpRouter {
-    pub fn new(peers: impl super::HttpHandler) -> Self {
-        Self {
-            peers: Arc::new(peers),
-        }
-    }
-
-    fn handles(&self, path: &str) -> bool {
-        crate::replication::is_peer_membership_path(path)
-    }
-
-    async fn call(&self, request: Request) -> Response {
-        self.peers.call(request).await
-    }
-}
-
 pub struct HttpServer {
     pub(super) kernel: Kernel,
-    pub(super) router: HttpRouter,
 }
 
 impl HttpServer {
-    pub fn new(kernel: Kernel, router: HttpRouter) -> Self {
-        Self { kernel, router }
+    pub fn new(kernel: Kernel) -> Self {
+        Self { kernel }
     }
 
     fn into_service(self) -> MakeKernelService {
-        MakeKernelService::new(KernelService::new(self.kernel, self.router))
-    }
-
-    pub async fn serve(self, addr: SocketAddr) -> hyper::Result<()> {
-        hyper::Server::bind(&addr).serve(self.into_service()).await
+        MakeKernelService::new(KernelService::new(self.kernel))
     }
 
     pub async fn serve_listener(self, listener: TcpListener) -> hyper::Result<()> {
         hyper::Server::from_tcp(listener)?
             .serve(self.into_service())
-            .await
-    }
-
-    pub async fn serve_with_shutdown<F>(self, addr: SocketAddr, shutdown: F) -> hyper::Result<()>
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        hyper::Server::bind(&addr)
-            .serve(self.into_service())
-            .with_graceful_shutdown(shutdown)
             .await
     }
 
@@ -85,12 +46,11 @@ impl HttpServer {
 #[derive(Clone)]
 pub(crate) struct KernelService {
     kernel: Kernel,
-    router: HttpRouter,
 }
 
 impl KernelService {
-    pub(crate) fn new(kernel: Kernel, router: HttpRouter) -> Self {
-        Self { kernel, router }
+    pub(crate) fn new(kernel: Kernel) -> Self {
+        Self { kernel }
     }
 }
 
@@ -108,7 +68,6 @@ impl Service<Request> for KernelService {
         let method = req.method().clone();
         let path = uri.path().to_owned();
         let kernel = self.kernel.clone();
-        let router = self.router.clone();
         let resources = self.kernel.resources().clone();
 
         Box::pin(async move {
@@ -121,20 +80,19 @@ impl Service<Request> for KernelService {
             let mut req = req;
             req.extensions_mut().insert(resources.clone());
 
-            if path == "/healthz"
+            if path == crate::uri::HOST_HEALTH
                 || path == crate::uri::HOST_METRICS
                 || path == crate::uri::HOST_PUBLIC_KEY
-                || router.handles(&path)
             {
                 let _request = match resources.admit_request(deadline).await {
                     Ok(permit) => permit,
                     Err(err) => return Ok(super::response::tc_error_response(err)),
                 };
-                if path == "/healthz" {
+                if path == crate::uri::HOST_HEALTH {
                     if !kernel.is_ready() {
                         return Ok(super::response::tc_error_response(tc_error::TCError::new(
                             tc_error::ErrorKind::Unavailable,
-                            "transaction storage is not ready",
+                            "host is not ready",
                         )));
                     }
                     return Ok(match kernel.health(method) {
@@ -158,32 +116,16 @@ impl Service<Request> for KernelService {
                         Err(error) => super::response::tc_error_response(error),
                     });
                 }
-                return Ok(router.call(req).await);
             }
 
             let bearer = parse_bearer_token(&req);
-            let expected_digest = match req
-                .headers()
-                .get(crate::gateway::EXPECTED_DIGEST_HEADER)
-                .map(|value| {
-                    value
-                        .to_str()
-                        .ok()
-                        .and_then(|value| crate::application::parse_digest(value).ok())
-                }) {
-                Some(Some(digest)) => Some(digest),
-                Some(None) => {
-                    return Ok(bad_request_response("invalid application digest header"));
-                }
-                None => None,
-            };
             let body_is_none = hyper::body::HttpBody::size_hint(req.body()).exact() == Some(0);
             let raw_path = uri
                 .path_and_query()
                 .map(|path| path.as_str())
                 .unwrap_or(&path);
 
-            let mut guard = match deadline
+            let guard = match deadline
                 .wait(kernel.begin_request(method, raw_path, body_is_none, bearer, deadline))
                 .await
             {
@@ -194,11 +136,6 @@ impl Service<Request> for KernelService {
 
             {
                 let contract = guard.body_contract();
-                if let Some(expected) = expected_digest {
-                    if let Err(error) = guard.set_expected_digest(expected) {
-                        return Ok(super::response::tc_error_response(error));
-                    }
-                }
                 let txn = guard.txn().clone();
                 req.extensions_mut().insert(txn.clone());
                 if let crate::BodyContract::Application { max_bytes: limit } = contract {
@@ -227,22 +164,20 @@ impl Service<Request> for KernelService {
                                     crate::State::None,
                                     crate::State::from(tc_value::Value::Bytes(body.shared())),
                                 ])),
-                                "application/json" => {
-                                    crate::application::decode_definition(&body.shared(), limit)
-                                        .await
-                                        .map(|(identity, definition)| {
-                                            crate::State::Tuple(vec![
-                                                crate::State::from(tc_value::Value::Link(identity)),
-                                                crate::State::from_scalar(definition),
-                                            ])
-                                        })
-                                }
+                                "application/json" => crate::literal::decode(&body.shared(), limit)
+                                    .await
+                                    .map(|(identity, definition)| {
+                                        crate::State::Tuple(vec![
+                                            crate::State::from(tc_value::Value::Link(identity)),
+                                            crate::State::from_scalar(definition),
+                                        ])
+                                    }),
                                 _ => Err(tc_error::TCError::bad_request(
                                     "unsupported application content type",
                                 )),
                             };
                             match state {
-                                Ok(state) => guard.execute(Some(state)).await.map(drop),
+                                Ok(state) => guard.execute(Some(state)).await.map(|_| ()),
                                 Err(error) => Err(error),
                             }
                         }
@@ -286,10 +221,7 @@ impl Service<Request> for KernelService {
                             Err(err) => Ok(super::response::tc_error_response(err)),
                         }
                     }
-                    Ok((None, guard)) => {
-                        drop(guard);
-                        Ok(super::response::no_content())
-                    }
+                    Ok((None, _guard)) => Ok(super::response::no_content()),
                     Err(err) if err.code() == tc_error::ErrorKind::NotFound => Ok(not_found()),
                     Err(err) => Ok(super::response::tc_error_response(err)),
                 }

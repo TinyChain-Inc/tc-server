@@ -24,9 +24,9 @@ pub enum BodyContract {
 pub(crate) enum KernelTarget {
     Health,
     AuthContext,
+    Host,
     State(Box<[pathlink::PathSegment]>),
     Application(pathlink::Link),
-    External(pathlink::Link),
 }
 
 pub struct KernelRequestGuard {
@@ -34,11 +34,20 @@ pub struct KernelRequestGuard {
     pub(super) method: Method,
     pub(super) target: KernelTarget,
     pub(super) txn: crate::TxnHandle,
-    pub(super) expected_digest: Option<crate::application::Digest>,
     pub(super) _permit: crate::resources::CapacityPermit,
 }
 
 impl KernelRequestGuard {
+    #[cfg(feature = "http-server")]
+    pub(crate) fn returns_wasm(&self, state: &State) -> bool {
+        self.method == Method::Get
+            && matches!(&self.target, KernelTarget::Application(target) if target.path().first().is_some_and(|root| root.as_str() == "lib"))
+            && matches!(
+                state,
+                State::Scalar(tc_ir::Scalar::Value(tc_value::Value::Bytes(_)))
+            )
+    }
+
     pub fn txn(&self) -> &crate::TxnHandle {
         &self.txn
     }
@@ -65,9 +74,9 @@ impl KernelRequestGuard {
             }
             KernelTarget::Application(_)
             | KernelTarget::Health
+            | KernelTarget::Host
             | KernelTarget::AuthContext
-            | KernelTarget::State(_)
-            | KernelTarget::External(_) => BodyContract::Native,
+            | KernelTarget::State(_) => BodyContract::Native,
         }
     }
 
@@ -85,18 +94,20 @@ impl KernelRequestGuard {
     pub async fn execute(&self, body: Option<State>) -> tc_error::TCResult<Option<State>> {
         let state = self
             .kernel
-            .execute(
-                self.target.clone(),
-                self.txn.clone(),
-                self.method,
-                body,
-                self.expected_digest.clone(),
-            )
+            .execute(self.target.clone(), self.txn.clone(), self.method, body)
             .await?;
+        // Only this outer request boundary knows that nested graph execution has
+        // completed successfully. It reports success; the first claimed Cluster
+        // remains the sole owner of whether and how to commit its resources.
         if state.is_some() {
             if let Some(coordinator) = self.txn.coordinator() {
-                coordinator
-                    .coordinate(&self.txn, crate::txn::TransactionOutcome::Commit, true)
+                self.kernel
+                    .coordinate(
+                        &self.txn,
+                        &coordinator,
+                        crate::txn::TransactionOutcome::Commit,
+                        true,
+                    )
                     .await?;
             }
         }
@@ -154,25 +165,5 @@ impl KernelRequestGuard {
             bytes: bytes.into(),
             _permits: permits,
         })
-    }
-
-    #[cfg(feature = "http-server")]
-    pub(crate) fn set_expected_digest(
-        &mut self,
-        expected: crate::application::Digest,
-    ) -> tc_error::TCResult<()> {
-        let KernelTarget::Application(identity) = &self.target else {
-            return Err(tc_error::TCError::bad_request(
-                "expected a versioned application target",
-            ));
-        };
-        let identity = crate::application::application_identity(identity)?;
-        if !self.txn.has_protocol_claim(identity.path()) {
-            return Err(tc_error::TCError::unauthorized(
-                "expected digest requires authenticated resource-leader authority",
-            ));
-        }
-        self.expected_digest = Some(expected);
-        Ok(())
     }
 }
