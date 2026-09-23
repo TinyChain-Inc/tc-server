@@ -213,17 +213,15 @@ async fn write_record(dir: &DirLock<ControlFile>, name: &str, record: ControlFil
         dir.get_file(name).cloned()
     };
     if let Some(file) = existing {
-        {
-            let mut contents = file.write_owned::<ControlFile>().await.map_err(map_io)?;
-            *contents = record;
-        }
+        return file.replace_all(record, size).await.map_err(map_io);
     } else {
         let mut dir = dir.write().await;
         dir.create_file(name.to_string(), record, size)
             .await
             .map_err(map_io)?;
     }
-    dir.write().await.sync().await.map_err(map_io)
+
+    dir.sync_all().await.map_err(map_io)
 }
 
 async fn child(
