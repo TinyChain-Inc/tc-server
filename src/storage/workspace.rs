@@ -83,7 +83,12 @@ impl<'en> en::ToStream<'en> for AuthorityRecord {
         let mut map = encoder.encode_map(Some(3))?;
         map.encode_entry("actor_id", &self.actor_id)?;
         map.encode_entry("algorithm", self.algorithm.name())?;
-        map.encode_entry("signing_key", &self.signing_key)?;
+        // Preserve the numeric sequence representation without constructing one
+        // nested encoder stream per key byte on the native call stack.
+        map.encode_entry(
+            "signing_key",
+            en::SeqStream::from(futures::stream::iter(self.signing_key.iter().copied())),
+        )?;
         map.end()
     }
 }
