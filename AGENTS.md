@@ -116,8 +116,9 @@ provide additional, non-normative integration context.
 - Runtime Library, Class, and Service values depend on storage and execution
   context and are not wire codecs. The one-entry literal definition is the sole
   application wire representation.
-- Service execution and standalone named persistent collections are unsupported
-  until Service and Chain own them. Do not add a server registry or placeholder.
+- Executable Services follow [SERVICE_CONTRACT.md](SERVICE_CONTRACT.md).
+  Standalone named persistent collections remain unsupported; Service delegates
+  member persistence and recovery to Chain. Do not add a server registry.
 
 ## Transactions and replication
 

@@ -7,8 +7,10 @@ async fn stage_service(
     identity: pathlink::Link,
     definition: tc_ir::Scalar,
 ) -> KernelRequestGuard {
-    let (_, permit) = kernel
-        .admit_host_request()
+    let permit = kernel
+        .txn_server
+        .resources()
+        .admit_request(kernel.deadline())
         .await
         .expect("request admission");
     let guard = KernelRequestGuard::new(
@@ -54,6 +56,430 @@ async fn complete(kernel: &Kernel, txn: crate::TxnHandle, outcome: crate::txn::T
         .expect("complete transaction");
 }
 
+#[path = "service.rs"]
+mod service_fixture;
+
+use service_fixture::definition as executable_service;
+
+#[cfg(all(feature = "http-client", feature = "http-server"))]
+#[test]
+fn service_snapshot_is_transaction_bound_and_failed_sync_publishes_no_membership() {
+    crate::test_runtime::run(|| async {
+        use crate::cluster::AsyncHash;
+        use futures::FutureExt;
+
+        let source = setup_with_ttl("snapshot-source", std::time::Duration::from_secs(60)).await;
+        let target = setup_with_ttl("snapshot-target", std::time::Duration::from_secs(60)).await;
+        let identity: pathlink::Link = "/service/test/native/1.0.0".parse().unwrap();
+        for kernel in [&source, &target] {
+            let txn = bind(kernel).await.with_claims(vec![crate::Claim::new(
+                identity.clone(),
+                umask::Mode::all(),
+            )]);
+            stage_service(kernel, &txn, identity.clone(), executable_service(true))
+                .await
+                .finish_success()
+                .await
+                .unwrap();
+        }
+        let body = |n: tc_value::Value| {
+            crate::State::Tuple(vec![
+                tc_value::Value::Tuple(vec![n.clone()]).into(),
+                tc_value::Value::Tuple(vec![n]).into(),
+            ])
+        };
+        let write = bind(&source).await.with_claims(vec![crate::Claim::new(
+            identity.clone(),
+            umask::Mode::all(),
+        )]);
+        execute(
+            &source,
+            Method::Put,
+            &format!("{identity}/insert"),
+            Some(body(1_u64.into())),
+            write.clone(),
+        )
+        .await
+        .unwrap();
+        complete(&source, write, crate::txn::TransactionOutcome::Commit).await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let http = crate::http::HttpServer::new(source.clone());
+        let task = tokio::spawn(async move {
+            http.serve_listener_with_shutdown(listener, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        let replica = target
+            .inner
+            .bootstrap
+            .self_identity("http://127.0.0.1:12345".into())
+            .unwrap();
+
+        let (txn, session) = target
+            .bootstrap_resource(&endpoint, &identity, &replica)
+            .await
+            .unwrap();
+        let source_identity = source
+            .inner
+            .bootstrap
+            .self_identity(endpoint.clone())
+            .unwrap();
+        let mismatched = crate::cluster::BootstrapSession::new(
+            session.token().into(),
+            source_identity,
+            "00".repeat(32),
+        );
+        let error = target
+            .synchronize_service(&txn, &identity, &endpoint, &mismatched)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tc_error::ErrorKind::Conflict);
+        target.inner.services.rollback(&txn.id()).await.unwrap();
+
+        // Cancellation while the network snapshot is pending selects no decision.
+        let (txn, session) = target
+            .bootstrap_resource(&endpoint, &identity, &replica)
+            .await
+            .unwrap();
+        let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stalled_endpoint = format!("http://{}", stalled.local_addr().unwrap());
+        {
+            let pending = target.synchronize_service(&txn, &identity, &stalled_endpoint, &session);
+            futures::pin_mut!(pending);
+            assert!(pending.as_mut().now_or_never().is_none());
+        }
+        target.inner.services.rollback(&txn.id()).await.unwrap();
+        let read = bind(&target).await;
+        let local = target
+            .inner
+            .services
+            .state()
+            .items(read.id())
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let initial_hash = local.hash(&read).await.unwrap();
+
+        let (txn, session) = target
+            .bootstrap_resource(&endpoint, &identity, &replica)
+            .await
+            .unwrap();
+        let write = bind(&source).await.with_claims(vec![crate::Claim::new(
+            identity.clone(),
+            umask::Mode::all(),
+        )]);
+        // A later transaction may change the source, but the older snapshot and
+        // hash still describe the same source transaction.
+        execute(
+            &source,
+            Method::Put,
+            &format!("{identity}/insert"),
+            Some(body(2_u64.into())),
+            write.clone(),
+        )
+        .await
+        .unwrap();
+        complete(&source, write, crate::txn::TransactionOutcome::Commit).await;
+        target
+            .synchronize_service(&txn, &identity, &endpoint, &session)
+            .await
+            .unwrap();
+        assert_ne!(local.hash(&txn).await.unwrap(), initial_hash);
+        assert_eq!(
+            hex::encode(local.hash(&txn).await.unwrap()),
+            session.state_hash()
+        );
+        let value = execute(
+            &target,
+            Method::Get,
+            &format!("{identity}/count"),
+            None,
+            txn.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(value, crate::State::Scalar(Scalar::Value(tc_value::Value::Number(n))) if n.to_string() == "1")
+        );
+        target.inner.services.rollback(&txn.id()).await.unwrap();
+        let response = execute(
+            &target,
+            Method::Get,
+            &format!("{identity}/replicas"),
+            None,
+            bind(&target).await,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, crate::State::Tuple(replicas) if replicas.is_empty()));
+        let _ = shutdown.send(());
+        task.await.unwrap();
+    });
+}
+
+#[test]
+fn executable_services_keep_direct_and_composed_writes_in_the_chain() {
+    crate::test_runtime::run(|| async {
+        for table in [false, true] {
+            let path = crate::txn::test_path(if table {
+                "executable-table"
+            } else {
+                "executable-btree"
+            });
+            let kernel = open_at(path.clone(), std::time::Duration::from_secs(60), false)
+                .await
+                .unwrap();
+            let identity: pathlink::Link = "/service/test/native/1.0.0".parse().unwrap();
+            let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
+                identity.clone(),
+                umask::Mode::all(),
+            )]);
+            stage_service(&kernel, &txn, identity.clone(), executable_service(table))
+                .await
+                .finish_success()
+                .await
+                .unwrap();
+            let key = |n| {
+                if table {
+                    tc_value::Value::Tuple(vec![tc_value::Value::from(n)])
+                } else {
+                    tc_value::Value::None
+                }
+            };
+            let body = |n| {
+                crate::State::Tuple(vec![
+                    key(n).into(),
+                    tc_value::Value::Tuple(vec![tc_value::Value::from(n)]).into(),
+                ])
+            };
+            let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
+                identity.clone(),
+                umask::Mode::all(),
+            )]);
+            execute(
+                &kernel,
+                Method::Put,
+                &format!("{identity}/data/insert"),
+                Some(body(1_u64)),
+                txn.clone(),
+            )
+            .await
+            .unwrap();
+            let pending = execute(
+                &kernel,
+                Method::Get,
+                &format!("{identity}/count"),
+                None,
+                txn.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(pending, crate::State::Scalar(Scalar::Value(tc_value::Value::Number(n))) if n.to_string() == "1")
+            );
+            complete(&kernel, txn, crate::txn::TransactionOutcome::Commit).await;
+
+            for (method, suffix, value) in [
+                (Method::Put, "insert", body(2)),
+                (
+                    Method::Post,
+                    "append",
+                    crate::State::Map(
+                        [
+                            ("key".parse().unwrap(), key(3).into()),
+                            (
+                                "value".parse().unwrap(),
+                                tc_value::Value::Tuple(vec![3_u64.into()]).into(),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+            ] {
+                let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
+                    identity.clone(),
+                    umask::Mode::all(),
+                )]);
+                execute(
+                    &kernel,
+                    method,
+                    &format!("{identity}/{suffix}"),
+                    Some(value),
+                    txn.clone(),
+                )
+                .await
+                .unwrap();
+                complete(&kernel, txn, crate::txn::TransactionOutcome::Commit).await;
+            }
+            let bytes = std::fs::read(
+                path.join("data/service/test/native/1.0.0/.native/data/wal/committed.chain_block"),
+            )
+            .unwrap();
+            let wal: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+            let requests = wal[2][1].as_object().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(
+                requests
+                    .values()
+                    .all(|batch| batch.as_array().unwrap().len() == 1)
+            );
+            let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
+                identity.clone(),
+                umask::Mode::all(),
+            )]);
+            execute(
+                &kernel,
+                Method::Put,
+                &format!("{identity}/insert"),
+                Some(body(4)),
+                txn.clone(),
+            )
+            .await
+            .unwrap();
+            complete(
+                &kernel,
+                txn.clone(),
+                crate::txn::TransactionOutcome::Rollback,
+            )
+            .await;
+            kernel.test_services().finalize(&txn.id()).await.unwrap();
+            let read = bind(&kernel).await;
+            let count = execute(
+                &kernel,
+                Method::Get,
+                &format!("{identity}/count"),
+                None,
+                read.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(count, crate::State::Scalar(Scalar::Value(tc_value::Value::Number(n))) if n.to_string() == "3")
+            );
+            let label = execute(
+                &kernel,
+                Method::Get,
+                &format!("{identity}/label"),
+                None,
+                read,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(label, crate::State::Scalar(Scalar::Value(tc_value::Value::String(s))) if s == "native")
+            );
+        }
+    });
+}
+
+#[test]
+fn service_recovery_preserves_expired_original_ids_and_rejects_materialization_intent() {
+    use sha2::Digest;
+    let path = crate::txn::test_path("service-recovery");
+    let first = path.clone();
+    let id = crate::test_runtime::run(move || async move {
+        let kernel = open_at(first, std::time::Duration::from_secs(60), false)
+            .await
+            .unwrap();
+        let identity: pathlink::Link = "/service/test/native/1.0.0".parse().unwrap();
+        let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
+            identity.clone(),
+            umask::Mode::all(),
+        )]);
+        stage_service(&kernel, &txn, identity.clone(), executable_service(true))
+            .await
+            .finish_success()
+            .await
+            .unwrap();
+        let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
+            identity.clone(),
+            umask::Mode::all(),
+        )]);
+        execute(
+            &kernel,
+            Method::Put,
+            &format!("{identity}/insert"),
+            Some(crate::State::Tuple(vec![
+                tc_value::Value::Tuple(vec![1_u64.into()]).into(),
+                tc_value::Value::Tuple(vec![7_u64.into()]).into(),
+            ])),
+            txn.clone(),
+        )
+        .await
+        .unwrap();
+        complete(&kernel, txn.clone(), crate::txn::TransactionOutcome::Commit).await;
+        txn.id()
+    });
+    let wal_path =
+        path.join("data/service/test/native/1.0.0/.native/data/wal/committed.chain_block");
+    let committed = std::fs::read(&wal_path).unwrap();
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&committed[32..]).unwrap()[2][1]
+            .get(id.to_string())
+            .is_some()
+    );
+    std::fs::remove_dir_all(path.join("workspace/txn")).unwrap();
+    // The old runtime (including expiry) is gone. Reopening after TTL + clock
+    // skew exercises the private recovery capability, not request authentication.
+    std::thread::sleep(std::time::Duration::from_millis(4100));
+    let second = path.clone();
+    let expected = committed.clone();
+    crate::test_runtime::run(move || async move {
+        let kernel = open_at(second.clone(), std::time::Duration::from_millis(50), false)
+            .await
+            .unwrap();
+        // Before yielding to the newly started expiry task, recovery retains the WAL.
+        assert_eq!(
+            std::fs::read(
+                second
+                    .join("data/service/test/native/1.0.0/.native/data/wal/committed.chain_block")
+            )
+            .unwrap(),
+            expected
+        );
+        assert!(kernel.is_ready());
+        let txn = bind(&kernel).await;
+        let count = execute(
+            &kernel,
+            Method::Get,
+            "/service/test/native/1.0.0/count",
+            None,
+            txn,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(count, crate::State::Scalar(Scalar::Value(tc_value::Value::Number(n))) if n.to_string() == "1")
+        );
+    });
+
+    // An explicit recovery-state fixture: any surviving materialization intent
+    // rejects opening, even when the native subject itself is structurally valid.
+    let bytes = std::fs::read(&wal_path).unwrap();
+    let mut wal: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+    wal[1] = serde_json::Value::String(id.to_string());
+    let encoded = serde_json::to_vec(&wal).unwrap();
+    let mut marked = sha2::Sha256::digest(&encoded).to_vec();
+    marked.extend(encoded);
+    std::fs::write(&wal_path, &marked).unwrap();
+    let last = path.clone();
+    crate::test_runtime::run(move || async move {
+        let error = open_at(last, std::time::Duration::from_secs(60), false)
+            .await
+            .err()
+            .expect("must remain unavailable");
+        assert!(error.to_string().contains("recovery required"));
+    });
+    assert_eq!(std::fs::read(&wal_path).unwrap(), marked);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 #[tokio::test]
 async fn collection_type_routes_do_not_host_named_resources() {
     let kernel = kernel("collection-types-only").await;
@@ -81,15 +507,28 @@ async fn setup_with_bootstrap(
     ttl: std::time::Duration,
     bootstrap_required: bool,
 ) -> Kernel {
-    let workspace = crate::txn::test_workspace(name);
+    open_at(crate::txn::test_path(name), ttl, bootstrap_required)
+        .await
+        .expect("construct kernel")
+}
+
+async fn open_at(
+    path: std::path::PathBuf,
+    ttl: std::time::Duration,
+    bootstrap_required: bool,
+) -> tc_error::TCResult<Kernel> {
+    let storage = crate::HostStorage::new(&crate::HostLimits::default().storage);
+    let workspace = storage.workspace(path.join("workspace"))?;
     let host: pathlink::Link = crate::uri::HOST_ROOT.parse().expect("host link");
     let (protocol, actor) = workspace
-        .load_or_create_protocol_authority(&"test-host".parse().unwrap(), host.clone())
+        .load_or_create_protocol_authority(
+            &path.file_name().unwrap().to_str().unwrap().parse().unwrap(),
+            host.clone(),
+        )
         .await
         .expect("protocol authority");
-    let storage = crate::HostStorage::new(&crate::HostLimits::default().storage);
     let application_roots = storage
-        .application_roots(crate::txn::test_path(&format!("apps-{name}")))
+        .application_roots(path.join("data"))
         .await
         .expect("test application roots");
     let actors = crate::auth::KeyringActorResolver::default();
@@ -101,10 +540,14 @@ async fn setup_with_bootstrap(
         .expect("unique test actor");
     let verifier = crate::auth::RjwtTokenVerifier::new(std::sync::Arc::new(actors.clone()));
     let bootstrap = std::sync::Arc::new(
-        crate::replication::ReplicationIssuer::local(&protocol, actors.clone())
-            .expect("test replication issuer"),
+        crate::replication::ReplicationIssuer::new(
+            std::sync::Arc::new(protocol.clone()),
+            vec![[7; 32].into()],
+            actors.clone(),
+        )
+        .expect("test replication issuer"),
     );
-    let kernel = Kernel::new(
+    Kernel::new(
         crate::HostServices {
             application_roots,
             replication: std::sync::Arc::new(crate::replication::LocalClusterGateway),
@@ -120,8 +563,6 @@ async fn setup_with_bootstrap(
         ttl,
     )
     .await
-    .expect("construct kernel");
-    kernel
 }
 
 #[tokio::test]

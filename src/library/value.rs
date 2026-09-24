@@ -432,7 +432,7 @@ impl crate::cluster::DirItem for Library {
 }
 
 impl crate::cluster::AsyncHash for Library {
-    async fn hash(&self, _txn_id: TxnId) -> TCResult<[u8; 32]> {
+    async fn hash(&self, _txn: &crate::TxnHandle) -> TCResult<[u8; 32]> {
         Ok(self.runtime.hash())
     }
 }

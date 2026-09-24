@@ -1,6 +1,10 @@
-/// Native collection futures need the same bounded debug-test stack as the
-/// standalone Collection and Chain suites. No task outlives this test runtime.
-pub(crate) fn run<F: std::future::Future<Output = ()> + Send + 'static>(make: fn() -> F) {
+/// Drop every runtime task before a restart test reopens its storage owners.
+/// Native debug futures use the standalone Collection/Chain test stack bound.
+pub(crate) fn run<F, T>(make: impl FnOnce() -> F + Send + 'static) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
     use futures::FutureExt;
 
     std::thread::Builder::new()
@@ -17,11 +21,12 @@ pub(crate) fn run<F: std::future::Future<Output = ()> + Send + 'static>(make: fn
                 let result = std::panic::AssertUnwindSafe(make()).catch_unwind().await;
                 send.send(result).unwrap();
             });
-            if let Err(panic) = receive.recv().unwrap() {
-                std::panic::resume_unwind(panic);
+            match receive.recv().unwrap() {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
             }
         })
         .unwrap()
         .join()
-        .unwrap();
+        .unwrap()
 }

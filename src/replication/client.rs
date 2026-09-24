@@ -8,6 +8,7 @@ pub(crate) async fn bootstrap_seed(
     resource: &pathlink::Link,
     identity: &super::Replica,
     issuer: &super::ReplicationIssuer,
+    deadline: crate::Deadline,
 ) -> TCResult<crate::cluster::BootstrapSession> {
     let seed = super::normalize_peer(seed)?;
     let url = crate::http_client::peer_txn_url(&seed, crate::uri::HOST_ROOT, txn_id)?;
@@ -19,7 +20,6 @@ pub(crate) async fn bootstrap_seed(
     }
     let mut last_error = None;
     for (nonce, ciphertext) in requests {
-        let deadline = crate::Deadline::after(crate::outbound_http::DEFAULT_TIMEOUT);
         let encoded = crate::http_body::json_body(tc_ir::Scalar::Tuple(vec![
             tc_ir::Scalar::Value(tc_value::Value::Bytes(nonce.into())),
             tc_ir::Scalar::Value(tc_value::Value::Bytes(ciphertext.into())),
@@ -84,23 +84,12 @@ pub(crate) async fn bootstrap_seed(
 pub(crate) async fn read_seed_state(
     seed: &str,
     token: &str,
-    txn_id: TxnId,
+    txn: &crate::TxnHandle,
     target: &pathlink::Link,
-    deadline: crate::Deadline,
     response_bound: usize,
 ) -> TCResult<crate::State> {
-    let seed = super::normalize_peer(seed)?;
-    let url = crate::http_client::peer_txn_url(&seed, &target.to_string(), txn_id)?;
-    let response = crate::http_client::send_http(
-        &hyper::Client::new(),
-        hyper::Method::GET,
-        url,
-        Some(format!("Bearer {token}")),
-        None,
-        Body::empty(),
-        deadline,
-    )
-    .await?;
+    let deadline = txn.deadline();
+    let response = seed_response(seed, token, txn, target).await?;
     let content_type = response
         .headers()
         .get(http::header::CONTENT_TYPE)
@@ -111,7 +100,47 @@ pub(crate) async fn read_seed_state(
             .map(|bytes| crate::State::from(tc_value::Value::Bytes(bytes)));
     }
 
-    crate::outbound_http::decode::<tc_ir::Scalar>(response, (), deadline, response_bound)
+    // Definitions contain scalar declaration references, not allocated collections.
+    crate::outbound_http::decode(response, (), deadline, response_bound)
         .await
         .map(crate::State::from_scalar)
+}
+
+pub(crate) async fn read_seed_snapshot(
+    seed: &str,
+    token: &str,
+    txn: &crate::TxnHandle,
+    target: &pathlink::Link,
+    response_bound: usize,
+) -> TCResult<crate::State> {
+    use tc_collection::StorageContext;
+
+    let response = seed_response(seed, token, txn, target).await?;
+    crate::outbound_http::decode(
+        response,
+        txn.subcontext_unique(),
+        txn.deadline(),
+        response_bound,
+    )
+    .await
+}
+
+async fn seed_response(
+    seed: &str,
+    token: &str,
+    txn: &crate::TxnHandle,
+    target: &pathlink::Link,
+) -> TCResult<hyper::Response<Body>> {
+    let seed = super::normalize_peer(seed)?;
+    let url = crate::http_client::peer_txn_url(&seed, &target.to_string(), txn.id())?;
+    crate::http_client::send_http(
+        &hyper::Client::new(),
+        hyper::Method::GET,
+        url,
+        Some(format!("Bearer {token}")),
+        None,
+        Body::empty(),
+        txn.deadline(),
+    )
+    .await
 }

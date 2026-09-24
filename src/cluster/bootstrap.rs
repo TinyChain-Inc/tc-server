@@ -24,7 +24,7 @@ impl BootstrapSession {
         }
     }
 
-    fn token(&self) -> &str {
+    pub(crate) fn token(&self) -> &str {
         &self.token
     }
 
@@ -32,7 +32,7 @@ impl BootstrapSession {
         &self.replica
     }
 
-    fn state_hash(&self) -> &str {
+    pub(crate) fn state_hash(&self) -> &str {
         &self.state_hash
     }
 }
@@ -66,6 +66,9 @@ impl<T: DirItem> Cluster<Dir<T>> {
         identity: &crate::replication::Replica,
     ) -> TCResult<BTreeSet<String>> {
         let (txn, session) = kernel.bootstrap_resource(seed, resource, identity).await?;
+        // Native restoration has a large concrete future. Keep it out of the
+        // recursive bootstrap frame, including for Class/Library directories.
+        Box::pin(kernel.synchronize_service(&txn, resource, seed, &session)).await?;
         let replicas = pathlink::Link::from(
             resource.path().clone().append(
                 "replicas"
@@ -77,9 +80,7 @@ impl<T: DirItem> Cluster<Dir<T>> {
             crate::State::from(tc_value::Value::String(session.replica().endpoint.clone())),
             replica_put_state(session.replica(), session.state_hash().to_string()),
         ]);
-        let peers =
-            seed_replica_endpoints(seed, session.token(), txn.id(), &replicas, txn.deadline())
-                .await?;
+        let peers = seed_replica_endpoints(seed, session.token(), &txn, &replicas).await?;
         kernel
             .update_bootstrap_membership(&txn, &replicas, local_value)
             .await?;
@@ -117,9 +118,8 @@ async fn seed_tree(
         let state = crate::replication::read_seed_state(
             seed,
             &token,
-            txn.id(),
+            txn,
             &directory,
-            txn.deadline(),
             txn.request_body_limit(),
         )
         .await?;
@@ -137,9 +137,8 @@ async fn seed_tree(
                 let state = crate::replication::read_seed_state(
                     seed,
                     session.token(),
-                    txn.id(),
+                    txn,
                     &child,
-                    txn.deadline(),
                     txn.application_body_limit(),
                 )
                 .await?;
@@ -166,16 +165,14 @@ fn state_bool(state: crate::State) -> TCResult<bool> {
 async fn seed_replica_endpoints(
     seed: &str,
     token: &str,
-    txn_id: tc_ir::TxnId,
+    txn: &crate::TxnHandle,
     target: &pathlink::Link,
-    deadline: crate::Deadline,
 ) -> TCResult<BTreeSet<String>> {
     let state = crate::replication::read_seed_state(
         seed,
         token,
-        txn_id,
+        txn,
         target,
-        deadline,
         crate::literal::MAX_DEFINITION_BYTES,
     )
     .await?;

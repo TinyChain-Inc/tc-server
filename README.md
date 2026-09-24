@@ -33,7 +33,8 @@ owner or generic application payload.
   embedded definition.
 - Application versions are immutable. Identical installation is a no-op;
   different content at the same identity conflicts.
-- Service persistence and discovery are supported. Service execution is not.
+- Services execute scalar methods and own SyncChain-backed BTree/Table members;
+  see the [Service contract](SERVICE_CONTRACT.md) for recovery and healthy joins.
 
 The identity maps directly beneath `data_dir`; transactional versions are owned
 by the recursive `txfs` directory. The workspace contains host-control and

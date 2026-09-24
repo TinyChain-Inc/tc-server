@@ -113,11 +113,11 @@ where
     pub(crate) async fn exact_hash(self, txn: &crate::TxnHandle) -> TCResult<[u8; 32]> {
         match self {
             Self::Dir { cluster, unmatched } if unmatched.is_empty() => {
-                cluster.state().hash(txn.id()).await
+                cluster.state().hash(txn).await
             }
             Self::Item {
                 cluster, suffix, ..
-            } if suffix.is_empty() => cluster.state().hash(txn.id()).await,
+            } if suffix.is_empty() => cluster.state().hash(txn).await,
             _ => Err(TCError::not_found("bootstrap resource")),
         }
     }
@@ -643,8 +643,8 @@ impl<T> AsyncHash for Dir<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    async fn hash(&self, txn_id: TxnId) -> TCResult<[u8; 32]> {
-        let entries = self.entries(txn_id).await?;
+    async fn hash(&self, txn: &crate::TxnHandle) -> TCResult<[u8; 32]> {
+        let entries = self.entries(txn.id()).await?;
         let ordered = entries
             .into_iter()
             .map(|(name, is_dir)| (name.to_string(), is_dir))
@@ -673,7 +673,7 @@ mod tests {
         kernel
             .test_services()
             .create_item(&create_txn, &segments, move |storage| {
-                crate::service::Service::create(create_txn_id, storage, identity, definition)
+                crate::service::Service::create(create_txn_id, storage, identity, definition, 8)
             })
             .await
             .expect("create nested Service");

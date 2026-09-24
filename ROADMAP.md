@@ -13,17 +13,13 @@ workspace architecture and normative storage and transaction contracts.
 - Close the recursive-application issues only after committed CI evidence is
   linked from their live checklists.
 
-## Service hosting
-
-- Add executable Service behavior as the public owner of named persistent state.
-- Delegate durable member state to the common Chain contract; do not restore a
-  server collection registry or add a Service-specific transaction lifecycle.
-- Keep unsupported Service execution explicit until the complete owner exists.
-
 ## Chain integration
 
-- Integrate Chain-owned durable history, replay, canonical-state selection, and
-  resynchronization through the boundary in `tc-chain/CHAIN_CONTRACT.md`.
+- Add authoritative replacement for damaged or interrupted canonical storage.
+  Local WAL recovery and healthy snapshot joining follow
+  [SERVICE_CONTRACT.md](SERVICE_CONTRACT.md); neither repairs damaged evidence.
+- Integrate future Chain variants and persistent Tensor members through their
+  existing ownership boundaries when implemented.
 - Preserve Cluster-owned exact-resource leadership and TxnServer-owned expiry
   and frontier scheduling. Do not add a server WAL, repair heuristic, or decision
   ledger while Chain is incomplete.

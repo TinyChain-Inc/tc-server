@@ -16,13 +16,15 @@ mod dir;
 mod replicas;
 pub(crate) use dir::Dir;
 #[cfg(feature = "http-client")]
+pub(crate) use dir::Resolved;
+#[cfg(feature = "http-client")]
 pub(crate) use replicas::replica_put_state;
 
 const REPLICAS: &str = "replicas";
 
 /// Hash a resource's transaction-visible state using `async_hash` composition.
 pub(crate) trait AsyncHash: Send + Sync {
-    fn hash(&self, txn_id: TxnId) -> impl Future<Output = TCResult<[u8; 32]>> + Send;
+    fn hash(&self, txn: &crate::TxnHandle) -> impl Future<Output = TCResult<[u8; 32]>> + Send;
 }
 
 pub(crate) trait DirItem:

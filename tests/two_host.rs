@@ -13,6 +13,173 @@ use tinychain::http::HttpServer;
 use tinychain::replication::ReplicationIssuer;
 use tinychain::{HostLimits, HostStorage, HttpGateway, ProtocolAuthority, Workspace};
 
+#[path = "support/runtime.rs"]
+mod test_runtime;
+
+#[path = "support/service.rs"]
+mod service_fixture;
+
+#[test]
+fn populated_service_join_replicates_methods_and_recovers_both_hosts() {
+    let (seed_root, joining_root) = test_runtime::run(|| async {
+        use futures::TryStreamExt;
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let joining_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let seed_addr = seed_listener.local_addr().unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap();
+        let seed = prepare("service-seed").await;
+        let joining = prepare("service-join").await;
+        let installer = Actor::new_falcon512("service-installer".into()).unwrap();
+        let host: Link = "/host".parse().unwrap();
+        let keyring = actor_directory(
+            &host,
+            [seed.actor.clone(), joining.actor.clone(), installer.clone()],
+        );
+        let (seed_task, seed_shutdown, seed_root, _) =
+            start(seed, seed_listener, keyring.clone()).await;
+        for table in [false, true] {
+            let kind = if table { "table" } else { "btree" };
+            let identity: Link = format!("/service/example-devco/{kind}/1.0.0")
+                .parse()
+                .unwrap();
+            let bearer = bearer_for(
+                &installer,
+                host.clone(),
+                Claim::new(identity.clone(), umask::USER_WRITE),
+            );
+            let definition = std::collections::BTreeMap::from([(
+                identity.to_string(),
+                service_fixture::definition(table),
+            )]);
+            let encoded = destream_json::encode(definition)
+                .unwrap()
+                .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                    bytes.extend_from_slice(&chunk);
+                    Ok(bytes)
+                })
+                .await
+                .unwrap();
+            let response = put(seed_addr, "service", &bearer, encoded).await;
+            let status = response.status();
+            let body = hyper::body::to_bytes(response).await.unwrap();
+            assert!(status.is_success(), "{}", String::from_utf8_lossy(&body));
+            let key = if table { "[1]" } else { "null" };
+            let response = put(
+                seed_addr,
+                format!("{identity}/insert").trim_start_matches('/'),
+                &bearer,
+                format!("[{key},[1]]"),
+            )
+            .await;
+            let status = response.status();
+            let body = hyper::body::to_bytes(response).await.unwrap();
+            assert!(status.is_success(), "{}", String::from_utf8_lossy(&body));
+        }
+        let (joining_task, joining_shutdown, joining_root, joining_kernel) =
+            start(joining, joining_listener, keyring).await;
+        joining_kernel
+            .bootstrap_seed(
+                &format!("http://{seed_addr}"),
+                format!("http://{joining_addr}"),
+            )
+            .await
+            .expect("populated Service join");
+        assert!(joining_kernel.is_ready());
+        for table in [false, true] {
+            let kind = if table { "table" } else { "btree" };
+            let identity: Link = format!("/service/example-devco/{kind}/1.0.0")
+                .parse()
+                .unwrap();
+            assert_replica(seed_addr, &identity.to_string(), joining_addr).await;
+            assert_service_count(joining_addr, &identity, 1).await;
+            let bearer = bearer_for(
+                &installer,
+                host.clone(),
+                Claim::new(identity.clone(), umask::USER_WRITE),
+            );
+            let key = if table { "[2]" } else { "null" };
+            let response = put(
+                joining_addr,
+                format!("{identity}/insert").trim_start_matches('/'),
+                &bearer,
+                format!("[{key},[2]]"),
+            )
+            .await;
+            let status = response.status();
+            let body = hyper::body::to_bytes(response).await.unwrap();
+            assert!(status.is_success(), "{}", String::from_utf8_lossy(&body));
+            let key = if table { "[3]" } else { "null" };
+            let response = Client::new()
+                .request(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("http://{seed_addr}{identity}/append"))
+                        .header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!(r#"{{"key":{key},"value":[3]}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = hyper::body::to_bytes(response).await.unwrap();
+            assert!(
+                status.is_success(),
+                "{status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            for addr in [seed_addr, joining_addr] {
+                assert_service_count(addr, &identity, 3).await;
+            }
+        }
+        let _ = seed_shutdown.send(());
+        let _ = joining_shutdown.send(());
+        seed_task.await.unwrap();
+        joining_task.await.unwrap();
+        (seed_root, joining_root)
+    });
+    // Stop expiry with the old runtimes before reopening either storage owner.
+    for (label, root) in [("service-seed", seed_root), ("service-join", joining_root)] {
+        test_runtime::run(move || async move {
+            std::fs::remove_dir_all(root.join("workspace/txn")).unwrap();
+            let host = open(label, root.clone()).await;
+            let keyring = actor_directory(&"/host".parse().unwrap(), [host.actor.clone()]);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (task, shutdown, _, kernel) = start(host, listener, keyring).await;
+            assert!(kernel.is_ready());
+            for kind in ["btree", "table"] {
+                assert_service_count(
+                    addr,
+                    &format!("/service/example-devco/{kind}/1.0.0")
+                        .parse()
+                        .unwrap(),
+                    3,
+                )
+                .await;
+            }
+            let _ = shutdown.send(());
+            task.await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+}
+
+async fn assert_service_count(address: SocketAddr, identity: &Link, count: usize) {
+    let response = Client::new()
+        .get(format!("http://{address}{identity}/count").parse().unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = hyper::body::to_bytes(response).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!(count)
+    );
+}
+
 struct PreparedHost {
     root: std::path::PathBuf,
     roots: tinychain::ApplicationRoots,

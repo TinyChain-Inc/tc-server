@@ -82,7 +82,10 @@ impl KernelInner {
                 "service",
                 Arc::clone(&protocol),
                 Arc::clone(&replication),
-                crate::service::Service::load,
+                {
+                    let capacity = resources.limits().execution.max_op_invocations;
+                    move |id, storage| crate::service::Service::load(id, storage, capacity)
+                },
             ),
         )?;
 
@@ -281,6 +284,8 @@ impl Kernel {
         seed: &str,
         self_endpoint: String,
     ) -> TCResult<std::collections::BTreeSet<String>> {
+        self.bootstrap_ready
+            .store(false, std::sync::atomic::Ordering::Release);
         let identity = self.inner.bootstrap.self_identity(self_endpoint)?;
         let mut peers = self.inner.classes.bootstrap(self, seed, &identity).await?;
         peers.extend(
@@ -312,6 +317,7 @@ impl Kernel {
             resource,
             identity,
             &self.inner.bootstrap,
+            request.txn().deadline(),
         )
         .await?;
         Ok((request.txn().clone(), session))
@@ -331,8 +337,41 @@ impl Kernel {
             resource,
             identity,
             &self.inner.bootstrap,
+            txn.deadline(),
         )
         .await
+    }
+
+    #[cfg(feature = "http-client")]
+    pub(crate) async fn synchronize_service(
+        &self,
+        txn: &crate::TxnHandle,
+        resource: &Link,
+        seed: &str,
+        session: &crate::cluster::BootstrapSession,
+    ) -> TCResult<()> {
+        if crate::uri::application_root(resource) != Some("service") {
+            return Ok(());
+        }
+        let resolved = self
+            .inner
+            .services
+            .clone()
+            .lookup(txn, &resource.path()[1..])
+            .await?;
+        // Directory membership hashes have no member payloads to synchronize.
+        if let crate::cluster::Resolved::Item {
+            cluster, suffix, ..
+        } = resolved
+        {
+            if !suffix.is_empty() {
+                return Err(TCError::bad_request(
+                    "synchronization requires an exact Service",
+                ));
+            }
+            cluster.state().synchronize(txn, seed, session).await?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "http-client")]
@@ -455,6 +494,9 @@ impl Kernel {
             )),
         };
         let finalizer = std::sync::Arc::clone(&kernel.inner);
+        for service in kernel.inner.services.state().items(bootstrap_txn).await? {
+            Box::pin(service.recover(&kernel.txn_server, &kernel.inner)).await?;
+        }
         kernel.txn_server.finish_recovery().await?;
         kernel
             .txn_server
@@ -743,11 +785,11 @@ where
 mod tests;
 
 fn scalar_body(body: Option<crate::State>) -> TCResult<Scalar> {
-    match body.unwrap_or(crate::State::None) {
-        crate::State::None => Ok(Scalar::default()),
-        crate::State::Scalar(scalar) => Ok(scalar),
-        _ => Err(tc_error::TCError::bad_request("expected a scalar request")),
-    }
+    use safecast::TryCastFrom;
+
+    Scalar::try_cast_from(body.unwrap_or_default(), |_| {
+        TCError::bad_request("expected a scalar request")
+    })
 }
 
 fn put_body(body: Option<crate::State>) -> TCResult<(Scalar, crate::State)> {
