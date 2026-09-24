@@ -455,6 +455,7 @@ impl Kernel {
             )),
         };
         let finalizer = std::sync::Arc::clone(&kernel.inner);
+        kernel.txn_server.finish_recovery().await?;
         kernel
             .txn_server
             .start_expiry(&tokio::runtime::Handle::current(), move |cutoff| {
