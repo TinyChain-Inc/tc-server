@@ -20,14 +20,14 @@ const LAST_ALLOCATED: &str = "last_allocated";
 #[derive(Clone)]
 pub struct Workspace {
     control: DirLock<ControlFile>,
-    transactions: DirLock<tc_collection::PersistentFile>,
+    transactions: DirLock<crate::storage::ApplicationBlock>,
     next_temp: Arc<AtomicU64>,
 }
 
 impl Workspace {
     pub(crate) fn from_roots(
         control: DirLock<ControlFile>,
-        transactions: DirLock<tc_collection::PersistentFile>,
+        transactions: DirLock<crate::storage::ApplicationBlock>,
     ) -> Self {
         Self {
             control,
@@ -134,7 +134,7 @@ impl Workspace {
     pub async fn transaction(
         &self,
         txn_id: TxnId,
-    ) -> TCResult<DirLock<tc_collection::PersistentFile>> {
+    ) -> TCResult<DirLock<crate::storage::ApplicationBlock>> {
         child(self.transactions.clone(), txn_id.to_string()).await
     }
 
@@ -142,7 +142,7 @@ impl Workspace {
         &self,
         txn_id: TxnId,
         path: &[String],
-    ) -> TCResult<DirLock<tc_collection::PersistentFile>> {
+    ) -> TCResult<DirLock<crate::storage::ApplicationBlock>> {
         let mut dir = self.transaction(txn_id).await?;
         for segment in path {
             dir = child(dir, segment.clone()).await?;
@@ -225,9 +225,9 @@ async fn write_record(dir: &DirLock<ControlFile>, name: &str, record: ControlFil
 }
 
 async fn child(
-    dir: DirLock<tc_collection::PersistentFile>,
+    dir: DirLock<crate::storage::ApplicationBlock>,
     name: impl Into<String>,
-) -> TCResult<DirLock<tc_collection::PersistentFile>> {
+) -> TCResult<DirLock<crate::storage::ApplicationBlock>> {
     let mut dir = dir.write().await;
     let child = dir.get_or_create_dir(name.into()).map_err(map_io)?;
     dir.sync().await.map_err(map_io)?;

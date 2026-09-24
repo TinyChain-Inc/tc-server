@@ -300,6 +300,9 @@ impl Library {
         txn_id: TxnId,
         storage: txfs::Dir<TxnId, ApplicationBlock>,
     ) -> TCResult<Self> {
+        if storage.native().await?.is_some() {
+            return Err(TCError::bad_request("unsupported Library layout"));
+        }
         let manifest_name: tc_ir::Id = MANIFEST.parse().expect("manifest file name");
         let module_name: tc_ir::Id = MODULE.parse().expect("module file name");
         let mut manifest = None;

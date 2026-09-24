@@ -92,7 +92,8 @@ provide additional, non-normative integration context.
   Service values own validation, transactional versions, immutable conflict checks, routing,
   replication, and lifecycle.
 - Committed layouts are strict: Library has `manifest.json` and optional
-  `module.wasm`; Class and Service have only `manifest.json`. Unsupported or
+  `module.wasm`; Class has only `manifest.json`. Service owns its manifest and
+  delegates native member storage through `txfs::Dir::native`. Unsupported or
   ambiguous layouts fail without mutation.
 - Every recursive directory owns a delegated `txfs::Dir`, including its typed
   manifest and optional module handles. Concrete resources retain decoded

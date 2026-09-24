@@ -13,9 +13,11 @@ use tc_ir::Scalar;
 const MAX_APPLICATION_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
-pub(crate) enum ApplicationBlock {
+pub enum ApplicationBlock {
     Manifest(Link, Scalar),
     Module(Arc<[u8]>),
+    Collection(tc_collection::PersistentFile),
+    Chain(tc_chain::ChainFile),
 }
 
 impl AsType<ApplicationBlock> for ApplicationBlock {
@@ -32,6 +34,37 @@ impl AsType<ApplicationBlock> for ApplicationBlock {
     }
 }
 
+safecast::as_type!(ApplicationBlock, Chain, tc_chain::ChainFile);
+
+impl From<tc_collection::CollectionNode> for ApplicationBlock {
+    fn from(node: tc_collection::CollectionNode) -> Self {
+        Self::Collection(tc_collection::PersistentFile::Node(node))
+    }
+}
+
+impl AsType<tc_collection::CollectionNode> for ApplicationBlock {
+    fn as_type(&self) -> Option<&tc_collection::CollectionNode> {
+        match self {
+            Self::Collection(file) => file.as_type(),
+            _ => None,
+        }
+    }
+
+    fn as_type_mut(&mut self) -> Option<&mut tc_collection::CollectionNode> {
+        match self {
+            Self::Collection(file) => file.as_type_mut(),
+            _ => None,
+        }
+    }
+
+    fn into_type(self) -> Option<tc_collection::CollectionNode> {
+        match self {
+            Self::Collection(file) => file.into_type(),
+            _ => None,
+        }
+    }
+}
+
 impl GetSize for ApplicationBlock {
     fn get_size(&self) -> usize {
         match self {
@@ -39,6 +72,8 @@ impl GetSize for ApplicationBlock {
                 identity.to_string().len() + definition.get_size()
             }
             Self::Module(bytes) => bytes.len(),
+            Self::Collection(file) => file.get_size(),
+            Self::Chain(file) => file.get_size(),
         }
     }
 }
@@ -70,10 +105,12 @@ impl FileLoad for ApplicationBlock {
                 file.read_to_end(&mut bytes).await?;
                 Ok(Self::Module(bytes.into()))
             }
-            Some(name) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported application layout file {name}"),
-            )),
+            Some("committed.chain_block") => tc_chain::ChainFile::load(path, file, metadata)
+                .await
+                .map(Self::Chain),
+            Some(_) => tc_collection::PersistentFile::load(path, file, metadata)
+                .await
+                .map(Self::Collection),
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "missing file name",
@@ -85,6 +122,8 @@ impl FileLoad for ApplicationBlock {
 impl FileSave for ApplicationBlock {
     async fn save(&self, file: &mut tokio::fs::File) -> io::Result<u64> {
         match self {
+            Self::Collection(value) => value.save(file).await,
+            Self::Chain(value) => value.save(file).await,
             Self::Manifest(identity, definition) => {
                 let mut encoded = destream_json::encode(crate::literal::Definition(
                     identity.clone(),
@@ -106,3 +145,7 @@ impl FileSave for ApplicationBlock {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/native_storage.rs"]
+mod tests;

@@ -26,6 +26,11 @@ where
         Fut: Future<Output = TCResult<T>> + Send + 'static,
     {
         Box::pin(async move {
+            if storage.native().await?.is_some() {
+                return Err(TCError::bad_request(
+                    "native storage requires an application item",
+                ));
+            }
             let entries = storage.iter(txn_id).await.map_err(TCError::from)?;
             let mut members = Vec::new();
             for (name, entry) in entries {
@@ -55,10 +60,8 @@ where
                         Arc::clone(&gateway),
                     ))
                 } else {
-                    if name.as_str() == ".txfs" {
-                        return Err(TCError::bad_request(
-                            ".txfs is a reserved application segment",
-                        ));
+                    if matches!(name.as_str(), ".txfs" | ".native") {
+                        return Err(TCError::bad_request("reserved application storage segment"));
                     }
                     DirEntry::Dir(
                         Self::load(

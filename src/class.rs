@@ -97,6 +97,9 @@ impl Class {
         txn_id: TxnId,
         storage: txfs::Dir<TxnId, ApplicationBlock>,
     ) -> TCResult<Self> {
+        if storage.native().await?.is_some() {
+            return Err(TCError::bad_request("unsupported Class layout"));
+        }
         let mut entries = storage.iter(txn_id).await.map_err(TCError::from)?;
         let name: tc_ir::Id = MANIFEST.parse().expect("manifest file name");
         let (entry_name, entry) = entries

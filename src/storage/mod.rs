@@ -8,7 +8,7 @@ use crate::Workspace;
 mod file;
 mod workspace;
 
-pub(crate) use file::ApplicationBlock;
+pub use file::ApplicationBlock;
 pub use workspace::{AuthorityRecord, ControlFile};
 
 const CLASS_ROOT: &str = "class";
@@ -36,7 +36,7 @@ impl ApplicationRoots {
 #[derive(Clone)]
 pub struct HostStorage {
     control: Arc<Cache<ControlFile>>,
-    workspace: Arc<Cache<tc_collection::PersistentFile>>,
+    workspace: Arc<Cache<crate::storage::ApplicationBlock>>,
     data: Arc<Cache<ApplicationBlock>>,
 }
 

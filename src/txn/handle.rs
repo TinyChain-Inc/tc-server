@@ -430,7 +430,9 @@ impl TxnHandle {
         self.grant(authority, claim.link, claim.mask)
     }
 
-    async fn context(&self) -> tc_error::TCResult<freqfs::DirLock<tc_collection::PersistentFile>> {
+    async fn context(
+        &self,
+    ) -> tc_error::TCResult<freqfs::DirLock<crate::storage::ApplicationBlock>> {
         self.server
             .workspace()
             .transaction_child(self.id, &self.workspace_path)
@@ -510,7 +512,7 @@ impl TxnHandle {
 }
 
 impl tc_collection::StorageContext for TxnHandle {
-    type File = tc_collection::PersistentFile;
+    type File = crate::storage::ApplicationBlock;
 
     fn context(
         &self,
