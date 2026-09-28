@@ -1,5 +1,7 @@
 use super::*;
 
+const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 #[tokio::test]
 async fn preserves_remote_pressure_metadata() {
     let error = TCError::resource_unavailable(

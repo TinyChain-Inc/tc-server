@@ -92,11 +92,16 @@ impl KernelRequestGuard {
     }
 
     pub async fn execute(&self, body: Option<State>) -> tc_error::TCResult<Option<State>> {
+        // Keep the concrete recursive dispatch future out of the enclosing
+        // deadline/request frame; native Service paths otherwise exhaust a
+        // normal debug runtime stack. Ownership and cancellation remain local.
         self.deadline()
-            .run(
-                self.kernel
-                    .execute(self.target.clone(), self.txn.clone(), self.method, body),
-            )
+            .run(Box::pin(self.kernel.execute(
+                self.target.clone(),
+                self.txn.clone(),
+                self.method,
+                body,
+            )))
             .await
             .map(|(state, _)| state)
     }
@@ -117,10 +122,12 @@ impl KernelRequestGuard {
     ) -> tc_error::TCResult<(Option<State>, bool, Self)> {
         let (state, raw_bytes) = self
             .deadline()
-            .run(
-                self.kernel
-                    .execute(self.target.clone(), self.txn.clone(), self.method, body),
-            )
+            .run(Box::pin(self.kernel.execute(
+                self.target.clone(),
+                self.txn.clone(),
+                self.method,
+                body,
+            )))
             .await?;
         Ok((state, raw_bytes, self))
     }

@@ -1,6 +1,10 @@
 #![deny(unsafe_code)]
 #![warn(unreachable_pub)]
 
+#[cfg(test)]
+#[path = "../tests/support/runtime.rs"]
+mod test_runtime;
+
 pub mod auth;
 pub use auth::Claim;
 pub mod class;

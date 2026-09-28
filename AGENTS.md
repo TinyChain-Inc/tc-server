@@ -92,12 +92,14 @@ provide additional, non-normative integration context.
   Service values own validation, transactional versions, immutable conflict checks, routing,
   replication, and lifecycle.
 - Committed layouts are strict: Library has `manifest.json` and optional
-  `module.wasm`; Class and Service have only `manifest.json`. Unsupported or
+  `module.wasm`; Class has only `manifest.json`. Service owns its manifest and
+  delegates native member storage through ordinary directory handles. Unsupported or
   ambiguous layouts fail without mutation.
 - Every recursive directory owns a delegated `txfs::Dir`, including its typed
   manifest and optional module handles. Concrete resources retain decoded
-  definitions and runtime state. Recursive `txfs` lifecycle publishes committed
-  versions and discards abandoned versions. Bootstrap reads them through one
+  definitions and runtime state. `txfs` manages immediate files and membership;
+  recursive application owners explicitly load and delegate child lifecycle.
+  Bootstrap reads files through one
   ordinary `TxnServer`-allocated transaction. Application claims do not allocate
   collection workspaces.
 - `HostStorage` may create a root immediately before its first `freqfs::Cache`
@@ -115,8 +117,9 @@ provide additional, non-normative integration context.
 - Runtime Library, Class, and Service values depend on storage and execution
   context and are not wire codecs. The one-entry literal definition is the sole
   application wire representation.
-- Service execution and standalone named persistent collections are unsupported
-  until Service and Chain own them. Do not add a server registry or placeholder.
+- Executable Services follow [SERVICE_CONTRACT.md](SERVICE_CONTRACT.md).
+  Standalone named persistent collections remain unsupported; Service delegates
+  member persistence and recovery to Chain. Do not add a server registry.
 
 ## Transactions and replication
 

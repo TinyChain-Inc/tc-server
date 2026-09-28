@@ -143,6 +143,35 @@ impl TxnServer {
         self.handle(txn_id, false, None, kernel)
     }
 
+    /// Only startup recovery of validated Chain records may bind expired IDs.
+    /// This capability never crosses the request authentication boundary.
+    pub(crate) fn bind_recovery(
+        &self,
+        txn_id: TxnId,
+        kernel: Arc<crate::kernel::KernelInner>,
+    ) -> TCResult<TxnHandle> {
+        use tc_collection::StorageContext;
+
+        if self.is_ready() {
+            return Err(TCError::conflict("recovery requires an unpublished host"));
+        }
+        self.reject_finalized(txn_id)?;
+        self.observe(txn_id);
+        Ok(self
+            .handle(txn_id, false, None, kernel)?
+            .subcontext_unique())
+    }
+
+    pub(crate) async fn finish_recovery(&self) -> TCResult<()> {
+        let cutoff = self.state.inner.lock().latest_finalized;
+        if let Some(cutoff) = cutoff {
+            self.state.config.workspace().remove_through(cutoff).await?;
+        }
+        self.state.ready.store(true, Ordering::Release);
+        self.state.notify.notify_one();
+        Ok(())
+    }
+
     fn handle(
         &self,
         id: TxnId,
@@ -329,11 +358,6 @@ impl TxnServer {
                 }
             }
         }
-        if let Some(cutoff) = latest_finalized {
-            self.state.config.workspace().remove_through(cutoff).await?;
-        }
-        self.state.ready.store(true, Ordering::Release);
-        self.state.notify.notify_one();
         Ok(())
     }
 

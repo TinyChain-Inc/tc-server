@@ -14,6 +14,7 @@ pathlink = { path = "../deps/pathlink", features = ["serialize"] }
 tc-ir = { path = "../tc-ir" }
 tc-error = { path = "../tc-error", features = ["pathlink", "txfs"] }
 tc-value = { path = "../tc-value" }
+tc-chain = { path = "../tc-chain" }
 tc-state = { path = "../tc-state" }
 tc-collection = { path = "../tc-collection" }
 txn_lock = { path = "../deps/txn_lock" }

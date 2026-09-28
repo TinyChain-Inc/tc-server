@@ -403,17 +403,13 @@ impl Library {
 
 impl Transact for Library {
     async fn commit(&self, txn_id: TxnId) -> TCResult<()> {
-        self.storage
-            .commit(txn_id, true)
-            .await
-            .map_err(TCError::from)
+        self.storage.commit(txn_id).await.map_err(TCError::from)
     }
+
     async fn rollback(&self, txn_id: &TxnId) -> TCResult<()> {
-        self.storage
-            .rollback(*txn_id, true)
-            .await
-            .map_err(TCError::from)
+        self.storage.rollback(*txn_id).await.map_err(TCError::from)
     }
+
     async fn finalize(&self, txn_id: &TxnId) -> TCResult<()> {
         self.storage.finalize(*txn_id).await.map_err(TCError::from)
     }
@@ -429,7 +425,7 @@ impl crate::cluster::DirItem for Library {
 }
 
 impl crate::cluster::AsyncHash for Library {
-    async fn hash(&self, _txn_id: TxnId) -> TCResult<[u8; 32]> {
+    async fn hash(&self, _txn: &crate::TxnHandle) -> TCResult<[u8; 32]> {
         Ok(self.runtime.hash())
     }
 }

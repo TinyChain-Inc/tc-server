@@ -1,3 +1,5 @@
+use tc_ir::OpRef;
+
 use super::*;
 
 #[test]

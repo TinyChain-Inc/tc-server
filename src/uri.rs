@@ -87,7 +87,7 @@ pub(crate) fn split_application_link(
     }
     let mut segments = Vec::with_capacity(structural_end.saturating_sub(1));
     for segment in &path[1..structural_end] {
-        if matches!(segment.as_str(), ".txfs" | "replicas") {
+        if matches!(segment.as_str(), ".txfs" | ".native" | "replicas") {
             return Err(tc_error::TCError::bad_request(format!(
                 "{} is a reserved application segment",
                 segment.as_str()

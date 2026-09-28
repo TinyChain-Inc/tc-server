@@ -13,7 +13,7 @@ use tc_error::{TCError, TCResult};
 const FANOUT_CONCURRENCY: usize = 8;
 
 #[cfg(feature = "http-client")]
-pub(crate) use client::{bootstrap_seed, read_seed_state};
+pub(crate) use client::{bootstrap_seed, read_seed_snapshot, read_seed_state};
 pub use gateway::{ClusterGateway, LocalClusterGateway};
 pub use issuer::{ReplicationIssuer, parse_psk_keys};
 pub use membership::Replica;

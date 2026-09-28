@@ -239,7 +239,105 @@ where
                 }) as Box<dyn Handler<'a, crate::State>>
             });
         }
-        self.state.route(path)
+        let leaf = self.state.route(path)?;
+        // Executable Service members mutate this exact resource. Definition-only
+        // applications and directory membership retain their existing owners.
+        if !path.is_empty()
+            && self
+                .path
+                .first()
+                .is_some_and(|kind| kind.as_str() == "service")
+        {
+            let mut target = pathlink::Link::from(self.path.clone());
+            for segment in path {
+                target = target.append(segment.clone());
+            }
+            Some(Box::new(ServiceMutation {
+                cluster: self,
+                target,
+                leaf,
+            }))
+        } else {
+            Some(leaf)
+        }
+    }
+}
+
+/// V1's replication boundary, retaining the selected native verb instead of
+/// routing it again. A participant's `replicate` call deliberately does not forward.
+struct ServiceMutation<'a, T> {
+    cluster: &'a Cluster<T>,
+    target: pathlink::Link,
+    leaf: Box<dyn Handler<'a, crate::State> + 'a>,
+}
+
+impl<'a, T: AsyncHash> Handler<'a, crate::State> for ServiceMutation<'a, T> {
+    fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, crate::State>>
+    where
+        'txn: 'a,
+    {
+        self.leaf.get()
+    }
+
+    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, crate::State>>
+    where
+        'txn: 'a,
+    {
+        self.leaf.post()
+    }
+
+    fn put<'txn>(self: Box<Self>) -> Option<PutHandler<'a, 'txn, crate::State>>
+    where
+        'txn: 'a,
+    {
+        let Self {
+            cluster,
+            target,
+            leaf,
+        } = *self;
+        let put = leaf.put()?;
+        Some(Box::new(move |txn, key, value| {
+            Box::pin(async move {
+                if !txn.may_mutate(&cluster.path.clone().into(), cluster.path()) {
+                    return Err(TCError::unauthorized("unauthorized Service mutation"));
+                }
+                cluster
+                    .replicate(
+                        txn,
+                        &target,
+                        tc_ir::Method::Put,
+                        key.clone(),
+                        Some(value.clone()),
+                    )
+                    .await?;
+                put(txn, key, value).await?;
+                txn.mark_resource_mutated(cluster.path())
+            })
+        }))
+    }
+
+    fn delete<'txn>(self: Box<Self>) -> Option<DeleteHandler<'a, 'txn, crate::State>>
+    where
+        'txn: 'a,
+    {
+        let Self {
+            cluster,
+            target,
+            leaf,
+        } = *self;
+        let delete = leaf.delete()?;
+        Some(Box::new(move |txn, key| {
+            Box::pin(async move {
+                if !txn.may_mutate(&cluster.path.clone().into(), cluster.path()) {
+                    return Err(TCError::unauthorized("unauthorized Service mutation"));
+                }
+                cluster
+                    .replicate(txn, &target, tc_ir::Method::Delete, key.clone(), None)
+                    .await?;
+                delete(txn, key).await?;
+                txn.mark_resource_mutated(cluster.path())
+            })
+        }))
     }
 }
 
@@ -307,7 +405,7 @@ where
                     .ok_or_else(|| TCError::bad_request("replica PUT requires an endpoint key"))?;
                 let (host, actor_id, algorithm, public_key_b64, expected_hash) =
                     replica_value(value)?;
-                let actual_hash = self.cluster.state.hash(txn.id()).await?;
+                let actual_hash = self.cluster.state.hash(txn).await?;
                 if hex::encode(actual_hash) != expected_hash {
                     return Err(TCError::conflict(
                         "replica state hash does not match this resource",

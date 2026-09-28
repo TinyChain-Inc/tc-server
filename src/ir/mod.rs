@@ -1,136 +1,8 @@
 use pathlink::{Link, PathSegment};
 use tc_error::{TCError, TCResult};
-use tc_ir::{
-    DeleteHandler, GetHandler, Handler, Map, OpDef, OpRef, PostHandler, PutHandler, Scalar,
-};
+use tc_ir::{Handler, Map, Scalar};
 
 use crate::State;
-
-#[derive(Clone)]
-struct OpHandler {
-    subject: Link,
-    definition: OpDef,
-}
-
-impl OpHandler {
-    fn subject(&self) -> State {
-        State::from(tc_value::Value::Link(self.subject.clone()))
-    }
-}
-
-impl<'a> Handler<'a, State> for OpHandler {
-    fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, State>>
-    where
-        'txn: 'a,
-    {
-        matches!(self.definition, OpDef::Get(_)).then(|| {
-            Box::new(move |txn, key| {
-                Box::pin(async move {
-                    let subject = self.subject();
-                    tc_state::StateExecutor::execute_op(
-                        txn,
-                        self.definition,
-                        State::from_scalar(key),
-                        Some(subject),
-                        None,
-                    )
-                    .await
-                }) as tc_ir::HandlerFuture<'a, State>
-            }) as GetHandler<'a, 'txn, State>
-        })
-    }
-
-    fn put<'txn>(self: Box<Self>) -> Option<PutHandler<'a, 'txn, State>>
-    where
-        'txn: 'a,
-    {
-        matches!(self.definition, OpDef::Put(_)).then(|| {
-            Box::new(move |txn, key, value| {
-                Box::pin(async move {
-                    let subject = self.subject();
-                    tc_state::StateExecutor::execute_op(
-                        txn,
-                        self.definition,
-                        State::Tuple(vec![State::from_scalar(key), value]),
-                        Some(subject),
-                        None,
-                    )
-                    .await
-                    .map(|_| ())
-                }) as tc_ir::HandlerFuture<'a, ()>
-            }) as PutHandler<'a, 'txn, State>
-        })
-    }
-
-    fn post<'txn>(self: Box<Self>) -> Option<PostHandler<'a, 'txn, State>>
-    where
-        'txn: 'a,
-    {
-        matches!(self.definition, OpDef::Post(_)).then(|| {
-            Box::new(move |txn, params| {
-                Box::pin(async move {
-                    let subject = self.subject();
-                    tc_state::StateExecutor::execute_op(
-                        txn,
-                        self.definition,
-                        State::Map(params),
-                        Some(subject),
-                        None,
-                    )
-                    .await
-                }) as tc_ir::HandlerFuture<'a, State>
-            }) as PostHandler<'a, 'txn, State>
-        })
-    }
-
-    fn delete<'txn>(self: Box<Self>) -> Option<DeleteHandler<'a, 'txn, State>>
-    where
-        'txn: 'a,
-    {
-        matches!(self.definition, OpDef::Delete(_)).then(|| {
-            Box::new(move |txn, key| {
-                Box::pin(async move {
-                    let subject = self.subject();
-                    tc_state::StateExecutor::execute_op(
-                        txn,
-                        self.definition,
-                        State::from_scalar(key),
-                        Some(subject),
-                        None,
-                    )
-                    .await
-                    .map(|_| ())
-                }) as tc_ir::HandlerFuture<'a, ()>
-            }) as DeleteHandler<'a, 'txn, State>
-        })
-    }
-}
-
-struct ValueHandler(State);
-
-impl<'a> Handler<'a, State> for ValueHandler {
-    fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, State>>
-    where
-        'txn: 'a,
-    {
-        Some(Box::new(move |_txn, _key| {
-            Box::pin(async move { Ok(self.0) })
-        }))
-    }
-}
-
-struct RefHandler(OpRef);
-
-impl<'a> Handler<'a, State> for RefHandler {
-    fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, State>>
-    where
-        'txn: 'a,
-    {
-        Some(Box::new(move |txn, _key| {
-            tc_state::resolve_ref(tc_ir::TCRef::Op(self.0), txn, None)
-        }))
-    }
-}
 
 pub(crate) struct LibraryAnalysis {
     pub(crate) members: Map<Scalar>,
@@ -179,18 +51,9 @@ pub(crate) fn route_member<'a>(
     members: &'a Map<Scalar>,
     path: &[PathSegment],
 ) -> Option<Box<dyn Handler<'a, State> + 'a>> {
-    let member = member(members, path)?.clone();
-    Some(match member {
-        Scalar::Op(definition) => Box::new(OpHandler {
-            subject: identity.clone(),
-            definition,
-        }),
-        Scalar::Ref(reference) => match *reference {
-            tc_ir::TCRef::Op(op) => Box::new(RefHandler(op)),
-            reference => Box::new(ValueHandler(State::from(Scalar::from(reference)))),
-        },
-        value => Box::new(ValueHandler(State::from_scalar(value))),
-    })
+    Some(tc_state::route_scalar(member(members, path)?, || {
+        State::from(tc_value::Value::Link(identity.clone()))
+    }))
 }
 
 #[cfg(test)]

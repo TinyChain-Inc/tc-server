@@ -1,10 +1,6 @@
-use std::time::Duration;
-
 use destream::de::FromStream;
 use futures::TryStreamExt;
 use tc_error::{TCError, TCResult};
-
-pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) async fn send(
     client: &hyper::Client<hyper::client::HttpConnector, hyper::Body>,

@@ -26,11 +26,14 @@ where
         Fut: Future<Output = TCResult<T>> + Send + 'static,
     {
         Box::pin(async move {
-            let entries = storage.iter(txn_id).await.map_err(TCError::from)?;
+            let entries = storage
+                .iter(txn_id)
+                .await?
+                .map(|(name, entry)| ((*name).clone(), (*entry).clone()))
+                .collect::<Vec<_>>();
             let mut members = Vec::new();
             for (name, entry) in entries {
-                let name = (*name).clone();
-                let txfs::DirEntry::Dir(child) = &*entry else {
+                let txfs::DirEntry::Dir(child) = entry else {
                     return Err(TCError::bad_request(format!(
                         "application files appear before a version at {path}/{name}",
                     )));
@@ -42,12 +45,9 @@ where
                             "an application version requires a publisher and resource path",
                         ));
                     }
-                    let identity: pathlink::Link =
-                        child_path.to_string().parse().map_err(|error| {
-                            TCError::bad_request(format!("invalid application identity: {error}"))
-                        })?;
+                    let identity = pathlink::Link::from(child_path);
                     crate::uri::validate_identity(&identity, root_name)?;
-                    let item = load_item(txn_id, child.clone()).await?;
+                    let item = load_item(txn_id, txfs::Dir::load(child).await?).await?;
                     DirEntry::Item(Cluster::new(
                         identity.path().clone(),
                         item,
@@ -55,15 +55,13 @@ where
                         Arc::clone(&gateway),
                     ))
                 } else {
-                    if name.as_str() == ".txfs" {
-                        return Err(TCError::bad_request(
-                            ".txfs is a reserved application segment",
-                        ));
+                    if matches!(name.as_str(), ".txfs" | ".native") {
+                        return Err(TCError::bad_request("reserved application storage segment"));
                     }
                     DirEntry::Dir(
                         Self::load(
                             txn_id,
-                            child.clone(),
+                            txfs::Dir::load(child).await?,
                             child_path,
                             root_name,
                             Arc::clone(&protocol),
@@ -110,11 +108,11 @@ where
     pub(crate) async fn exact_hash(self, txn: &crate::TxnHandle) -> TCResult<[u8; 32]> {
         match self {
             Self::Dir { cluster, unmatched } if unmatched.is_empty() => {
-                cluster.state().hash(txn.id()).await
+                cluster.state().hash(txn).await
             }
             Self::Item {
                 cluster, suffix, ..
-            } if suffix.is_empty() => cluster.state().hash(txn.id()).await,
+            } if suffix.is_empty() => cluster.state().hash(txn).await,
             _ => Err(TCError::not_found("bootstrap resource")),
         }
     }
@@ -434,7 +432,7 @@ where
                     .create_dir(txn.id(), name.clone())
                     .await
                     .map_err(TCError::from)?;
-                let item = create(storage).await?;
+                let item = create(txfs::Dir::load(storage).await?).await?;
                 let path = self.path().clone().append(name.clone());
                 let replicas = self
                     .replica_snapshot(txn.id())
@@ -482,7 +480,7 @@ where
                         .map(|replica| (replica.endpoint.clone(), replica));
                     let child = Cluster::with_replicas(
                         child_path,
-                        Dir::empty(storage),
+                        Dir::empty(txfs::Dir::load(storage).await?),
                         Arc::clone(&self.protocol),
                         Arc::clone(&self.gateway),
                         replicas,
@@ -576,10 +574,7 @@ where
     T: Clone + Send + Sync + Transact + 'static,
 {
     async fn commit(&self, txn_id: TxnId) -> TCResult<()> {
-        self.storage
-            .commit(txn_id, false)
-            .await
-            .map_err(TCError::from)?;
+        self.storage.commit(txn_id).await.map_err(TCError::from)?;
         let (members, _) = self.members.read_and_commit(txn_id).await;
         for member in members.values() {
             member.commit(txn_id).await?;
@@ -589,7 +584,7 @@ where
 
     async fn rollback(&self, txn_id: &TxnId) -> TCResult<()> {
         self.storage
-            .rollback(*txn_id, false)
+            .rollback(*txn_id)
             .await
             .map_err(TCError::from)?;
         let (members, _) = self.members.read_and_rollback(*txn_id).await;
@@ -640,8 +635,8 @@ impl<T> AsyncHash for Dir<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    async fn hash(&self, txn_id: TxnId) -> TCResult<[u8; 32]> {
-        let entries = self.entries(txn_id).await?;
+    async fn hash(&self, txn: &crate::TxnHandle) -> TCResult<[u8; 32]> {
+        let entries = self.entries(txn.id()).await?;
         let ordered = entries
             .into_iter()
             .map(|(name, is_dir)| (name.to_string(), is_dir))
@@ -670,7 +665,7 @@ mod tests {
         kernel
             .test_services()
             .create_item(&create_txn, &segments, move |storage| {
-                crate::service::Service::create(create_txn_id, storage, identity, definition)
+                crate::service::Service::create(create_txn_id, storage, identity, definition, 8)
             })
             .await
             .expect("create nested Service");
