@@ -29,7 +29,10 @@ fn application_membership_stops_at_native_chain_storage() {
             )
             .await
             .unwrap();
-        let native = directory.create_native().await.unwrap();
+        let native = directory
+            .create_dir(txn.id(), ".native".parse().unwrap())
+            .await
+            .unwrap();
         let (canonical, wal, values) = {
             let mut native = native.write().await;
             (
@@ -70,7 +73,7 @@ fn application_membership_stops_at_native_chain_storage() {
             let _canonical = canonical.write().await;
             let _wal = wal.write().await;
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                directory.commit(txn.id(), true).await.unwrap();
+                directory.commit(txn.id()).await.unwrap();
                 directory.finalize(txn.id()).await.unwrap();
             })
             .await
@@ -81,7 +84,12 @@ fn application_membership_stops_at_native_chain_storage() {
             txfs::Dir::<tc_ir::TxnId, ApplicationBlock>::load(cache().load(path.clone()).unwrap())
                 .await
                 .unwrap();
-        let native = reopened.native().await.unwrap().unwrap();
+        let native = reopened
+            .get_dir(txn.id(), &".native".parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .clone();
         let (canonical, wal, values) = {
             let mut native = native.write().await;
             (

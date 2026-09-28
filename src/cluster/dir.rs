@@ -26,16 +26,14 @@ where
         Fut: Future<Output = TCResult<T>> + Send + 'static,
     {
         Box::pin(async move {
-            if storage.native().await?.is_some() {
-                return Err(TCError::bad_request(
-                    "native storage requires an application item",
-                ));
-            }
-            let entries = storage.iter(txn_id).await.map_err(TCError::from)?;
+            let entries = storage
+                .iter(txn_id)
+                .await?
+                .map(|(name, entry)| ((*name).clone(), (*entry).clone()))
+                .collect::<Vec<_>>();
             let mut members = Vec::new();
             for (name, entry) in entries {
-                let name = (*name).clone();
-                let txfs::DirEntry::Dir(child) = &*entry else {
+                let txfs::DirEntry::Dir(child) = entry else {
                     return Err(TCError::bad_request(format!(
                         "application files appear before a version at {path}/{name}",
                     )));
@@ -47,12 +45,9 @@ where
                             "an application version requires a publisher and resource path",
                         ));
                     }
-                    let identity: pathlink::Link =
-                        child_path.to_string().parse().map_err(|error| {
-                            TCError::bad_request(format!("invalid application identity: {error}"))
-                        })?;
+                    let identity = pathlink::Link::from(child_path);
                     crate::uri::validate_identity(&identity, root_name)?;
-                    let item = load_item(txn_id, child.clone()).await?;
+                    let item = load_item(txn_id, txfs::Dir::load(child).await?).await?;
                     DirEntry::Item(Cluster::new(
                         identity.path().clone(),
                         item,
@@ -66,7 +61,7 @@ where
                     DirEntry::Dir(
                         Self::load(
                             txn_id,
-                            child.clone(),
+                            txfs::Dir::load(child).await?,
                             child_path,
                             root_name,
                             Arc::clone(&protocol),
@@ -437,7 +432,7 @@ where
                     .create_dir(txn.id(), name.clone())
                     .await
                     .map_err(TCError::from)?;
-                let item = create(storage).await?;
+                let item = create(txfs::Dir::load(storage).await?).await?;
                 let path = self.path().clone().append(name.clone());
                 let replicas = self
                     .replica_snapshot(txn.id())
@@ -485,7 +480,7 @@ where
                         .map(|replica| (replica.endpoint.clone(), replica));
                     let child = Cluster::with_replicas(
                         child_path,
-                        Dir::empty(storage),
+                        Dir::empty(txfs::Dir::load(storage).await?),
                         Arc::clone(&self.protocol),
                         Arc::clone(&self.gateway),
                         replicas,
@@ -579,10 +574,7 @@ where
     T: Clone + Send + Sync + Transact + 'static,
 {
     async fn commit(&self, txn_id: TxnId) -> TCResult<()> {
-        self.storage
-            .commit(txn_id, false)
-            .await
-            .map_err(TCError::from)?;
+        self.storage.commit(txn_id).await.map_err(TCError::from)?;
         let (members, _) = self.members.read_and_commit(txn_id).await;
         for member in members.values() {
             member.commit(txn_id).await?;
@@ -592,7 +584,7 @@ where
 
     async fn rollback(&self, txn_id: &TxnId) -> TCResult<()> {
         self.storage
-            .rollback(*txn_id, false)
+            .rollback(*txn_id)
             .await
             .map_err(TCError::from)?;
         let (members, _) = self.members.read_and_rollback(*txn_id).await;

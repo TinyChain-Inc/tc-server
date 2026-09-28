@@ -93,12 +93,13 @@ provide additional, non-normative integration context.
   replication, and lifecycle.
 - Committed layouts are strict: Library has `manifest.json` and optional
   `module.wasm`; Class has only `manifest.json`. Service owns its manifest and
-  delegates native member storage through `txfs::Dir::native`. Unsupported or
+  delegates native member storage through ordinary directory handles. Unsupported or
   ambiguous layouts fail without mutation.
 - Every recursive directory owns a delegated `txfs::Dir`, including its typed
   manifest and optional module handles. Concrete resources retain decoded
-  definitions and runtime state. Recursive `txfs` lifecycle publishes committed
-  versions and discards abandoned versions. Bootstrap reads them through one
+  definitions and runtime state. `txfs` manages immediate files and membership;
+  recursive application owners explicitly load and delegate child lifecycle.
+  Bootstrap reads files through one
   ordinary `TxnServer`-allocated transaction. Application claims do not allocate
   collection workspaces.
 - `HostStorage` may create a root immediately before its first `freqfs::Cache`

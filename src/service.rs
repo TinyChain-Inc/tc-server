@@ -19,6 +19,7 @@ use tc_value::Value;
 use crate::storage::ApplicationBlock;
 
 const MANIFEST: &str = "manifest.json";
+const MEMBERS: &str = ".native";
 
 pub(crate) struct Root<'a>(pub(crate) &'a crate::cluster::Cluster<crate::cluster::Dir<Service>>);
 
@@ -81,8 +82,8 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
 
 /// An attribute of one Service version, as in v1.
 #[derive(Clone)]
-enum Attr {
-    Chain(tc_chain::SyncChain<crate::TxnHandle, ApplicationBlock>),
+enum Attr<C = tc_chain::SyncChain<crate::TxnHandle, ApplicationBlock>> {
+    Chain(C),
     Scalar(Scalar),
 }
 
@@ -113,38 +114,44 @@ impl Service {
         capacity: usize,
     ) -> TCResult<Self> {
         let proto = validate(&identity, &definition)?;
-        let scope = Arc::new(crate::txn::DependencyScope::new(
-            identity.clone(),
-            crate::ir::application_requirements(proto.values()),
-        ));
         let mut attrs = Map::new();
         let mut native = None;
-        for (name, scalar) in proto {
-            let attr = if let Some(schema) = collection_schema(&scalar)? {
-                let native = match &native {
-                    Some(native) => freqfs::DirLock::clone(native),
-                    None => native.insert(storage.create_native().await?).clone(),
-                };
-                let member = native.write().await.create_dir(name.to_string())?;
-                let (subject, wal, values) = {
-                    let mut member = member.write().await;
-                    (
-                        member.create_dir("subject".into())?,
-                        member.create_dir("wal".into())?,
-                        member.create_dir("values".into())?,
+        for (name, attr) in proto {
+            let attr = match attr {
+                Attr::Chain(schema) => {
+                    let native = match &native {
+                        Some(native) => freqfs::DirLock::clone(native),
+                        None => native
+                            .insert(
+                                storage
+                                    .create_dir(
+                                        txn_id,
+                                        MEMBERS.parse().expect("member directory name"),
+                                    )
+                                    .await?,
+                            )
+                            .clone(),
+                    };
+                    let member = native.write().await.create_dir(name.to_string())?;
+                    let (subject, wal, values) = {
+                        let mut member = member.write().await;
+                        (
+                            member.create_dir("subject".into())?,
+                            member.create_dir("wal".into())?,
+                            member.create_dir("values".into())?,
+                        )
+                    };
+                    let subject = Collection::create(subject, schema)?;
+                    let chain = tc_chain::SyncChain::create(
+                        subject,
+                        wal,
+                        values,
+                        tc_chain::TxnTaskQueue::new(capacity),
                     )
-                };
-                let subject = Collection::create(subject, schema)?;
-                let chain = tc_chain::SyncChain::create(
-                    subject,
-                    wal,
-                    values,
-                    tc_chain::TxnTaskQueue::new(capacity),
-                )
-                .await?;
-                Attr::Chain(chain)
-            } else {
-                Attr::Scalar(scalar)
+                    .await?;
+                    Attr::Chain(chain)
+                }
+                Attr::Scalar(scalar) => Attr::Scalar(scalar),
             };
             attrs.insert(name, attr);
         }
@@ -155,13 +162,7 @@ impl Service {
                 ApplicationBlock::Manifest(identity.clone(), definition.clone()),
             )
             .await?;
-        Ok(Self {
-            storage,
-            identity,
-            definition,
-            attrs,
-            scope,
-        })
+        Ok(Self::new(storage, identity, definition, attrs))
     }
 
     /// Open native members without replay; the complete unpublished kernel supplies
@@ -171,17 +172,22 @@ impl Service {
         storage: txfs::Dir<TxnId, ApplicationBlock>,
         capacity: usize,
     ) -> TCResult<Self> {
-        let (identity, definition) = {
-            let mut entries = storage.iter(txn_id).await?;
-            let (name, entry) = entries
-                .next()
-                .ok_or_else(|| TCError::bad_request("Service manifest is missing"))?;
-            if entries.next().is_some() || name.as_str() != MANIFEST {
-                return Err(TCError::bad_request("unsupported Service layout"));
+        let (manifest, native) = {
+            let mut manifest = None;
+            let mut native = None;
+            for (name, entry) in storage.iter(txn_id).await? {
+                match (name.as_str(), &*entry) {
+                    (MANIFEST, txfs::DirEntry::File(file)) => manifest = Some(file.clone()),
+                    (MEMBERS, txfs::DirEntry::Dir(dir)) => native = Some(dir.clone()),
+                    _ => return Err(TCError::bad_request("unsupported Service layout")),
+                }
             }
-            let txfs::DirEntry::File(manifest) = &*entry else {
-                return Err(TCError::bad_request("unsupported Service layout"));
-            };
+            (
+                manifest.ok_or_else(|| TCError::bad_request("Service manifest is missing"))?,
+                native,
+            )
+        };
+        let (identity, definition) = {
             let block = manifest.read::<ApplicationBlock>(txn_id).await?;
             let ApplicationBlock::Manifest(identity, definition) = &*block else {
                 return Err(TCError::bad_request("unsupported Service manifest"));
@@ -189,43 +195,39 @@ impl Service {
             (identity.clone(), definition.clone())
         };
         let proto = validate(&identity, &definition)?;
-        let scope = Arc::new(crate::txn::DependencyScope::new(
-            identity.clone(),
-            crate::ir::application_requirements(proto.values()),
-        ));
-        let native = storage.native().await?;
         let mut attrs = Map::new();
-        for (name, scalar) in proto {
-            let attr = if let Some(schema) = collection_schema(&scalar)? {
-                let native = native
-                    .as_ref()
-                    .ok_or_else(|| TCError::bad_request("missing Service native storage"))?;
-                let member = required_dir(native, name.as_str()).await?;
-                if member
-                    .read()
-                    .await
-                    .names()
-                    .any(|name| !matches!(name.as_str(), "subject" | "wal" | "values"))
-                {
-                    return Err(TCError::bad_request("unsupported Chain member layout"));
+        for (name, attr) in proto {
+            let attr = match attr {
+                Attr::Chain(schema) => {
+                    let native = native
+                        .as_ref()
+                        .ok_or_else(|| TCError::bad_request("missing Service native storage"))?;
+                    let member = required_dir(native, name.as_str()).await?;
+                    if member
+                        .read()
+                        .await
+                        .names()
+                        .any(|name| !matches!(name.as_str(), "subject" | "wal" | "values"))
+                    {
+                        return Err(TCError::bad_request("unsupported Chain member layout"));
+                    }
+                    let wal = required_dir(&member, "wal").await?;
+                    // Empty capture stores have no files and freqfs does not persist
+                    // empty directories. Every referenced capture is strictly loaded by Chain.
+                    let values = member.write().await.get_or_create_dir("values".into())?;
+                    let chain = tc_chain::SyncChain::open(
+                        || async {
+                            let subject = required_dir(&member, "subject").await?;
+                            Collection::load(subject, schema).await
+                        },
+                        wal,
+                        values,
+                        tc_chain::TxnTaskQueue::new(capacity),
+                    )
+                    .await?;
+                    Attr::Chain(chain)
                 }
-                let wal = required_dir(&member, "wal").await?;
-                // Empty capture stores have no files and freqfs does not persist
-                // empty directories. Every referenced capture is strictly loaded by Chain.
-                let values = member.write().await.get_or_create_dir("values".into())?;
-                let chain = tc_chain::SyncChain::open(
-                    || async {
-                        let subject = required_dir(&member, "subject").await?;
-                        Collection::load(subject, schema).await
-                    },
-                    wal,
-                    values,
-                    tc_chain::TxnTaskQueue::new(capacity),
-                )
-                .await?;
-                Attr::Chain(chain)
-            } else {
-                Attr::Scalar(scalar)
+                Attr::Scalar(scalar) => Attr::Scalar(scalar),
             };
             attrs.insert(name, attr);
         }
@@ -238,13 +240,31 @@ impl Service {
                 return Err(TCError::bad_request("unexpected Service native member"));
             }
         }
-        Ok(Self {
+        Ok(Self::new(storage, identity, definition, attrs))
+    }
+
+    fn new(
+        storage: txfs::Dir<TxnId, ApplicationBlock>,
+        identity: Link,
+        definition: Scalar,
+        attrs: Map<Attr>,
+    ) -> Self {
+        let requirements =
+            crate::ir::application_requirements(attrs.values().filter_map(|attr| match attr {
+                Attr::Scalar(scalar) => Some(scalar),
+                Attr::Chain(_) => None,
+            }));
+        let scope = Arc::new(crate::txn::DependencyScope::new(
+            identity.clone(),
+            requirements,
+        ));
+        Self {
             storage,
             identity,
             definition,
             attrs,
             scope,
-        })
+        }
     }
 
     pub(crate) async fn recover(
@@ -322,7 +342,7 @@ impl Transact for Service {
                 chain.commit(txn_id).await?;
             }
         }
-        self.storage.commit(txn_id, true).await.map_err(Into::into)
+        self.storage.commit(txn_id).await.map_err(Into::into)
     }
 
     async fn rollback(&self, txn_id: &TxnId) -> TCResult<()> {
@@ -331,10 +351,7 @@ impl Transact for Service {
                 chain.rollback(txn_id).await?;
             }
         }
-        self.storage
-            .rollback(*txn_id, true)
-            .await
-            .map_err(Into::into)
+        self.storage.rollback(*txn_id).await.map_err(Into::into)
     }
 
     async fn finalize(&self, txn_id: &TxnId) -> TCResult<()> {
@@ -427,7 +444,7 @@ impl Route<crate::State> for Service {
                     };
                     crate::ir::member(map, suffix)?
                 };
-                Some(crate::ir::route_scalar(self.as_state(), scalar))
+                Some(tc_state::route_scalar(scalar, || self.as_state()))
             }
         }
     }
@@ -479,7 +496,7 @@ fn collection_schema(scalar: &Scalar) -> TCResult<Option<CollectionSchema>> {
     .map(Some)
 }
 
-fn validate(identity: &Link, definition: &Scalar) -> TCResult<Map<Scalar>> {
+fn validate(identity: &Link, definition: &Scalar) -> TCResult<Map<Attr<CollectionSchema>>> {
     crate::uri::validate_identity(identity, "service")?;
     let Scalar::Map(proto) = definition else {
         return Err(TCError::bad_request(
@@ -493,7 +510,7 @@ fn validate(identity: &Link, definition: &Scalar) -> TCResult<Map<Scalar>> {
                 "replicas is a reserved Service member",
             ));
         }
-        let scalar = match scalar.clone() {
+        let attr = match scalar.clone() {
             Scalar::Op(op) => {
                 op.validate()?;
                 let op = if matches!(op, OpDef::Put(_) | OpDef::Delete(_)) {
@@ -514,14 +531,14 @@ fn validate(identity: &Link, definition: &Scalar) -> TCResult<Map<Scalar>> {
                 } else {
                     op.dereference_self(identity)
                 };
-                Scalar::Op(op)
+                Attr::Scalar(Scalar::Op(op))
             }
-            scalar => {
-                collection_schema(&scalar)?;
-                scalar
-            }
+            scalar => match collection_schema(&scalar)? {
+                Some(schema) => Attr::Chain(schema),
+                None => Attr::Scalar(scalar),
+            },
         };
-        attrs.insert(name.clone(), scalar);
+        attrs.insert(name.clone(), attr);
     }
     Ok(attrs)
 }

@@ -300,9 +300,6 @@ impl Library {
         txn_id: TxnId,
         storage: txfs::Dir<TxnId, ApplicationBlock>,
     ) -> TCResult<Self> {
-        if storage.native().await?.is_some() {
-            return Err(TCError::bad_request("unsupported Library layout"));
-        }
         let manifest_name: tc_ir::Id = MANIFEST.parse().expect("manifest file name");
         let module_name: tc_ir::Id = MODULE.parse().expect("module file name");
         let mut manifest = None;
@@ -406,17 +403,13 @@ impl Library {
 
 impl Transact for Library {
     async fn commit(&self, txn_id: TxnId) -> TCResult<()> {
-        self.storage
-            .commit(txn_id, true)
-            .await
-            .map_err(TCError::from)
+        self.storage.commit(txn_id).await.map_err(TCError::from)
     }
+
     async fn rollback(&self, txn_id: &TxnId) -> TCResult<()> {
-        self.storage
-            .rollback(*txn_id, true)
-            .await
-            .map_err(TCError::from)
+        self.storage.rollback(*txn_id).await.map_err(TCError::from)
     }
+
     async fn finalize(&self, txn_id: &TxnId) -> TCResult<()> {
         self.storage.finalize(*txn_id).await.map_err(TCError::from)
     }

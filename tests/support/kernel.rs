@@ -49,6 +49,14 @@ async fn execute(
 async fn bind(kernel: &Kernel) -> crate::TxnHandle {
     kernel.test_txn().await
 }
+
+async fn service_txn(kernel: &Kernel, identity: &pathlink::Link) -> crate::TxnHandle {
+    bind(kernel).await.with_claims(vec![crate::Claim::new(
+        identity.clone(),
+        umask::Mode::all(),
+    )])
+}
+
 async fn complete(kernel: &Kernel, txn: crate::TxnHandle, outcome: crate::txn::TransactionOutcome) {
     kernel
         .coordinate(&txn, outcome, false)
@@ -72,10 +80,7 @@ fn service_snapshot_is_transaction_bound_and_failed_sync_publishes_no_membership
         let target = setup_with_ttl("snapshot-target", std::time::Duration::from_secs(60)).await;
         let identity: pathlink::Link = "/service/test/native/1.0.0".parse().unwrap();
         for kernel in [&source, &target] {
-            let txn = bind(kernel).await.with_claims(vec![crate::Claim::new(
-                identity.clone(),
-                umask::Mode::all(),
-            )]);
+            let txn = service_txn(kernel, &identity).await;
             stage_service(kernel, &txn, identity.clone(), executable_service(true))
                 .await
                 .finish_success()
@@ -88,10 +93,7 @@ fn service_snapshot_is_transaction_bound_and_failed_sync_publishes_no_membership
                 tc_value::Value::Tuple(vec![n]).into(),
             ])
         };
-        let write = bind(&source).await.with_claims(vec![crate::Claim::new(
-            identity.clone(),
-            umask::Mode::all(),
-        )]);
+        let write = service_txn(&source, &identity).await;
         execute(
             &source,
             Method::Put,
@@ -169,10 +171,7 @@ fn service_snapshot_is_transaction_bound_and_failed_sync_publishes_no_membership
             .bootstrap_resource(&endpoint, &identity, &replica)
             .await
             .unwrap();
-        let write = bind(&source).await.with_claims(vec![crate::Claim::new(
-            identity.clone(),
-            umask::Mode::all(),
-        )]);
+        let write = service_txn(&source, &identity).await;
         // A later transaction may change the source, but the older snapshot and
         // hash still describe the same source transaction.
         execute(
@@ -235,10 +234,7 @@ fn executable_services_keep_direct_and_composed_writes_in_the_chain() {
                 .await
                 .unwrap();
             let identity: pathlink::Link = "/service/test/native/1.0.0".parse().unwrap();
-            let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
-                identity.clone(),
-                umask::Mode::all(),
-            )]);
+            let txn = service_txn(&kernel, &identity).await;
             stage_service(&kernel, &txn, identity.clone(), executable_service(table))
                 .await
                 .finish_success()
@@ -257,10 +253,7 @@ fn executable_services_keep_direct_and_composed_writes_in_the_chain() {
                     tc_value::Value::Tuple(vec![tc_value::Value::from(n)]).into(),
                 ])
             };
-            let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
-                identity.clone(),
-                umask::Mode::all(),
-            )]);
+            let txn = service_txn(&kernel, &identity).await;
             execute(
                 &kernel,
                 Method::Put,
@@ -302,10 +295,7 @@ fn executable_services_keep_direct_and_composed_writes_in_the_chain() {
                     ),
                 ),
             ] {
-                let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
-                    identity.clone(),
-                    umask::Mode::all(),
-                )]);
+                let txn = service_txn(&kernel, &identity).await;
                 execute(
                     &kernel,
                     method,
@@ -329,10 +319,7 @@ fn executable_services_keep_direct_and_composed_writes_in_the_chain() {
                     .values()
                     .all(|batch| batch.as_array().unwrap().len() == 1)
             );
-            let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
-                identity.clone(),
-                umask::Mode::all(),
-            )]);
+            let txn = service_txn(&kernel, &identity).await;
             execute(
                 &kernel,
                 Method::Put,
@@ -388,19 +375,13 @@ fn service_recovery_preserves_expired_original_ids_and_rejects_materialization_i
             .await
             .unwrap();
         let identity: pathlink::Link = "/service/test/native/1.0.0".parse().unwrap();
-        let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
-            identity.clone(),
-            umask::Mode::all(),
-        )]);
+        let txn = service_txn(&kernel, &identity).await;
         stage_service(&kernel, &txn, identity.clone(), executable_service(true))
             .await
             .finish_success()
             .await
             .unwrap();
-        let txn = bind(&kernel).await.with_claims(vec![crate::Claim::new(
-            identity.clone(),
-            umask::Mode::all(),
-        )]);
+        let txn = service_txn(&kernel, &identity).await;
         execute(
             &kernel,
             Method::Put,

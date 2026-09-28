@@ -61,9 +61,7 @@ fn populated_service_join_replicates_methods_and_recovers_both_hosts() {
                 .await
                 .unwrap();
             let response = put(seed_addr, "service", &bearer, encoded).await;
-            let status = response.status();
-            let body = hyper::body::to_bytes(response).await.unwrap();
-            assert!(status.is_success(), "{}", String::from_utf8_lossy(&body));
+            assert_success(response).await;
             let key = if table { "[1]" } else { "null" };
             let response = put(
                 seed_addr,
@@ -72,9 +70,7 @@ fn populated_service_join_replicates_methods_and_recovers_both_hosts() {
                 format!("[{key},[1]]"),
             )
             .await;
-            let status = response.status();
-            let body = hyper::body::to_bytes(response).await.unwrap();
-            assert!(status.is_success(), "{}", String::from_utf8_lossy(&body));
+            assert_success(response).await;
         }
         let (joining_task, joining_shutdown, joining_root, joining_kernel) =
             start(joining, joining_listener, keyring).await;
@@ -106,9 +102,7 @@ fn populated_service_join_replicates_methods_and_recovers_both_hosts() {
                 format!("[{key},[2]]"),
             )
             .await;
-            let status = response.status();
-            let body = hyper::body::to_bytes(response).await.unwrap();
-            assert!(status.is_success(), "{}", String::from_utf8_lossy(&body));
+            assert_success(response).await;
             let key = if table { "[3]" } else { "null" };
             let response = Client::new()
                 .request(
@@ -122,13 +116,7 @@ fn populated_service_join_replicates_methods_and_recovers_both_hosts() {
                 )
                 .await
                 .unwrap();
-            let status = response.status();
-            let body = hyper::body::to_bytes(response).await.unwrap();
-            assert!(
-                status.is_success(),
-                "{status}: {}",
-                String::from_utf8_lossy(&body)
-            );
+            assert_success(response).await;
             for addr in [seed_addr, joining_addr] {
                 assert_service_count(addr, &identity, 3).await;
             }
@@ -164,6 +152,17 @@ fn populated_service_join_replicates_methods_and_recovers_both_hosts() {
             std::fs::remove_dir_all(root).unwrap();
         });
     }
+}
+
+async fn assert_success(response: hyper::Response<Body>) {
+    let status = response.status();
+    // Always complete response projection before starting the next transaction.
+    let body = hyper::body::to_bytes(response).await.unwrap();
+    assert!(
+        status.is_success(),
+        "{status}: {}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 async fn assert_service_count(address: SocketAddr, identity: &Link, count: usize) {

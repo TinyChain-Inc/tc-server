@@ -15,10 +15,12 @@ transaction-consistent Chain hashes. Cache settings and physical filenames are
 not application identity.
 
 A Chain member retains its owner as `State::Chain`. Routing selects its native
-handler once and invokes the selected closure. Scalar methods use the shared
-`BoundMethod` and executor with the Service's dependency scope, absolute deadline,
-and operation budget. Collection views retain their existing limitation: an
-escaped mutable native collection handle is outside Chain interception.
+handler once and invokes the selected closure. Scalar attributes delegate handler
+selection to `tc-state`; only method binding constructs the native `$self` map.
+Methods use the shared `BoundMethod` and executor with the Service's dependency
+scope, absolute deadline, and operation budget. Collection views retain their
+existing limitation: an escaped mutable native collection handle is outside Chain
+interception.
 
 The exact Service Cluster replicates PUT/DELETE before local execution. Replicated
 methods bind their own member writes to native `$self` and must not directly write
@@ -28,8 +30,12 @@ PUT/DELETE boundary. Recursive expression binding belongs to `tc-ir`, not Servic
 
 ## Persistence and recovery
 
-The transactional application directory owns `manifest.json` and membership. Its
-delegated `.native` subtree belongs to Service members:
+Creation and loading validate the complete definition before constructing members.
+The prepared attributes carry native collection schemas into allocation; the
+original immutable definition remains the installation and discovery value.
+
+The transactional application directory owns `manifest.json` and immediate
+membership. Service gives its ordinary `.native` child to native member storage:
 
 ```text
 .native/<attribute>/subject/                 canonical collection
@@ -37,7 +43,10 @@ delegated `.native` subtree belongs to Service members:
 .native/<attribute>/values/                  captured collection arguments
 ```
 
-`txfs` does not interpret, version, or recursively synchronize this subtree.
+`txfs` returns native handles for all child directories and does not interpret,
+version, or recursively synchronize their contents. `.native` is a Service layout
+name, not a filesystem exception. Application directories explicitly load their
+children as transactional directories; Service delegates its members to Chain.
 The application file composition delegates collection and Chain codecs to their
 owners. Bootstrap still owns separate application, control, and workspace caches.
 The host delegates its configured operation capacity to each Chain queue.
