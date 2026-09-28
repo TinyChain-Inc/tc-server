@@ -60,6 +60,16 @@ fn populated_service_join_replicates_methods_and_recovers_both_hosts() {
                 })
                 .await
                 .unwrap();
+            if !table {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(include_str!(
+                        "../examples/service.json"
+                    ))
+                    .unwrap()
+                );
+            }
+
             let response = put(seed_addr, "service", &bearer, encoded).await;
             assert_success(response).await;
             let key = if table { "[1]" } else { "null" };
