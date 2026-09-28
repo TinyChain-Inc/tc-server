@@ -1,0 +1,25 @@
+{
+  "/service/example-devco/btree/1.0.0": {
+    "label": "native",
+    "data": {
+      "/state/chain/sync": [
+        {"/state/collection/btree": [[["key", "/state/scalar/value/number"]]]}
+      ]
+    },
+    "count": {
+      "/state/scalar/op/get": ["key", [
+        ["result", {"$self/data/count": [null]}]
+      ]]
+    },
+    "insert": {
+      "/state/scalar/op/put": ["key", "value", [
+        ["result", {"$self/data/insert": [{"$key": []}, {"$value": []}]}]
+      ]]
+    },
+    "append": {
+      "/state/scalar/op/post": [
+        ["result", {"$self/data/insert": [{"$key": []}, {"$value": []}]}]
+      ]
+    }
+  }
+}

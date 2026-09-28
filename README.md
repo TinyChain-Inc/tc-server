@@ -35,6 +35,8 @@ owner or generic application payload.
   different content at the same identity conflicts.
 - Services execute scalar methods and own SyncChain-backed BTree/Table members;
   see the [Service contract](SERVICE_CONTRACT.md) for recovery and healthy joins.
+  The [Service example](examples/service.md) covers installation, method calls,
+  mutation, and restart using a canonical definition reusable by client authors.
 
 The identity maps directly beneath `data_dir`; transactional versions are owned
 by the recursive `txfs` directory. The workspace contains host-control and
