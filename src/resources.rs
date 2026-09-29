@@ -166,11 +166,13 @@ pub struct HostResources {
 }
 
 #[derive(Clone)]
+#[cfg(any(feature = "http-client", feature = "http-server"))]
 pub(crate) struct ApplicationAdmission {
     resources: HostResources,
     deadline: Deadline,
 }
 
+#[cfg(any(feature = "http-client", feature = "http-server"))]
 impl ApplicationAdmission {
     pub(crate) async fn acquire(
         &self,

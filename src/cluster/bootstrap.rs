@@ -88,11 +88,10 @@ impl<T: DirItem> Cluster<Dir<T>> {
             .put(
                 &session.replica().endpoint,
                 session.token(),
-                txn.id(),
+                &txn,
                 &replicas,
                 Scalar::Value(tc_value::Value::String(identity.endpoint.clone())),
                 replica_put_state(identity, session.state_hash().to_string()),
-                txn.deadline(),
             )
             .await?;
         kernel

@@ -67,18 +67,13 @@ pub(crate) async fn forward_put_to_peers(
         .raw_token()
         .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?
         .to_string();
-    let txn_id = txn.id();
 
     fanout_attempt(peers, |peer| {
         let token = token.clone();
         let target = target.clone();
         let key = key.clone();
         let value = value.clone();
-        async move {
-            gateway
-                .put(&peer, &token, txn_id, &target, key, value, txn.deadline())
-                .await
-        }
+        async move { gateway.put(&peer, &token, txn, &target, key, value).await }
     })
     .await
 }
@@ -94,16 +89,11 @@ pub(crate) async fn forward_delete_to_peers(
         .raw_token()
         .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?
         .to_string();
-    let txn_id = txn.id();
     fanout_attempt(peers, |peer| {
         let token = token.clone();
         let target = target.clone();
         let key = key.clone();
-        async move {
-            gateway
-                .delete(&peer, &token, txn_id, &target, key, txn.deadline())
-                .await
-        }
+        async move { gateway.delete(&peer, &token, txn, &target, key).await }
     })
     .await
 }
@@ -119,13 +109,12 @@ pub(crate) async fn forward_resource_decision(
         .raw_token()
         .ok_or_else(|| tc_error::TCError::unauthorized("missing bearer token"))?
         .to_string();
-    let txn_id = txn.id();
     let result = fanout_attempt(peers, |peer| {
         let token = token.clone();
         let resource = resource.clone();
         async move {
             gateway
-                .decide_resource(&peer, &token, txn_id, &resource, commit, txn.deadline())
+                .decide_resource(&peer, &token, txn, &resource, commit)
                 .await
         }
     })
@@ -156,7 +145,7 @@ impl Fanout {
         {
             return Err(error.expect("checked conflict"));
         }
-        if delivered.len() + 1 <= replica_count / 2 {
+        if delivered.len() < replica_count / 2 {
             return Err(error.unwrap_or_else(|| {
                 TCError::bad_gateway("replica write lost its strict majority")
             }));

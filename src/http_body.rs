@@ -1,12 +1,11 @@
 use std::{
-    future::Future,
     io,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, future::BoxFuture, stream};
 use hyper::body::HttpBody;
 use tc_error::{Pressure, PressureReason, TCError, TCResult};
 use tokio::sync::OwnedSemaphorePermit;
@@ -39,7 +38,7 @@ pub(crate) struct BoundedBody {
     limit: usize,
     admission: Option<ApplicationAdmission>,
     pub(crate) permit: Option<OwnedSemaphorePermit>,
-    pending: Option<Pin<Box<dyn Future<Output = TCResult<(OwnedSemaphorePermit, Bytes)>> + Send>>>,
+    pending: Option<BoxFuture<'static, TCResult<(OwnedSemaphorePermit, Bytes)>>>,
     failure: Option<TCError>,
 }
 

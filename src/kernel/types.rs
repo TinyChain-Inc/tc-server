@@ -110,9 +110,14 @@ impl KernelRequestGuard {
     ///
     /// Dropping a guard never selects an outcome. The first owning Cluster remains
     /// responsible for deciding whether this successful request mutated anything.
+    /// Decision propagation and local commit inherit the original request deadline,
+    /// including any wait for Chain publication ownership.
     pub async fn finish_success(self) -> tc_error::TCResult<()> {
-        self.kernel
-            .coordinate(&self.txn, crate::txn::TransactionOutcome::Commit, true)
+        self.deadline()
+            .run(
+                self.kernel
+                    .coordinate(&self.txn, crate::txn::TransactionOutcome::Commit, true),
+            )
             .await
     }
 

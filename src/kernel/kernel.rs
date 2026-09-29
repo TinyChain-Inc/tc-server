@@ -39,16 +39,17 @@ pub(crate) struct KernelInner {
 }
 
 impl KernelInner {
-    async fn load(
-        txn_id: TxnId,
-        roots: crate::storage::ApplicationRoots,
-        protocol: crate::ProtocolAuthority,
-        replication: Arc<dyn crate::replication::ClusterGateway>,
-        rpc: Arc<dyn crate::gateway::RpcGateway>,
-        resources: crate::HostResources,
-        actors: crate::auth::KeyringActorResolver,
-        bootstrap: Arc<crate::replication::ReplicationIssuer>,
-    ) -> TCResult<Self> {
+    async fn load(txn_id: TxnId, services: HostServices) -> TCResult<Self> {
+        let HostServices {
+            application_roots: roots,
+            protocol,
+            replication,
+            rpc,
+            resources,
+            actors,
+            bootstrap,
+            ..
+        } = services;
         let protocol = Arc::new(protocol);
         let (class_root, library_root, service_root) = roots.into_parts();
         let path = |root: &str| std::iter::once(root.parse().expect("application root")).collect();
@@ -471,21 +472,9 @@ impl Kernel {
             services.resources.clone(),
             ttl,
         );
-        let txn_server = crate::txn::TxnServer::load(txn, services.verifier).await?;
+        let txn_server = crate::txn::TxnServer::load(txn, services.verifier.clone()).await?;
         let bootstrap_txn = txn_server.allocate().await?;
-        let inner = std::sync::Arc::new(
-            KernelInner::load(
-                bootstrap_txn,
-                services.application_roots,
-                services.protocol,
-                services.replication,
-                services.rpc,
-                services.resources,
-                services.actors,
-                services.bootstrap,
-            )
-            .await?,
-        );
+        let inner = std::sync::Arc::new(KernelInner::load(bootstrap_txn, services).await?);
         let kernel = Self {
             txn_server,
             inner,

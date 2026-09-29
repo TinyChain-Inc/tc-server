@@ -25,8 +25,10 @@ use trusted_installers::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse()?;
     let bind = config.bind_addr()?;
-    let mut limits = tinychain::HostLimits::default();
-    limits.transaction_ttl = Duration::from_secs(config.request_ttl_secs);
+    let mut limits = tinychain::HostLimits {
+        transaction_ttl: Duration::from_secs(config.request_ttl_secs),
+        ..tinychain::HostLimits::default()
+    };
     limits.ingress.request_body_bytes = config.max_request_bytes;
 
     let trusted_installers = load_trusted_installers(&config)?;
