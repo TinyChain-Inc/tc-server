@@ -27,12 +27,12 @@ pub(crate) fn protocol_snapshot(
         let claims = crate::auth::claims_from_wire(claims.clone());
         for claim in claims.iter().filter(|claim| claim.link == txn_link) {
             let principal = (host.to_string(), actor.to_string());
-            if claim.mask.has(umask::USER_EXEC) {
-                if snapshot.owner.replace(principal.clone()).is_some() {
-                    return Err(tc_error::TCError::bad_request(
-                        "token contains multiple transaction owners",
-                    ));
-                }
+            if claim.mask.has(umask::USER_EXEC)
+                && snapshot.owner.replace(principal.clone()).is_some()
+            {
+                return Err(tc_error::TCError::bad_request(
+                    "token contains multiple transaction owners",
+                ));
             }
             if claim.mask.has(umask::USER_WRITE) {
                 if snapshot.owner.as_ref() != Some(&principal) {

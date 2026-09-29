@@ -26,7 +26,7 @@ impl Compiler {
             config.consume_fuel(true);
             let engine = wasmtime::Engine::new(&config)
                 .map_err(|error| TCError::internal(format!("WASM engine error: {error}")))?;
-            return Ok(Self {
+            Ok(Self {
                 resources: resources.clone(),
                 engine: Arc::new(engine),
                 compilations: Arc::new(tokio::sync::Semaphore::new(limits.wasm_compilations)),
@@ -35,7 +35,7 @@ impl Compiler {
                     memory_bytes: limits.wasm_memory_bytes,
                     result_bytes: limits.wasm_result_bytes,
                 },
-            });
+            })
         }
         #[cfg(not(feature = "wasm"))]
         {

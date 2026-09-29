@@ -164,11 +164,10 @@ impl crate::replication::ClusterGateway for HttpGateway {
         &self,
         peer: &str,
         token: &str,
-        txn_id: TxnId,
+        txn: &crate::TxnHandle,
         target: &pathlink::Link,
         key: Scalar,
         value: State,
-        deadline: crate::Deadline,
     ) -> TCResult<()> {
         let (content_type, body) = if crate::uri::is_application_root(target) {
             encode_application_put(key, value).await?
@@ -181,15 +180,15 @@ impl crate::replication::ClusterGateway for HttpGateway {
         };
         send_peer_request(
             &self.client,
-            peer,
-            token,
-            txn_id,
-            &target.to_string(),
-            hyper::Method::PUT,
-            Some(content_type),
-            body,
+            build_http_request(
+                hyper::Method::PUT,
+                peer_txn_url(peer, &target.to_string(), txn.id())?,
+                Some(format!("Bearer {token}")),
+                Some(content_type),
+                body,
+            )?,
             false,
-            deadline,
+            txn.deadline(),
         )
         .await
     }
@@ -198,23 +197,22 @@ impl crate::replication::ClusterGateway for HttpGateway {
         &self,
         peer: &str,
         token: &str,
-        txn_id: TxnId,
+        txn: &crate::TxnHandle,
         target: &pathlink::Link,
         key: Scalar,
-        deadline: crate::Deadline,
     ) -> TCResult<()> {
         let body = crate::http_body::json_body(key);
         send_peer_request(
             &self.client,
-            peer,
-            token,
-            txn_id,
-            &target.to_string(),
-            hyper::Method::DELETE,
-            Some("application/json"),
-            body,
+            build_http_request(
+                hyper::Method::DELETE,
+                peer_txn_url(peer, &target.to_string(), txn.id())?,
+                Some(format!("Bearer {token}")),
+                Some("application/json"),
+                body,
+            )?,
             false,
-            deadline,
+            txn.deadline(),
         )
         .await
     }
@@ -223,26 +221,25 @@ impl crate::replication::ClusterGateway for HttpGateway {
         &self,
         peer: &str,
         token: &str,
-        txn_id: TxnId,
+        txn: &crate::TxnHandle,
         resource: &pathlink::PathBuf,
         commit: bool,
-        deadline: crate::Deadline,
     ) -> TCResult<()> {
         send_peer_request(
             &self.client,
-            peer,
-            token,
-            txn_id,
-            &resource.to_string(),
-            if commit {
-                hyper::Method::PUT
-            } else {
-                hyper::Method::DELETE
-            },
-            None,
-            hyper::Body::empty(),
+            build_http_request(
+                if commit {
+                    hyper::Method::PUT
+                } else {
+                    hyper::Method::DELETE
+                },
+                peer_txn_url(peer, &resource.to_string(), txn.id())?,
+                Some(format!("Bearer {token}")),
+                None,
+                hyper::Body::empty(),
+            )?,
             true,
-            deadline,
+            txn.deadline(),
         )
         .await
     }
@@ -250,27 +247,11 @@ impl crate::replication::ClusterGateway for HttpGateway {
 
 async fn send_peer_request(
     client: &hyper::Client<hyper::client::HttpConnector, hyper::Body>,
-    peer: &str,
-    token: &str,
-    txn_id: TxnId,
-    path: &str,
-    method: hyper::Method,
-    content_type: Option<&str>,
-    body: impl Into<hyper::Body>,
+    request: http::Request<hyper::Body>,
     require_empty: bool,
     deadline: crate::Deadline,
 ) -> TCResult<()> {
-    let uri = peer_txn_url(peer, path, txn_id)?;
-    let response = send_http(
-        client,
-        method,
-        uri,
-        Some(format!("Bearer {token}")),
-        content_type,
-        body,
-        deadline,
-    )
-    .await?;
+    let response = crate::outbound_http::send(client, request, deadline).await?;
     crate::outbound_http::consume(
         response,
         deadline,

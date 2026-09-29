@@ -72,7 +72,7 @@ impl TxnHandle {
             .as_ref()
             .and_then(|snapshot| snapshot.owner.as_ref())
             .is_some_and(|(host, actor)| {
-                host.as_str() == authority.host().to_string() && actor == authority.actor_id()
+                authority.host() == host.as_str() && actor == authority.actor_id()
             });
         let mut auth_context = context.cloned();
         if let Some(context) = auth_context.as_mut() {
@@ -267,6 +267,7 @@ impl TxnHandle {
         txn
     }
 
+    #[cfg(any(feature = "http-client", feature = "http-server", feature = "wasm"))]
     pub(crate) fn request_body_limit(&self) -> usize {
         self.server.resources().limits().ingress.request_body_bytes
     }

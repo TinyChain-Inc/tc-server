@@ -135,7 +135,7 @@ where
         let (host, actor) = txn
             .leader(&self.path)
             .ok_or_else(|| TCError::conflict("resource was not claimed"))?;
-        if host == self.protocol.host().to_string() && actor == self.protocol.actor_id() {
+        if *self.protocol.host() == host && actor == self.protocol.actor_id() {
             return Ok(());
         }
         self.replica_snapshot(txn.id())

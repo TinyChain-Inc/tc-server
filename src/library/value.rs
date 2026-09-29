@@ -183,7 +183,7 @@ enum LibraryRuntime {
     #[cfg(feature = "wasm")]
     Wasm {
         members: Map<Scalar>,
-        module: crate::wasm::WasmLibrary,
+        module: Arc<crate::wasm::WasmLibrary>,
     },
 }
 
@@ -290,7 +290,7 @@ impl Library {
             analysis.requirements,
             LibraryRuntime::Wasm {
                 members: analysis.members,
-                module: wasm,
+                module: Arc::new(wasm),
             },
         ))
     }
@@ -366,7 +366,7 @@ impl Library {
                         analysis.requirements,
                         LibraryRuntime::Wasm {
                             members: analysis.members,
-                            module: wasm,
+                            module: Arc::new(wasm),
                         },
                     ))
                 }
@@ -441,7 +441,7 @@ impl Route<crate::State> for Library {
         #[cfg(feature = "wasm")]
         if let LibraryRuntime::Wasm { module, .. } = &self.runtime {
             return Some(Box::new(crate::wasm::WasmRoute::new(
-                module.clone(),
+                module.as_ref().clone(),
                 path.to_vec(),
             )));
         }
