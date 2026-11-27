@@ -1,10 +1,7 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use freqfs::DirLock;
-use get_size::GetSize;
 use pathlink::Link;
 use tc_error::{TCError, TCResult};
 use tc_ir::TxnId;
@@ -86,8 +83,9 @@ impl Workspace {
                 record
             }
             None => {
-                let actor = rjwt::Actor::new_falcon512(actor_id.to_string())
+                let actor = rjwt::Actor::new(actor_id.to_string(), rjwt::AlgKind::Falcon512)
                     .map_err(|err| TCError::internal(err.to_string()))?;
+
                 let record = AuthorityRecord {
                     actor_id: actor_id.clone(),
                     algorithm: rjwt::AlgKind::Falcon512,
@@ -104,6 +102,7 @@ impl Workspace {
                 record
             }
         };
+
         let signing_key = rjwt::SigningKey::from_bytes(record.algorithm, &record.signing_key)
             .map_err(|err| TCError::internal(err.to_string()))?;
         let replication_actor =
@@ -131,19 +130,12 @@ impl Workspace {
         write_record(&self.control, LAST_ALLOCATED, ControlFile::Frontier(txn_id)).await
     }
 
-    pub async fn transaction(
-        &self,
-        txn_id: TxnId,
-    ) -> TCResult<DirLock<crate::storage::ApplicationBlock>> {
-        child(self.transactions.clone(), txn_id.to_string()).await
-    }
-
-    pub async fn transaction_child(
+    pub(crate) async fn transaction_child(
         &self,
         txn_id: TxnId,
         path: &[String],
     ) -> TCResult<DirLock<crate::storage::ApplicationBlock>> {
-        let mut dir = self.transaction(txn_id).await?;
+        let mut dir = child(self.transactions.clone(), txn_id.to_string()).await?;
         for segment in path {
             dir = child(dir, segment.clone()).await?;
         }
@@ -169,7 +161,7 @@ impl Workspace {
         Ok(entries)
     }
 
-    pub fn unique_name(&self) -> String {
+    pub(crate) fn unique_name(&self) -> String {
         format!("tmp-{}", self.next_temp.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -198,25 +190,18 @@ impl Workspace {
         }
         txns.sync().await.map_err(map_io)
     }
-
-    #[cfg(test)]
-    pub(crate) async fn has_transaction(&self, txn_id: TxnId) -> TCResult<bool> {
-        let txns = self.transactions.read().await;
-        Ok(txns.get_dir(&txn_id.to_string()).is_some())
-    }
 }
 
 async fn write_record(dir: &DirLock<ControlFile>, name: &str, record: ControlFile) -> TCResult<()> {
-    let size = record.get_size();
     let existing = {
         let dir = dir.read().await;
         dir.get_file(name).cloned()
     };
     if let Some(file) = existing {
-        return file.replace_all(record, size).await.map_err(map_io);
+        return file.replace_all(record).await.map_err(map_io);
     } else {
         let mut dir = dir.write().await;
-        dir.create_file(name.to_string(), record, size)
+        dir.create_file(name.to_string(), record)
             .await
             .map_err(map_io)?;
     }
@@ -234,47 +219,15 @@ async fn child(
     Ok(child)
 }
 
-fn map_io(err: impl std::fmt::Display) -> TCError {
-    TCError::internal(err.to_string())
-}
-
 #[cfg(test)]
-mod tests {
-    fn txn_id() -> tc_ir::TxnId {
-        tc_ir::TxnId::from_parts(tc_ir::NetworkTime::from_nanos(1), 0).with_trace([1; 32])
-    }
+#[path = "../tests/support/workspace.rs"]
+mod tests;
 
-    fn workspace(name: &str) -> super::Workspace {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        crate::HostStorage::new(&crate::HostLimits::default().storage)
-            .workspace(std::env::temp_dir().join(format!("tc-workspace-{name}-{unique}")))
-            .expect("workspace")
-    }
-
-    #[tokio::test]
-    async fn transaction_workspace_ids_are_recovered_without_records() {
-        let workspace = workspace("transaction-id");
-        workspace
-            .transaction(txn_id())
-            .await
-            .expect("transaction dir");
-        assert_eq!(workspace.transaction_ids().await.expect("IDs"), [txn_id()]);
-    }
-
-    #[tokio::test]
-    async fn cleanup_removes_workspaces_through_the_frontier() {
-        let workspace = workspace("cleanup-through");
-        let newer =
-            tc_ir::TxnId::from_parts(tc_ir::NetworkTime::from_nanos(2), 0).with_trace([2; 32]);
-        workspace
-            .transaction(txn_id())
-            .await
-            .expect("old transaction");
-        workspace.transaction(newer).await.expect("new transaction");
-        workspace.remove_through(txn_id()).await.expect("cleanup");
-        assert_eq!(workspace.transaction_ids().await.expect("IDs"), [newer]);
+// Preserve host-control wire diagnostics while retaining native integrity provenance.
+fn map_io(error: std::io::Error) -> TCError {
+    if freqfs::IntegrityError::is_marked(&error) {
+        error.into()
+    } else {
+        TCError::internal(error)
     }
 }

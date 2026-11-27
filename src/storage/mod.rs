@@ -41,6 +41,9 @@ pub struct HostStorage {
 }
 
 impl HostStorage {
+    /// Construct native storage with positive file-handle limits within Tokio's
+    /// semaphore capacity. Callers must validate externally supplied limits before
+    /// this infallible bootstrap operation and provide an active Tokio runtime.
     pub fn new(limits: &crate::StorageLimits) -> Self {
         Self {
             control: Cache::new(
@@ -117,3 +120,6 @@ impl HostStorage {
         })
     }
 }
+
+#[cfg(test)]
+pub(crate) use file::tensor_fault;

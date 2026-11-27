@@ -1,36 +1,44 @@
 # tc-server invariants
 
-This file defines the repository-local host runtime rules. When this repository
-is checked out by the TinyChain superproject, the
-[workspace invariants](https://github.com/TinyChain-Inc/tcv2/blob/main/AGENTS.md)
-provide additional, non-normative integration context.
+This file defines the repository-local host runtime rules.
 
 ## Ownership
+
+The server selects and delivers transaction decisions; Chain owns durable history
+and recovery ordering; collections apply local transactional state transitions.
+Collection commit, rollback, reservations, visibility, and materialization remain
+local data-structure responsibilities. Lower layers return errors without selecting
+distributed decisions or terminating the host.
 
 - Bootstrap creates one complete `Kernel`, `TxnServer`, `HostServices`,
   `HostResources`, `HostStorage`, and protocol authority. There
   are no optional production owners, gateways, finalizers, or hidden defaults.
-- `HostServices`, `TxnHandle`, and `StateExecutor` are trusted in-process
+- `HostServices`, `TxnHandle`, `Gateway`, and `OpExecutor` are trusted in-process
   capabilities. Their authority-bearing state is privately constructed and
   exposed only through semantic operations. Crate visibility is not an
   ownership boundary: do not add generic `inner`, `server`, `resources`,
   signer, token, or application-root getters.
 - `HostStorage` creates one application-data cache, one host-control cache, and
   one collection-workspace cache. Application code receives delegated roots
-  and never constructs caches or filesystem paths. The superproject's
-  [storage document](https://github.com/TinyChain-Inc/tcv2/blob/main/docs/storage.md)
-  records the integrated layout.
+  and never constructs caches or filesystem paths.
 - Application roots are `Cluster<Dir<Library>>`, `Cluster<Dir<Class>>`, and
   `Cluster<Dir<Service>>`. The kernel selects a root once; recursive directories
   consume structure; the concrete application owns behavior and persistence.
 - The shared `Kernel` state owns those three roots directly. Do not introduce an `app` or
   `application` module, aggregate owner, generic payload, or facade: TinyChain
   has no fourth domain object above Library, Class, and Service.
-- `Cluster<T>` owns exact-resource claims, leadership, propagation, and direct
-  `Transact` delegation. It has no decision ledger, transaction registry,
+- `Cluster<T>` owns exact-resource claims, leadership, participation, propagation,
+  and direct `Transact` delegation. Participation retains active calls and attempted
+  dependencies until cutoff; it is not a decision ledger, recovery registry,
   reconciliation policy, or per-resource signing key.
+- Ordinary enrollment returns the resolved participation to the call owner.
+  Decisions validate their envelope before authenticating participation; directory
+  dispatch does not pre-enroll decision requests.
 - `TxnServer` owns allocation, verification, fixed expiry, the durable frontier,
   oldest-first cutoff scheduling, readiness, and workspace cleanup only.
+- `TxnHandle` implements Gateway resource access separately from OpExecutor
+  operation execution. Resource permissions remain with their owners; Gateway
+  write-scope checks do not replace authorization.
 - Graph scheduling, admission, deadlines, and `OpDef` execution remain here.
   IR values expose intrinsic dependency discovery; executor-local planning stays
   here. The executor is private host machinery, never a public execution API.
@@ -42,17 +50,20 @@ provide additional, non-normative integration context.
 
 - `Kernel::new` completes recovery validation and starts expiry before returning.
   Adapters receive the finished kernel.
-- `Kernel::begin_request` and `KernelRequestGuard` are the single bound request
+- `Kernel::begin_request` and `BoundRequest` are the single top-level admission
   path. HTTP and PyO3 do not bind transactions, route applications, select
-  outcomes, or stage resources independently.
+  outcomes, or stage resources independently. Delegated Gateway calls inherit
+  transaction authority and execution limits; same-host dependencies do not
+  construct another bound request or gain completion authority. Remote calls
+  enter the receiving host as participants.
 - `Kernel::begin_request` derives the host's absolute deadline. Callers may
-  cancel earlier but cannot extend execution beyond host policy. The guard's
-  transaction accessor is the deliberate trusted-native capability edge used
+  cancel earlier but cannot extend execution beyond host policy. The bound
+  request's transaction accessor is the deliberate trusted-native capability edge used
   by native response handles; decoded or foreign values never construct one.
-- `Cluster<Dir<T>>::lookup` claims every traversed directory and item before
-  reading transactional state. Directory membership determines the terminal
-  item; live routing never scans for a semantic-version boundary. Missing
-  nonempty suffixes return `NotFound`.
+- `Cluster<Dir<T>>::lookup` selects the owning resource through transactional
+  directory membership; traversal alone does not claim ancestor leadership.
+  The selected owner admits the call. Live routing never scans for a
+  semantic-version boundary. Missing nonempty suffixes return `NotFound`.
 - Ordinary operations invoke the selected native verb closure directly. A
   locked exact bodyless PUT or DELETE is interpreted by the resolved Cluster as
   commit or rollback. An
@@ -61,10 +72,12 @@ provide additional, non-normative integration context.
   network boundary; WASM encodes at the sandbox boundary; PyO3 projection lives
   only in `client/rust`.
 - HTTP owns parsing, bounded bodies, response streaming, and wire codecs. It has
-  no semantic fallback callback. Readiness, canonical target classification,
-  and semantic response kind belong to the kernel; adapters only project those
-  decisions into status, MIME, and encoding. Unknown kernel targets return
+  no semantic fallback callback. Readiness and canonical target classification belong to the kernel; adapters
+  project native State into their transport representation. Unknown kernel targets return
   `NotFound`.
+- The bound request selects the application media type and size limit and
+  delegates definition and State decoding to the native codecs. HTTP and PyO3
+  supply their bounded inputs and retain the request through projection.
 - HTTP pull-decodes application JSON directly into its canonical `(Link, Scalar)`
   definition. Admission is a request-local capacity lease, never a binary body
   carrier. Only raw WASM is materialized as bytes because those bytes are the
@@ -75,12 +88,13 @@ provide additional, non-normative integration context.
   contiguous buffer is permitted only for semantic bytes or an intrinsically
   contiguous AEAD/WASM call, and remains bounded and owner-local. Operator JSON
   configuration is not a TinyChain semantic wire type.
-- Decoded IR and WASM are untrusted. Every entry crosses a request guard and
-  inherits its absolute deadline, graph shape limits, shared operation budget,
-  and capacity permits. `TxnHandle` and `StateExecutor` are trusted host SPI;
-  decoded values cannot choose their declaring Class or widen a budget. A
-  `TxnHandle` carries this enforcement context but does not interpret an
-  `OpDef`; the private executor validates and interprets each definition once.
+- Decoded IR and WASM are untrusted. Top-level ingress crosses a bound request;
+  delegated execution inherits its absolute deadline, graph shape limits,
+  shared operation budget, and capacity permits. `TxnHandle`, `Gateway`, and
+  `OpExecutor` are trusted host SPI; decoded values cannot choose their declaring
+  Class or widen a budget. A `TxnHandle` carries this enforcement context but
+  does not interpret an `OpDef`; the private executor validates and interprets
+  each definition once.
 
 ## Applications and storage
 
@@ -123,44 +137,67 @@ provide additional, non-normative integration context.
 
 ## Transactions and replication
 
-- Failed, cancelled, timed-out, or unprojectable requests send no rollback. The
-  superproject's
-  [transaction document](https://github.com/TinyChain-Inc/tcv2/blob/main/docs/protocol/transactions.md)
-  describes the integrated protocol.
-- The first owning Cluster coordinates a successful mutation after the complete
-  request succeeds, including terminal viewing, encoding, streaming, or PyO3
-  materialization. Dropping a response guard sends no decision. The coordinator
-  is the first exact resource recorded after transaction ownership in signed
-  claim order; it is never stored separately or selected by path ordering. Each
-  exact leader propagates to replicas for its path and participants do not
-  forward.
-- Propagation is fail-fast and precedes local lifecycle application. Duplicate
-  delivery replays idempotent resource behavior; no outcome or retry ledger is
-  retained.
+- Ordinary owner PUT/POST/DELETE execution commits before returning its State
+  for projection. Returned execution errors roll back through the locally owned,
+  claimed coordinator. Participants, ownerless work, and locked decisions never
+  coordinate another decision. There is no successful-mutation flag.
+- GET execution and descendants are read-only, including forwarded POST work.
+  Reject actual PUT/DELETE effects before mutation; pure calculations and fresh
+  literal construction remain available.
+- The coordinator is the first selected resource after ownership in signed claim
+  order, never a mirrored or sorted path. Dependent calls branch authority and
+  retain attempted dependencies, including failed deliveries, at their owner.
+- Resource admission, enrollment, and sealing share one short mutex. A sealed
+  resource rejects late work; active calls make a decision return `Conflict`.
+  Tokens cover whole execution calls. An untouched replica may accept sealed
+  decision-only participation after verifying the exact signed leader against
+  its membership; this never admits application work. Keep participation until
+  cutoff, without storing outcomes or adding a transaction ledger.
+- Installation and exact deletion belong to the namespace root. Reserve
+  descendant admission before structural work; reject enlisted descendants or
+  affected replica identities that differ from the namespace's. Never remove
+  the coordinating owner or claim descendants merely for structural traversal.
+- Execute PUT/DELETE locally, then replicate successful work. Execute composed
+  POST once and propagate its dependent calls. A failed peer may be evicted only
+  while surviving replicas retain a strict majority.
+- The owner signs commit or rollback on its transaction lock. Decision branches
+  carry signed exact-resource ancestry and that outcome. Recipients authenticate
+  backedges against their retained leader; only the local leader skips them,
+  while replicas still apply. Reject contradictory authority or outcomes and
+  allow duplicate diamond delivery through idempotent lifecycle methods.
+  Leaders propagate decisions before local application; replicas do not forward.
+  Delivery is fail-fast, without an outcome or retry ledger.
+- Projection retains the request deadline, capacity, and shutdown ownership but
+  selects no deferred decision. Failure or abandonment cannot undo a completed
+  commit. Keep Chain's failed-task rejection. The request task retains admission
+  through cancellation rollback. Eligible cleanup receives a fresh bounded host
+  request deadline; it does not renew expiry or authorize new work. Cleanup failure
+  is fatal. Direct collection callers own rollback, quiescence, and disposal after
+  uncertain materialization.
+- Immutable result snapshots can survive commit after mutation quiescence.
+  Rollback, finalization, and expiry still require affected streams and guards
+  to be released; retaining a result does not extend transaction expiry.
 - Local cutoff finalization recursively visits application roots and sends no
-  RPC. A failure prevents frontier advancement and readiness until the same
-  cutoff succeeds.
-- Divergence evidence fails closed. Canonical selection, replay, and repair
-  belong to `tc-chain`, never bootstrap or HTTP replication.
-- Distributed protocol state belongs to the exact `Cluster` it describes.
-  `replicas` is the sole reserved Cluster child and uses ordinary GET, PUT, and
-  DELETE with the Cluster lifecycle. Configuration, Kubernetes DNS, and mDNS
-  provide bootstrap candidates only. Never add a global peer registry, a
-  join/action endpoint, gateway-selected membership, or adapter-local control
-  route.
-- Replicate work before local mutation. A resource may evict failed replicas
-  only while its surviving snapshot retains a strict majority; never turn
-  write-time eviction into post-decision repair or server-owned reconciliation.
-- Bootstrap traverses directory Clusters before terminal item Clusters and uses
-  a separate ordinary transaction for each exact membership change. Joining a
-  root alone is incorrect. Configured seeds gate readiness; discovery failure
-  must not be hidden behind a healthy Kubernetes readiness response.
+  RPC. Failure withdraws readiness and terminates the host; uncertain canonical
+  storage is never retried. Shutdown drains requests and joins an active finalizer
+  before dropping the runtime. Recovery evidence and selection belong to Chain.
+- Distributed protocol state belongs to its exact `Cluster`. `replicas` is its
+  sole reserved child and uses ordinary GET, PUT, and DELETE. Discovery provides
+  candidates only; add no global peer registry, join/action endpoint, or adapter
+  control route. Bootstrap joins each exact directory and item separately,
+  preserving the joining host's signed ownership while the seed adds leadership.
+  Validate returned authority before adoption; an owner on a joining replica
+  delegates its decision to the resource leader before local application.
+- The [Service contract](SERVICE_CONTRACT.md#source-and-adaptation)
+  documents deliberate differences from v1: read-only GET, returned-error
+  rollback, strict delivery, and fatal uncertain materialization.
 
 ## Features and verification
 
-- Supported features are `http-client`, `http-server`, `wasm`, and `mdns`.
-  Defaults enable both HTTP features and WASM. Features gate boundaries, not
-  application owners or transaction behavior.
+- Supported features are `http-client`, `http-server`, `http2`, `wasm`, and `mdns`.
+  Defaults enable both HTTP adapters, HTTP/2, and WASM. `http2` adds protocol
+  support only to enabled HTTP adapters; HTTP/1 remains available. Features gate
+  boundaries, not application owners or transaction behavior.
 - PyO3 is not a server feature. Build the extension from `client/rust`.
 - Run all targets/features, supported feature powersets, architecture checks,
   and relevant HTTP/WASM/Python/two-host acceptance after ownership changes.
@@ -169,3 +206,28 @@ provide additional, non-normative integration context.
 - Configure Wasmtime only in the bootstrap-owned compiler. Fuel, Store resource
   limits, compilation admission, blocking isolation, and checked ABI ranges are
   mandatory; JSON Library construction must not initialize Wasmtime.
+- Production Library compilation accepts binary WebAssembly only. WAT text is
+  converted explicitly in test fixtures. Keep Wasmtime's compiler, parallel
+  compilation, demangling, and address symbolization features enabled; optional
+  runtime facilities require an actual use before adding them.
+
+## Transport projection
+
+- Resources return native State; bound requests own execution and completion.
+  Adapters encode ordinary results without resource-specific response flags or
+  alternate serialization pipelines. Raw WASM is an upload representation only.
+- Share native view acquisition through `TxnHandle::view` and synchronous deadline
+  checks through `Deadline::check`. Adapters own encoding and foreign conversion;
+  derive a pending result's deadline from its bound request.
+- Preserve one absolute deadline and request ownership through terminal projection.
+  Projection does not defer or revise the completed execution decision. Native
+  handoff must not serialize values, and embedded callers explicitly drain their
+  kernel after consuming or dropping retained results.
+- Keep composed futures small: avoid nested inline collections and retain boxing
+  at measured stack boundaries. End-to-end transport regressions run on ordinary
+  worker stacks without inherited stack-size overrides.
+
+- Supported application builds abort on Rust panic, including detached tasks.
+  Panics do not run rollback or destructors; ordinary errors and cancellation keep
+  their existing cleanup policy. Validate panic policy with built artifacts, not
+  only the unwinding test harness. See `SERVICE_CONTRACT.md`.

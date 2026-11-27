@@ -1,13 +1,16 @@
+use std::future::Future;
 use std::net::TcpListener;
 use std::task::{Context, Poll};
 
-use futures::{TryStreamExt, future::BoxFuture};
+use futures::future::BoxFuture;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tower::Service;
 
-use super::parse::{decode_native_body, parse_bearer_token};
+use crate::{Kernel, Method};
+use super::parse::{decode_body, parse_bearer_token};
 use super::response::method_not_allowed;
 use super::{Request, Response};
-use crate::{Kernel, Method};
 
 pub struct HttpServer {
     pub(super) kernel: Kernel,
@@ -22,24 +25,63 @@ impl HttpServer {
         MakeKernelService::new(KernelService::new(self.kernel))
     }
 
+    /// Serve until failure or explicit kernel shutdown, then join host work.
     pub async fn serve_listener(self, listener: TcpListener) -> hyper::Result<()> {
-        hyper::Server::from_tcp(listener)?
-            .serve(self.into_service())
+        self.serve_listener_with_shutdown(listener, std::future::pending())
             .await
     }
 
+    /// Stop admission on the signal, drain transports, then join finalization.
+    /// Keep polling this future until it returns before dropping the runtime.
     pub async fn serve_listener_with_shutdown<F>(
         self,
         listener: TcpListener,
         shutdown: F,
     ) -> hyper::Result<()>
     where
-        F: std::future::Future<Output = ()> + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
-        hyper::Server::from_tcp(listener)?
-            .serve(self.into_service())
-            .with_graceful_shutdown(shutdown)
-            .await
+        let kernel = self.kernel.clone();
+        let transport = Transport::new();
+        let result = match hyper::Server::from_tcp(listener) {
+            Ok(server) => {
+                let stopping = kernel.clone();
+                let server = server
+                    .executor(transport.clone())
+                    .serve(self.into_service())
+                    .with_graceful_shutdown(async move {
+                        tokio::select! {
+                            _ = shutdown => {},
+                            _ = stopping.shutdown_started() => {},
+                        }
+
+                        stopping.begin_shutdown();
+                    });
+
+                tokio::pin!(server);
+                tokio::select! {
+                    result = &mut server => result,
+                    deadline = kernel.shutdown_started() => {
+                        // A backpressured socket may stop polling its response body.
+                        // By this deadline all admitted requests have expired; cancel
+                        // transport tasks, never a canonical finalization pass.
+                        tokio::time::timeout_at(deadline.instant(), &mut server)
+                            .await.unwrap_or(Ok(()))
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+
+        kernel.begin_shutdown();
+        transport.tasks.close();
+        // Listener failure also drains already accepted work before cancellation.
+        let deadline = kernel.shutdown_started().await;
+        let _ = tokio::time::timeout_at(deadline.instant(), transport.tasks.wait()).await;
+        transport.stop.cancel();
+        transport.tasks.wait().await;
+        kernel.shutdown().await;
+        result
     }
 }
 
@@ -81,31 +123,26 @@ impl Service<Request> for KernelService {
                 || path == crate::uri::HOST_PUBLIC_KEY
             {
                 let _request = match kernel.admit_host_request().await {
-                    Ok((_, permit)) => permit,
+                    Ok((_, permit, request)) => (permit, request),
                     Err(err) => return Ok(super::response::tc_error_response(err)),
                 };
-                if path == crate::uri::HOST_HEALTH {
-                    return Ok(match kernel.health(method) {
-                        Ok(health) => super::state_response(health),
-                        Err(error) => super::response::tc_error_response(error),
-                    });
-                }
-                if path == crate::uri::HOST_METRICS {
-                    return Ok(match kernel.metrics(method) {
-                        Ok(metrics) => super::state_response(metrics),
-                        Err(error) => super::response::tc_error_response(error),
-                    });
-                }
-                if path == crate::uri::HOST_PUBLIC_KEY {
-                    let actor = match super::host::public_key_actor(&req).await {
-                        Ok(actor) => actor,
-                        Err(response) => return Ok(*response),
-                    };
-                    return Ok(match kernel.public_key(method, &actor) {
-                        Ok(key) => super::state_response(key),
-                        Err(error) => super::response::tc_error_response(error),
-                    });
-                }
+
+                let state = match path.as_str() {
+                    crate::uri::HOST_HEALTH => kernel.health(method),
+                    crate::uri::HOST_METRICS => kernel.metrics(method),
+                    _ => {
+                        let actor = match super::host::public_key_actor(&req).await {
+                            Ok(actor) => actor,
+                            Err(response) => return Ok(*response),
+                        };
+
+                        kernel.public_key(method, &actor)
+                    }
+                };
+
+                return Ok(state
+                    .map(super::state_response)
+                    .unwrap_or_else(super::response::tc_error_response));
             }
 
             let bearer = parse_bearer_token(&req);
@@ -115,124 +152,22 @@ impl Service<Request> for KernelService {
                 .map(|path| path.as_str())
                 .unwrap_or(&path);
 
-            let guard = match deadline
-                .wait(kernel.begin_request(method, raw_path, body_is_none, bearer))
-                .await
-            {
-                Err(err) => return Ok(super::response::tc_error_response(err)),
-                Ok(Ok(guard)) => *guard,
-                Ok(Err(err)) => return Ok(super::response::tc_error_response(err)),
-            };
+            // Keep the request state on the heap: embedding it in both deadline
+            // wrappers duplicates large polling frames on ordinary worker stacks.
+            let result = deadline
+                .run(Box::pin(async {
+                    let request = *kernel
+                        .begin_request(method, raw_path, body_is_none, bearer)
+                        .await?;
 
-            {
-                let contract = guard.body_contract();
-                let txn = guard.txn().clone();
-                if let crate::BodyContract::Application { max_bytes: limit } = contract {
-                    let admission = guard.application_admission();
-                    let content_type = req
-                        .headers()
-                        .get(http::header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("application/json");
-                    let is_wasm = match content_type {
-                        "application/json" => false,
-                        "application/wasm" => true,
-                        _ => {
-                            return Ok(super::response::tc_error_response(
-                                tc_error::TCError::bad_request(
-                                    "unsupported application content type",
-                                ),
-                            ));
-                        }
-                    };
-                    let mut body =
-                        crate::http_body::BoundedBody::new(req.into_body(), limit, Some(admission));
-                    let state = if is_wasm {
-                        match (&mut body)
-                            .try_fold(Vec::new(), |mut bytes, chunk| async move {
-                                bytes.extend_from_slice(&chunk);
-                                Ok(bytes)
-                            })
-                            .await
-                        {
-                            Ok(bytes) if bytes.is_empty() => {
-                                Err(tc_error::TCError::bad_request("empty WASM Library"))
-                            }
-                            Ok(bytes) => Ok(crate::State::Tuple(vec![
-                                crate::State::None,
-                                crate::State::from(tc_value::Value::Bytes(bytes.into())),
-                            ])),
-                            Err(error) => Err(body.decode_error(error)),
-                        }
-                    } else {
-                        match destream_json::try_decode::<_, _, crate::literal::Definition>(
-                            (),
-                            &mut body,
-                        )
-                        .await
-                        {
-                            Ok(crate::literal::Definition(identity, definition)) => {
-                                Ok(crate::State::Tuple(vec![
-                                    crate::State::from(tc_value::Value::Link(identity)),
-                                    crate::State::from_scalar(definition),
-                                ]))
-                            }
-                            Err(error) => Err(body.decode_error(error)),
-                        }
-                    };
-                    let _admission = body.permit.take();
-                    let result = match state {
-                        Ok(state) => match guard.execute(Some(state)).await {
-                            Ok(Some(_)) => guard.finish_success().await,
-                            Ok(None) => Ok(()),
-                            Err(error) => Err(error),
-                        },
-                        Err(error) => Err(error),
-                    };
-                    return Ok(match result {
-                        Ok(_) => super::response::no_content(),
-                        Err(error) => super::response::tc_error_response(error),
-                    });
-                }
-                let native_body_limit = guard.native_body_limit();
-                let body = match deadline
-                    .wait(decode_native_body(req, txn.clone(), native_body_limit))
-                    .await
-                {
-                    Err(err) => {
-                        return Ok(super::response::tc_error_response(err));
-                    }
-                    Ok(result) => match result {
-                        Ok(body) => body,
-                        Err(err) => {
-                            return Ok(super::response::tc_error_response(err));
-                        }
-                    },
-                };
-                let result = deadline
-                    .wait(guard.execute_bound(body))
-                    .await
-                    .unwrap_or_else(Err);
-                match result {
-                    Ok((Some(state), raw_application_bytes, guard)) => {
-                        match deadline
-                            .wait(super::native_state_response(
-                                state,
-                                txn,
-                                raw_application_bytes,
-                                Some(guard),
-                            ))
-                            .await
-                            .unwrap_or_else(Err)
-                        {
-                            Ok(response) => Ok(response),
-                            Err(err) => Ok(super::response::tc_error_response(err)),
-                        }
-                    }
-                    Ok((None, _, _guard)) => Ok(super::response::no_content()),
-                    Err(err) => Ok(super::response::tc_error_response(err)),
-                }
-            }
+                    let (body, _admission) = decode_body(req, &request).await?;
+
+                    let response = request.execute_bound(body).await?;
+                    super::response::request_response(response).await
+                }))
+                .await;
+
+            Ok(result.unwrap_or_else(super::response::tc_error_response))
         })
     }
 }
@@ -291,3 +226,40 @@ impl Service<Request> for ConnectionService {
 pub(crate) fn to_kernel_method(method: &hyper::Method) -> Option<Method> {
     method.as_str().parse().ok()
 }
+
+/// Hyper owns connection processing; Tokio owns task completion and cancellation.
+#[derive(Clone)]
+struct Transport {
+    tasks: TaskTracker,
+    stop: CancellationToken,
+}
+
+impl Transport {
+    fn new() -> Self {
+        Self {
+            tasks: TaskTracker::new(),
+            stop: CancellationToken::new(),
+        }
+    }
+}
+
+impl<F> hyper::rt::Executor<F> for Transport
+where
+    F: Future + Send + 'static,
+    F::Output: Send,
+{
+    fn execute(&self, future: F) {
+        let stop = self.stop.clone();
+        self.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => {},
+                _ = future => {},
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/support/http_shutdown.rs"]
+mod tests;

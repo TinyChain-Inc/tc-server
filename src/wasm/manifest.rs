@@ -117,13 +117,3 @@ pub(super) async fn decode_entry(bytes: Vec<u8>) -> TCResult<WasmEntry> {
         .await
         .map_err(|err| TCError::bad_request(format!("invalid WASM entry: {err}")))
 }
-
-pub(super) fn format_path(path: &[PathSegment]) -> String {
-    format!(
-        "/{}",
-        path.iter()
-            .map(PathSegment::to_string)
-            .collect::<Vec<_>>()
-            .join("/")
-    )
-}

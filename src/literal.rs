@@ -4,8 +4,33 @@ use safecast::TryCastFrom;
 use tc_error::{TCError, TCResult};
 use tc_ir::Scalar;
 
+/// Canonical one-entry application definition shared by transport adapters.
 #[derive(Clone, Debug)]
-pub(crate) struct Definition(pub(crate) Link, pub(crate) Scalar);
+pub struct Definition(pub Link, pub Scalar);
+
+impl From<Definition> for crate::State {
+    fn from(Definition(identity, definition): Definition) -> Self {
+        Self::from(Scalar::from(Definition(identity, definition)))
+    }
+}
+
+impl From<Definition> for Scalar {
+    fn from(Definition(identity, definition): Definition) -> Self {
+        Self::Tuple(vec![tc_value::Value::from(identity).into(), definition])
+    }
+}
+
+/// Construct the native installation value for an uploaded WASM Library.
+pub fn wasm_installation(bytes: std::sync::Arc<[u8]>) -> TCResult<crate::State> {
+    if bytes.is_empty() {
+        return Err(TCError::bad_request("empty WASM Library"));
+    }
+
+    Ok(crate::State::from(vec![
+        crate::State::from(crate::State::None),
+        crate::State::from(tc_value::Value::from(bytes)),
+    ]))
+}
 
 impl de::FromStream for Definition {
     type Context = ();
@@ -56,15 +81,39 @@ impl<'en> en::IntoStream<'en> for Definition {
 pub(crate) const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn into_put(key: Scalar, value: crate::State) -> TCResult<(Link, Scalar)> {
-    let Scalar::Value(tc_value::Value::Link(identity)) = key else {
+    let Some(tc_value::Value::Link(identity)) = tc_value::Value::opt_cast_from(key) else {
         return Err(TCError::bad_request(
             "application installation requires its identity as the PUT key",
         ));
     };
+
     let value = Scalar::try_cast_from(value, |state| {
         TCError::bad_request(format!("expected a scalar value, found {state:?}"))
     })?;
     Ok((identity, value))
+}
+
+/// Check deletion of an already-validated local application identity.
+pub(crate) fn check_delete(
+    txn: &crate::TxnHandle,
+    identity: &Link,
+    key: &Scalar,
+    kind: &str,
+) -> TCResult<()> {
+    if !matches!(key, Scalar::Value(tc_value::Value::None)) {
+        return Err(TCError::bad_request(format!(
+            "{kind} deletion requires an explicit JSON null"
+        )));
+    }
+
+    let namespace = pathlink::PathBuf::from(identity.path()[0].clone());
+    if !txn.may_mutate(identity, &namespace) {
+        return Err(TCError::unauthorized(format!(
+            "unauthorized {kind} deletion"
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

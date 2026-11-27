@@ -57,8 +57,8 @@ curl --fail-with-body http://127.0.0.1:8702/service/example-devco/btree/1.0.0/co
 # 2
 ```
 
-Let each curl finish consuming its response before continuing: successful response
-completion participates in commit. Stop the host with Ctrl-C, then restart it with
+Execution commits before response projection; a later response failure does not
+undo that commit. Stop the host with Ctrl-C, then restart it with
 the same command, directories, identity, and secret. Repeat the final GET; the
 count remains `2`. Do not delete the workspace: it also contains host control
 records. For further writes after token expiry, generate another token using the

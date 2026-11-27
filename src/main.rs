@@ -23,7 +23,35 @@ use trusted_installers::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(panic = "abort") {
+        return Err("tc-server requires panic=abort; rebuild with the application profile".into());
+    }
+
     let config = Config::parse()?;
+    #[cfg(unix)]
+    let shutdown_signal = {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        async move {
+            tokio::select! {
+                _ = terminate.recv() => {},
+                _ = interrupt.recv() => {},
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let shutdown_signal = async {
+        if let Err(cause) = tokio::signal::ctrl_c().await {
+            // A failed signal handler must still drain active work before exit.
+            eprintln!("signal handler failed: {cause}");
+        }
+    };
+
+    let stop_bootstrap = tokio_util::sync::CancellationToken::new();
+    let mut bootstrap_task = None;
     let bind = config.bind_addr()?;
     let mut limits = tinychain::HostLimits {
         transaction_ttl: Duration::from_secs(config.request_ttl_secs),
@@ -93,7 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RjwtTokenVerifier::new(Arc::new(keyring.clone())),
         installer_policy,
     );
-    let resources = tinychain::HostResources::new(limits.clone())?;
+
+    let resources = tinychain::HostResources::new(limits)?;
     let services = tinychain::HostServices {
         application_roots,
         replication: Arc::new(gateway.clone()),
@@ -105,27 +134,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bootstrap: issuer,
         bootstrap_required: !peers.is_empty(),
     };
-    let kernel = tinychain::Kernel::new(services, workspace, limits.transaction_ttl).await?;
     let listener = std::net::TcpListener::bind(bind)?;
     listener.set_nonblocking(true)?;
     let bound = listener.local_addr()?;
-    if !peers.is_empty() {
-        let self_endpoint = self_peer(bound, config.advertise_ip).ok_or_else(|| {
+    let self_endpoint = if peers.is_empty() {
+        None
+    } else {
+        Some(self_peer(bound, config.advertise_ip).ok_or_else(|| {
             tc_error::TCError::bad_request(
                 "peer bootstrap requires a concrete bind or advertised IP",
             )
-        })?;
+        })?)
+    };
+
+    let kernel = tinychain::Kernel::new(services, workspace).await?;
+    if let Some(self_endpoint) = self_endpoint {
         let bootstrap = kernel.clone();
-        tokio::spawn(async move {
+        let stopping = stop_bootstrap.clone();
+        bootstrap_task = Some(tokio::spawn(async move {
             let self_endpoint = tinychain::replication::normalize_peer(&self_endpoint)
                 .expect("validated self endpoint");
             let mut pending = std::collections::VecDeque::from(peers);
             let mut attempted = std::collections::BTreeSet::new();
             let mut delay = Duration::from_millis(250);
             loop {
+                if stopping.is_cancelled() {
+                    return;
+                }
+
                 let mut failed = Vec::new();
                 let mut succeeded = false;
                 while let Some(seed) = pending.pop_front() {
+                    if stopping.is_cancelled() {
+                        return;
+                    }
+
                     if !attempted.insert(seed.clone()) {
                         continue;
                     }
@@ -145,15 +188,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+
                 if succeeded {
                     return;
                 }
-                tokio::time::sleep(delay).await;
+
+                tokio::select! {
+                    _ = stopping.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {},
+                }
+
                 delay = (delay * 2).min(Duration::from_secs(10));
                 attempted.clear();
                 pending.extend(failed);
             }
-        });
+        }));
     }
 
     #[cfg(feature = "mdns")]
@@ -165,9 +214,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    HttpServer::new(kernel).serve_listener(listener).await?;
+    let stopping = kernel.clone();
+    let stop_retries = stop_bootstrap.clone();
+    let result = HttpServer::new(kernel.clone())
+        .serve_listener_with_shutdown(listener, async move {
+            shutdown_signal.await;
+            stopping.begin_shutdown();
+            stop_retries.cancel();
+            #[cfg(feature = "mdns")]
+            drop(mdns);
+        })
+        .await;
+
+    stop_bootstrap.cancel();
+    if let Some(task) = bootstrap_task {
+        task.await?;
+    }
+
+    kernel.shutdown().await;
+    result?;
     Ok(())
 }
 
 #[cfg(test)]
+#[path = "../tests/support/main_tests.rs"]
 mod main_tests;

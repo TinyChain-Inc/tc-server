@@ -27,3 +27,26 @@ async fn authority_record_uses_its_canonical_stream_codec() {
     .unwrap();
     assert_eq!(decoded, record);
 }
+
+#[test]
+fn host_control_size_counts_capacity_and_fixed_frontier() {
+    let mut signing_key = Vec::with_capacity(1024);
+    signing_key.extend([1, 2, 3]);
+    let actor_id: tc_ir::Id = "host-actor".parse().unwrap();
+    let expected =
+        std::mem::size_of::<ControlFile>() + actor_id.get_heap_size() + signing_key.capacity();
+
+    let file = ControlFile::Authority(AuthorityRecord {
+        actor_id,
+        algorithm: rjwt::AlgKind::Falcon512,
+        signing_key,
+    });
+
+    assert_eq!(file.get_size(), expected);
+    let frontier = ControlFile::Frontier(tc_ir::TxnId::from_parts(
+        tc_ir::NetworkTime::from_nanos(1),
+        0,
+    ));
+
+    assert_eq!(frontier.get_size(), std::mem::size_of::<ControlFile>());
+}

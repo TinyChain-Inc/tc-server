@@ -1,4 +1,4 @@
-use tc_ir::OpRef;
+use tc_ir::{OpRef, Scalar};
 
 use super::*;
 

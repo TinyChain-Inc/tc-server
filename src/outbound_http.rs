@@ -65,26 +65,6 @@ pub(crate) async fn consume(
     })
 }
 
-pub(crate) async fn collect_bytes(
-    response: hyper::Response<hyper::Body>,
-    deadline: crate::Deadline,
-    bound: usize,
-) -> TCResult<std::sync::Arc<[u8]>> {
-    let mut body = success_body(response, deadline, bound).await?;
-    let result = deadline
-        .wait(
-            (&mut body).try_fold(Vec::new(), |mut bytes, chunk| async move {
-                bytes.extend_from_slice(&chunk);
-                Ok(bytes)
-            }),
-        )
-        .await?;
-    result.map(Vec::into).map_err(|error| {
-        body.take_failure()
-            .unwrap_or_else(|| TCError::bad_gateway(error.to_string()))
-    })
-}
-
 async fn success_body(
     response: hyper::Response<hyper::Body>,
     deadline: crate::Deadline,

@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use pathlink::{Link, PathSegment};
+use safecast::TryCastFrom;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Handler, Scalar, Transact, TxnId};
-use tc_value::Value;
 
+use crate::txn::TxnServer;
 use super::Method;
 use super::types::KernelTarget;
-use crate::txn::TxnServer;
+
 type Root<T> = crate::cluster::Cluster<crate::cluster::Dir<T>>;
 
 #[path = "resolver.rs"]
@@ -112,54 +113,82 @@ impl KernelInner {
         })
     }
 
+    pub(crate) fn register_peer_identity(
+        &self,
+        replica: &crate::replication::Replica,
+    ) -> TCResult<()> {
+        self.bootstrap.register_peer_identity(replica)
+    }
+
     async fn bootstrap(
         &self,
         txn: &crate::TxnHandle,
         state: crate::State,
     ) -> TCResult<crate::State> {
-        let crate::State::Tuple(payload) = state else {
+        let tc_state::State::Tuple(payload) = state else {
             return Err(TCError::bad_request(
                 "GET /host requires an encrypted nonce and ciphertext",
             ));
         };
+
         let [nonce, ciphertext]: [crate::State; 2] = payload.try_into().map_err(|_| {
             TCError::bad_request("GET /host requires an encrypted nonce and ciphertext")
         })?;
-        let bytes = |state| match state {
-            crate::State::Scalar(tc_ir::Scalar::Value(tc_value::Value::Bytes(bytes))) => Ok(bytes),
+
+        let bytes = |state| match tc_value::Value::opt_cast_from(state) {
+            Some(tc_value::Value::Bytes(bytes)) => Ok(bytes),
             _ => Err(TCError::bad_request(
                 "GET /host encrypted message fields must be bytes",
             )),
         };
+
         let nonce = bytes(nonce)?;
         let ciphertext = bytes(ciphertext)?;
-        let (resource, key) = self
+        let (resource, key, token, peer) = self
             .bootstrap
             .open_request(txn.id(), &nonce, &ciphertext)
             .await?;
+
+        let txn = txn.adopt_claims(&token).await?;
+        let claims = txn.protocol_snapshot().expect("verified bootstrap owner");
+        if claims.owner != Some((peer.host, peer.actor_id))
+            || claims.locked
+            || !claims.leaders.is_empty()
+            || txn
+                .auth_context()
+                .expect("verified bootstrap token")
+                .claims
+                .len()
+                != 1
+        {
+            return Err(TCError::unauthorized(
+                "bootstrap requires the joining host's ownership claim",
+            ));
+        }
+
         let hash = match resource.path().first().map(PathSegment::as_str) {
             Some("class") => {
                 self.classes
                     .clone()
-                    .lookup(txn, &resource.path()[1..])
+                    .lookup(&txn, &resource.path()[1..])
                     .await?
-                    .exact_hash(txn)
+                    .exact_hash(&txn)
                     .await?
             }
             Some("lib") => {
                 self.libraries
                     .clone()
-                    .lookup(txn, &resource.path()[1..])
+                    .lookup(&txn, &resource.path()[1..])
                     .await?
-                    .exact_hash(txn)
+                    .exact_hash(&txn)
                     .await?
             }
             Some("service") => {
                 self.services
                     .clone()
-                    .lookup(txn, &resource.path()[1..])
+                    .lookup(&txn, &resource.path()[1..])
                     .await?
-                    .exact_hash(txn)
+                    .exact_hash(&txn)
                     .await?
             }
             _ => {
@@ -168,24 +197,30 @@ impl KernelInner {
                 ));
             }
         };
+
         self.bootstrap
-            .seal_response(txn.id(), resource, hash, &key)
+            .seal_response(
+                txn.raw_token().expect("claimed bootstrap resource"),
+                hash,
+                &key,
+            )
             .await
             .map(|(nonce, ciphertext)| {
-                crate::State::Tuple(vec![
-                    crate::State::from(tc_value::Value::Bytes(nonce.into())),
-                    crate::State::from(tc_value::Value::Bytes(ciphertext.into())),
+                crate::State::from(vec![
+                    crate::State::from(tc_value::Value::from(nonce)),
+                    crate::State::from(tc_value::Value::from(ciphertext)),
                 ])
             })
     }
 
-    pub(super) async fn dispatch(
+    pub(crate) async fn dispatch(
         &self,
         txn: &crate::TxnHandle,
         target: &Link,
         method: Method,
         body: Option<crate::State>,
-    ) -> TCResult<(Option<crate::State>, bool)> {
+    ) -> TCResult<Option<crate::State>> {
+        txn.check_active()?;
         match target.path().first().map(PathSegment::as_str) {
             Some("lib") => {
                 self.libraries
@@ -195,24 +230,18 @@ impl KernelInner {
                         target,
                         method,
                         body,
-                        Box::new(crate::library::Root::new(
+                        crate::library::Root::new(
                             &self.libraries,
                             #[cfg(feature = "wasm")]
                             &self.compiler,
-                        )),
+                        ),
                     )
                     .await
             }
             Some("class") => {
                 self.classes
                     .clone()
-                    .dispatch(
-                        txn,
-                        target,
-                        method,
-                        body,
-                        Box::new(crate::class::Root(&self.classes)),
-                    )
+                    .dispatch(txn, target, method, body, crate::class::Root(&self.classes))
                     .await
             }
             Some("service") => {
@@ -223,12 +252,13 @@ impl KernelInner {
                         target,
                         method,
                         body,
-                        Box::new(crate::service::Root(&self.services)),
+                        crate::service::Root(&self.services),
                     )
                     .await
             }
             _ => Err(TCError::not_found(target.to_string())),
         }
+        .map_err(|error| txn.storage_error(error))
     }
 
     fn metrics(&self) -> crate::State {
@@ -274,19 +304,48 @@ impl KernelInner {
 #[derive(Clone)]
 pub struct Kernel {
     txn_server: TxnServer,
+    drain: std::sync::Arc<super::drain::Drain>,
     inner: std::sync::Arc<super::KernelInner>,
     bootstrap_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Kernel {
+    /// Permanently withdraw readiness and reject new request admission.
+    pub fn begin_shutdown(&self) {
+        self.drain.begin(|| self.deadline());
+    }
+
+    pub(crate) fn fatal_recovery(&self, error: impl std::fmt::Display) -> ! {
+        self.begin_shutdown();
+        self.txn_server
+            .fatal_recovery(format_args!("transaction recovery required: {error}"))
+    }
+
+    /// Drain admitted requests and join finalization before dropping the runtime.
+    /// This does not force unexpired transactions into canonical storage. An active
+    /// finalization is never cancelled; the caller must keep polling this future.
+    /// Concurrent calls and a replacement waiter after cancellation are supported.
+    pub async fn shutdown(&self) {
+        self.begin_shutdown();
+        self.drain.wait().await;
+        self.txn_server.stop_expiry().await;
+    }
+
+    #[cfg(feature = "http-server")]
+    pub(crate) async fn shutdown_started(&self) -> crate::Deadline {
+        self.drain.stopped().await
+    }
+
     #[cfg(feature = "http-client")]
     pub async fn bootstrap_seed(
         &self,
         seed: &str,
         self_endpoint: String,
     ) -> TCResult<std::collections::BTreeSet<String>> {
-        self.bootstrap_ready
-            .store(false, std::sync::atomic::Ordering::Release);
+        let _request = self.drain.admit()?;
+        // Startup is gated by bootstrap_required until a seed succeeds. Later
+        // discovery candidates may be stale; failure must not erase that success.
+        // Transaction storage readiness is checked independently by is_ready.
         let identity = self.inner.bootstrap.self_identity(self_endpoint)?;
         let mut peers = self.inner.classes.bootstrap(self, seed, &identity).await?;
         peers.extend(
@@ -302,26 +361,36 @@ impl Kernel {
     }
 
     #[cfg(feature = "http-client")]
-    pub(crate) async fn bootstrap_resource(
+    pub(crate) async fn bootstrap_probe(
         &self,
         seed: &str,
         resource: &pathlink::Link,
         identity: &crate::replication::Replica,
-    ) -> TCResult<(crate::TxnHandle, crate::cluster::BootstrapSession)> {
+    ) -> TCResult<(
+        Box<crate::BoundRequest>,
+        crate::TxnHandle,
+        crate::cluster::BootstrapSession,
+    )> {
         let request = self
             .begin_request(Method::Get, &resource.to_string(), true, None)
             .await?;
-        request.execute(None).await?;
-        let session = crate::replication::bootstrap_seed(
-            seed,
-            request.txn().id(),
-            resource,
-            identity,
-            &self.inner.bootstrap,
-            request.txn().deadline(),
-        )
-        .await?;
-        Ok((request.txn().clone(), session))
+
+        request.txn().claim_owner()?;
+        let session = self
+            .bootstrap_child(seed, request.txn(), resource, identity)
+            .await?;
+
+        let txn = request.txn().adopt_claims(session.token()).await?;
+        let peer = session.replica();
+        if txn.is_locked()
+            || txn.leader(resource.path()) != Some((peer.host.clone(), peer.actor_id.clone()))
+        {
+            return Err(TCError::unauthorized(
+                "bootstrap resource leader does not match its seed",
+            ));
+        }
+
+        Ok((request, txn, session))
     }
 
     #[cfg(feature = "http-client")]
@@ -344,48 +413,49 @@ impl Kernel {
     }
 
     #[cfg(feature = "http-client")]
-    pub(crate) async fn synchronize_service(
-        &self,
-        txn: &crate::TxnHandle,
-        resource: &Link,
-        seed: &str,
-        session: &crate::cluster::BootstrapSession,
-    ) -> TCResult<()> {
-        if crate::uri::application_root(resource) != Some("service") {
-            return Ok(());
-        }
-        let resolved = self
-            .inner
-            .services
-            .clone()
-            .lookup(txn, &resource.path()[1..])
-            .await?;
-        // Directory membership hashes have no member payloads to synchronize.
-        if let crate::cluster::Resolved::Item {
-            cluster, suffix, ..
-        } = resolved
-        {
-            if !suffix.is_empty() {
-                return Err(TCError::bad_request(
-                    "synchronization requires an exact Service",
-                ));
-            }
-            cluster.state().synchronize(txn, seed, session).await?;
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "http-client")]
     pub(crate) async fn update_bootstrap_membership(
         &self,
         txn: &crate::TxnHandle,
         target: &pathlink::Link,
-        body: crate::State,
+        replica: &crate::replication::Replica,
+        state_hash: &str,
     ) -> TCResult<()> {
+        let body = crate::State::from(vec![
+            crate::State::from(tc_value::Value::from(replica.endpoint.clone())),
+            crate::cluster::replica_put_state(replica, state_hash.to_string()),
+        ]);
+
         self.inner
             .dispatch(txn, target, Method::Put, Some(body))
+            .await?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "http-client")]
+    pub(crate) async fn reconcile_bootstrap_membership(
+        &self,
+        target: &pathlink::Link,
+        replicas: &[crate::replication::Replica],
+        state_hash: &str,
+    ) -> TCResult<()> {
+        let request = self
+            .begin_request(Method::Put, &target.to_string(), false, None)
+            .await?;
+
+        request.txn().claim_owner()?;
+        let txn = request
+            .txn()
+            .grant_claim(crate::Claim::new(target.clone(), umask::USER_WRITE))
+            .await?;
+
+        for replica in replicas {
+            self.update_bootstrap_membership(&txn, target, replica, state_hash)
+                .await?;
+        }
+
+        self.coordinate(&txn, crate::txn::TransactionOutcome::Commit, false)
             .await
-            .map(|_| ())
     }
 
     #[cfg(feature = "http-client")]
@@ -408,17 +478,21 @@ impl Kernel {
             crate::Claim::new(identity.clone(), umask::USER_WRITE),
         ));
         let body = match value {
-            crate::State::Scalar(Scalar::Value(tc_value::Value::Bytes(bytes))) => {
-                crate::State::Tuple(vec![
-                    crate::State::None,
-                    crate::State::from(tc_value::Value::Bytes(bytes)),
-                ])
+            value if matches!(&value, tc_state::State::Scalar(scalar) if matches!(&scalar, tc_ir::Scalar::Value(value) if matches!(&value, tc_value::Value::Bytes(_)))) =>
+            {
+                let Some(tc_value::Value::Bytes(bytes)) = tc_value::Value::opt_cast_from(value)
+                else {
+                    unreachable!("matched seed module bytes")
+                };
+
+                crate::wasm_installation(bytes)?
             }
-            value => crate::State::Tuple(vec![
-                crate::State::from(tc_value::Value::Link(identity)),
+            value => crate::State::from(vec![
+                crate::State::from(tc_value::Value::from(identity)),
                 value,
             ]),
         };
+
         self.execute(
             KernelTarget::Application(target.parse().expect("application root")),
             txn,
@@ -433,11 +507,12 @@ impl Kernel {
         &self,
         txn: &crate::TxnHandle,
         outcome: crate::txn::TransactionOutcome,
-        require_mutation: bool,
+        automatic: bool,
     ) -> TCResult<()> {
-        let Some(coordinator) = txn.lock_coordinator(require_mutation)? else {
+        let Some(coordinator) = txn.lock_coordinator(outcome, automatic)? else {
             return Ok(());
         };
+
         let target = pathlink::Link::from(coordinator);
         let applied = self
             .inner
@@ -452,36 +527,37 @@ impl Kernel {
                 None,
             )
             .await?;
-        if applied.0.is_some() {
-            return Err(TCError::internal(
-                "resource decision returned an ordinary response",
-            ));
-        }
+
+        assert!(
+            applied.is_none(),
+            "resource decision returned an ordinary response"
+        );
+
         Ok(())
     }
 
     pub async fn new(
         services: HostServices,
         workspace: crate::Workspace,
-        ttl: std::time::Duration,
     ) -> TCResult<Self> {
         let bootstrap_ready = !services.bootstrap_required;
         let txn = crate::txn::TxnConfig::new(
             services.protocol.clone(),
             workspace,
             services.resources.clone(),
-            ttl,
         );
         let txn_server = crate::txn::TxnServer::load(txn, services.verifier.clone()).await?;
-        let bootstrap_txn = txn_server.allocate().await?;
+        let bootstrap_txn = txn_server.allocate_bootstrap().await?;
         let inner = std::sync::Arc::new(KernelInner::load(bootstrap_txn, services).await?);
         let kernel = Self {
             txn_server,
+            drain: std::sync::Arc::new(super::drain::Drain::new()),
             inner,
             bootstrap_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 bootstrap_ready,
             )),
         };
+
         let finalizer = std::sync::Arc::clone(&kernel.inner);
         for service in kernel.inner.services.state().items(bootstrap_txn).await? {
             Box::pin(service.recover(&kernel.txn_server, &kernel.inner)).await?;
@@ -502,29 +578,25 @@ impl Kernel {
         txn: crate::TxnHandle,
         method: Method,
         body: Option<crate::State>,
-    ) -> TCResult<(Option<crate::State>, bool)> {
+    ) -> TCResult<Option<crate::State>> {
+        let txn = if method == Method::Get {
+            txn.read_only()
+        } else {
+            txn
+        };
+
         match &target {
-            KernelTarget::Application(application) => self
-                .inner
-                .dispatch(&txn, application, method, body)
-                .await
-                .map(|(state, exact_item)| {
-                    let raw_bytes = exact_item
-                        && crate::uri::application_root(application) == Some("lib")
-                        && matches!(
-                            &state,
-                            Some(crate::State::Scalar(Scalar::Value(Value::Bytes(_))))
-                        );
-                    (state, raw_bytes)
-                }),
+            KernelTarget::Application(application) => {
+                self.inner.dispatch(&txn, application, method, body).await
+            }
             _ if txn.is_locked() => Err(TCError::conflict(
                 "a transaction decision must target an exact transactional resource",
             )),
-            KernelTarget::State(state_target) => self
-                .inner
-                .dispatch_state(&txn, state_target, method, body)
-                .await
-                .map(|state| (state, false)),
+            KernelTarget::State(state_target) => {
+                self.inner
+                    .dispatch_state(&txn, state_target, method, body)
+                    .await
+            }
             KernelTarget::AuthContext => {
                 if method != Method::Get {
                     return Err(tc_error::TCError::method_not_allowed(
@@ -532,17 +604,15 @@ impl Kernel {
                         crate::uri::HOST_AUTH_CONTEXT,
                     ));
                 }
-                crate::host::auth_context(&txn).map(|state| (Some(state), false))
+
+                crate::host::auth_context(&txn).map(Some)
             }
             KernelTarget::Host => {
                 if method != Method::Get {
                     return Err(TCError::method_not_allowed(method, crate::uri::HOST_ROOT));
                 }
                 let body = body.ok_or_else(|| TCError::bad_request("GET /host requires a body"))?;
-                self.inner
-                    .bootstrap(&txn, body)
-                    .await
-                    .map(|state| (Some(state), false))
+                self.inner.bootstrap(&txn, body).await.map(Some)
             }
         }
     }
@@ -554,10 +624,15 @@ impl Kernel {
     #[cfg(feature = "http-server")]
     pub(crate) async fn admit_host_request(
         &self,
-    ) -> TCResult<(crate::Deadline, crate::resources::CapacityPermit)> {
+    ) -> TCResult<(
+        crate::Deadline,
+        crate::resources::CapacityPermit,
+        tokio_util::task::task_tracker::TaskTrackerToken,
+    )> {
         let deadline = self.deadline();
+        let request = self.drain.admit()?;
         let permit = self.txn_server.resources().admit_request(deadline).await?;
-        Ok((deadline, permit))
+        Ok((deadline, permit, request))
     }
 
     #[cfg(feature = "http-server")]
@@ -566,47 +641,9 @@ impl Kernel {
         self.txn_server.resources().admit_connection(deadline).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn test_txn(&self) -> crate::TxnHandle {
-        self.txn_server
-            .bind(None, None, std::sync::Arc::clone(&self.inner))
-            .await
-            .expect("begin test transaction")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_txn_server(&self) -> &TxnServer {
-        &self.txn_server
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_libraries(&self) -> Root<crate::library::Library> {
-        self.inner.libraries.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_classes(&self) -> Root<crate::class::Class> {
-        self.inner.classes.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_services(&self) -> Root<crate::service::Service> {
-        self.inner.services.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn test_bind(
-        &self,
-        txn_id: Option<TxnId>,
-        context: Option<&crate::auth::AuthContext>,
-    ) -> TCResult<crate::TxnHandle> {
-        self.txn_server
-            .bind(txn_id, context, std::sync::Arc::clone(&self.inner))
-            .await
-    }
-
     pub fn is_ready(&self) -> bool {
-        self.txn_server.is_ready()
+        !self.drain.is_stopping()
+            && self.txn_server.is_ready()
             && self
                 .bootstrap_ready
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -624,7 +661,7 @@ impl Kernel {
         }
         use tc_ir::{Id, Map};
 
-        Ok(crate::State::Map(Map::from_iter([
+        Ok(crate::State::from(Map::from_iter([
             (
                 "status".parse::<Id>().expect("health field"),
                 crate::State::from(tc_value::Value::from("ok")),
@@ -652,14 +689,19 @@ impl Kernel {
         self.inner.public_key(actor_id)
     }
 
+    /// Admit and bind a request before application body decoding.
+    ///
+    /// Verifies supplied credentials and establishes the transaction context.
+    /// Resource-specific authorization remains enforced during concrete routing.
     pub async fn begin_request(
         &self,
         method: Method,
         raw_path: &str,
         body_is_none: bool,
         bearer: Option<String>,
-    ) -> TCResult<Box<super::KernelRequestGuard>> {
+    ) -> TCResult<Box<super::BoundRequest>> {
         let deadline = self.deadline();
+        let request = self.drain.admit()?;
         let (path, txn_id) = crate::txn::wire::split_path_and_txn_id(raw_path)?;
         let link: pathlink::Link = path
             .parse()
@@ -706,12 +748,14 @@ impl Kernel {
                 "an ordinary PUT or DELETE request requires an explicit body",
             ));
         }
-        Ok(Box::new(super::KernelRequestGuard::new(
+
+        Ok(Box::new(super::BoundRequest::new(
             self.clone(),
             method,
             target,
             txn,
             permit,
+            request,
         )))
     }
 }
@@ -736,6 +780,7 @@ where
             .await
         }
         Method::Put => {
+            txn.check_write()?;
             let (key, value) = put_body(body)?;
             handler
                 .put()
@@ -746,9 +791,10 @@ where
             Ok(crate::State::default())
         }
         Method::Post => {
-            let Some(crate::State::Map(params)) = body else {
+            let Some(tc_state::State::Map(params)) = body else {
                 return Err(TCError::bad_request("POST route requires a map request"));
             };
+
             handler
                 .post()
                 .ok_or_else(|| TCError::method_not_allowed(method, "native handler"))?(
@@ -757,6 +803,7 @@ where
             .await
         }
         Method::Delete => {
+            txn.check_write()?;
             handler
                 .delete()
                 .ok_or_else(|| TCError::method_not_allowed(method, "native handler"))?(
@@ -782,11 +829,12 @@ fn scalar_body(body: Option<crate::State>) -> TCResult<Scalar> {
 }
 
 fn put_body(body: Option<crate::State>) -> TCResult<(Scalar, crate::State)> {
-    let Some(crate::State::Tuple(mut values)) = body else {
+    let Some(tc_state::State::Tuple(mut values)) = body else {
         return Err(tc_error::TCError::bad_request(
             "PUT route requires a [key, value] tuple",
         ));
     };
+
     if values.len() != 2 {
         return Err(tc_error::TCError::bad_request(
             "PUT route requires a [key, value] tuple",

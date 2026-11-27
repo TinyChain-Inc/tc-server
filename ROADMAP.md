@@ -18,8 +18,8 @@ workspace architecture and normative storage and transaction contracts.
 - Add authoritative replacement for damaged or interrupted canonical storage.
   Local WAL recovery and healthy snapshot joining follow
   [SERVICE_CONTRACT.md](SERVICE_CONTRACT.md); neither repairs damaged evidence.
-- Integrate future Chain variants and persistent Tensor members through their
-  existing ownership boundaries when implemented.
+- Integrate future Chain variants through their existing ownership boundaries
+  when implemented.
 - Preserve Cluster-owned exact-resource leadership and TxnServer-owned expiry
   and frontier scheduling. Do not add a server WAL, repair heuristic, or decision
   ledger while Chain is incomplete.

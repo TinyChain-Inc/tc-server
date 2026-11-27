@@ -13,8 +13,12 @@ fn bearer_header_has_one_transport_neutral_parser() {
 fn actor_directory_rejects_conflicting_keys() {
     let directory = tinychain::auth::KeyringActorResolver::default();
     let host: pathlink::Link = "/host".parse().expect("host link");
-    let first = tinychain::auth::Actor::new_falcon512("actor".into()).expect("first actor");
-    let second = tinychain::auth::Actor::new_falcon512("actor".into()).expect("second actor");
+    let first =
+        tinychain::auth::Actor::new("actor".into(), rjwt::AlgKind::Falcon512).expect("first actor");
+
+    let second = tinychain::auth::Actor::new("actor".into(), rjwt::AlgKind::Falcon512)
+        .expect("second actor");
+
     directory
         .insert(host.clone(), first)
         .expect("first key is accepted");

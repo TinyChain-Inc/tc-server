@@ -5,12 +5,12 @@ use destream::{de, en};
 use futures::TryStreamExt;
 use tc_error::TCError;
 use tc_ir::TxnId;
-
-use crate::Claim;
+#[cfg(feature = "http-client")]
 use umask::USER_EXEC;
 
+#[cfg(feature = "http-client")]
+use crate::Claim;
 use crate::auth::{Actor, KeyringActorResolver};
-
 use super::Replica;
 use super::crypto::{decrypt, encrypt_with_key};
 
@@ -64,7 +64,8 @@ impl ReplicationIssuer {
         })
     }
 
-    pub fn self_identity(&self, endpoint: String) -> tc_error::TCResult<Replica> {
+    #[cfg(any(feature = "http-client", test))]
+    pub(crate) fn self_identity(&self, endpoint: String) -> tc_error::TCResult<Replica> {
         let public_key_b64 = BASE64.encode(self.authority.verifying_key().to_bytes());
         Ok(Replica {
             endpoint,
@@ -75,7 +76,7 @@ impl ReplicationIssuer {
         })
     }
 
-    pub fn register_peer_identity(&self, identity: &Replica) -> tc_error::TCResult<()> {
+    pub(crate) fn register_peer_identity(&self, identity: &Replica) -> tc_error::TCResult<()> {
         let actor_id = identity.actor_id.trim();
         if actor_id.is_empty() {
             return Err(TCError::bad_request("peer actor_id must not be empty"));
@@ -97,7 +98,7 @@ impl ReplicationIssuer {
         self.keyring.insert(host, actor)
     }
 
-    pub fn decrypt_with_key(
+    fn decrypt_with_key(
         &self,
         nonce: &[u8],
         ciphertext: &[u8],
@@ -117,9 +118,10 @@ impl ReplicationIssuer {
         txn_id: TxnId,
         nonce: &[u8],
         ciphertext: &[u8],
-    ) -> tc_error::TCResult<(pathlink::Link, Key<Aes256GcmSiv>)> {
+    ) -> tc_error::TCResult<(pathlink::Link, Key<Aes256GcmSiv>, String, Replica)> {
         let (payload, key) = self.decrypt_with_key(nonce, ciphertext)?;
-        let (resource, received_txn_id, endpoint, host, actor_id, algorithm, public_key_b64): (
+        let (resource, received_txn_id, endpoint, host, actor_id, algorithm, public_key_b64, token): (
+            String,
             String,
             String,
             String,
@@ -128,6 +130,7 @@ impl ReplicationIssuer {
             String,
             String,
         ) = decode_message(payload, "bootstrap request").await?;
+
         let received_txn_id: TxnId = received_txn_id.parse().map_err(|error| {
             TCError::bad_request(format!("invalid bootstrap transaction: {error}"))
         })?;
@@ -147,7 +150,8 @@ impl ReplicationIssuer {
                 "bootstrap must name an application Cluster",
             ));
         }
-        self.register_peer_identity(&Replica {
+
+        let peer = Replica {
             endpoint,
             host,
             actor_id,
@@ -155,50 +159,28 @@ impl ReplicationIssuer {
                 .parse()
                 .map_err(|error: rjwt::Error| TCError::bad_request(error.to_string()))?,
             public_key_b64,
-        })?;
+        };
 
-        Ok((resource, key))
+        self.register_peer_identity(&peer)?;
+
+        Ok((resource, key, token, peer))
     }
 
     pub(crate) async fn seal_response(
         &self,
-        txn_id: TxnId,
-        resource: pathlink::Link,
+        token: String,
         state_hash: [u8; 32],
         key: &Key<Aes256GcmSiv>,
     ) -> tc_error::TCResult<(Vec<u8>, Vec<u8>)> {
-        let grants = crate::auth::wire_claim(Claim::new(
-            crate::uri::transaction_path(txn_id)
-                .parse()
-                .expect("transaction path"),
-            USER_EXEC,
-        ));
-        let signed = self
-            .authority
-            .sign(crate::auth::Token::new(
-                self.authority.host().clone(),
-                std::time::SystemTime::now(),
-                std::time::Duration::from_secs(30),
-                self.authority.actor_id().to_string(),
-                grants,
-            ))
-            .map_err(|error| TCError::unauthorized(error.to_string()))?;
-        let signed = self
-            .authority
-            .extend(
-                signed,
-                crate::auth::wire_claim(Claim::new(resource, USER_EXEC)),
-                std::time::SystemTime::now(),
-            )
-            .map_err(|error| TCError::unauthorized(error.to_string()))?;
         let response = (
-            signed.into_jwt(),
+            token,
             self.authority.host().to_string(),
             self.authority.actor_id().to_string(),
             self.authority.verifying_key().alg().name().to_string(),
             BASE64.encode(self.authority.verifying_key().to_bytes()),
             hex::encode(state_hash),
         );
+
         let response = encode_message(&response).await?;
         encrypt_with_key(&response, key)
     }
@@ -210,6 +192,28 @@ impl ReplicationIssuer {
         resource: &pathlink::Link,
         identity: &Replica,
     ) -> tc_error::TCResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        // The joining host owns the transaction; the seed adds resource leadership.
+        let grants = crate::auth::wire_claim(Claim::new(
+            crate::uri::transaction_path(txn_id)
+                .parse()
+                .expect("transaction path"),
+            USER_EXEC,
+        ));
+
+        let signed = self
+            .authority
+            .sign(
+                crate::auth::Token::new(
+                    self.authority.host().clone(),
+                    std::time::SystemTime::now(),
+                    std::time::Duration::from_secs(30),
+                    self.authority.actor_id().to_string(),
+                    grants,
+                )
+                .map_err(|error| TCError::unauthorized(error.to_string()))?,
+            )
+            .map_err(|error| TCError::unauthorized(error.to_string()))?;
+
         let request = (
             resource.to_string(),
             txn_id.to_string(),
@@ -218,7 +222,9 @@ impl ReplicationIssuer {
             identity.actor_id.clone(),
             identity.algorithm.name().to_string(),
             identity.public_key_b64.clone(),
+            signed.into_jwt(),
         );
+
         let request = encode_message(&request).await?;
         self.keys
             .iter()
