@@ -1,4 +1,5 @@
 use hyper::Body;
+use safecast::TryCastFrom;
 use tc_error::{TCError, TCResult};
 use tc_ir::TxnId;
 
@@ -21,9 +22,10 @@ pub(crate) async fn bootstrap_seed(
     let mut last_error = None;
     for (nonce, ciphertext) in requests {
         let encoded = crate::http_body::json_body(tc_ir::Scalar::Tuple(vec![
-            tc_ir::Scalar::Value(tc_value::Value::Bytes(nonce.into())),
-            tc_ir::Scalar::Value(tc_value::Value::Bytes(ciphertext.into())),
+            tc_ir::Scalar::from(tc_value::Value::Bytes(nonce.into())),
+            tc_ir::Scalar::from(tc_value::Value::Bytes(ciphertext.into())),
         ]));
+
         match crate::http_client::send_http(
             &hyper::Client::new(),
             hyper::Method::GET,
@@ -59,12 +61,14 @@ pub(crate) async fn bootstrap_seed(
                     response.try_into().map_err(|_| {
                         TCError::bad_gateway("bootstrap response must contain nonce and ciphertext")
                     })?;
-                let bytes = |value| match value {
-                    tc_ir::Scalar::Value(tc_value::Value::Bytes(bytes)) => Ok(bytes),
+
+                let bytes = |value| match tc_value::Value::opt_cast_from(value) {
+                    Some(tc_value::Value::Bytes(bytes)) => Ok(bytes),
                     _ => Err(TCError::bad_gateway(
                         "bootstrap encrypted fields must be bytes",
                     )),
                 };
+
                 let nonce = bytes(nonce)?;
                 let ciphertext = bytes(ciphertext)?;
                 match issuer
@@ -78,6 +82,7 @@ pub(crate) async fn bootstrap_seed(
             Err(error) => last_error = Some(error),
         }
     }
+
     Err(last_error.unwrap_or_else(|| TCError::bad_gateway("bootstrap failed")))
 }
 
@@ -90,20 +95,11 @@ pub(crate) async fn read_seed_state(
 ) -> TCResult<crate::State> {
     let deadline = txn.deadline();
     let response = seed_response(seed, token, txn, target).await?;
-    let content_type = response
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok());
-    if content_type == Some("application/wasm") {
-        return crate::outbound_http::collect_bytes(response, deadline, response_bound)
-            .await
-            .map(|bytes| crate::State::from(tc_value::Value::Bytes(bytes)));
-    }
 
     // Definitions contain scalar declaration references, not allocated collections.
-    crate::outbound_http::decode(response, (), deadline, response_bound)
+    crate::outbound_http::decode::<tc_ir::Scalar>(response, (), deadline, response_bound)
         .await
-        .map(crate::State::from_scalar)
+        .map(crate::State::from)
 }
 
 pub(crate) async fn read_seed_snapshot(

@@ -1,10 +1,11 @@
-use crate::State;
-use futures::{FutureExt, future::BoxFuture};
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use safecast::TryCastFrom;
 use tc_error::{TCError, TCResult};
 use tc_ir::{IntoView, Map, Scalar, TxnId};
 
-use crate::{Method, gateway::RpcGateway};
+use crate::gateway::RpcGateway;
+use crate::{Method, State};
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -38,7 +39,7 @@ impl RpcGateway for HttpGateway {
     ) -> BoxFuture<'static, TCResult<State>> {
         let client = self.client.clone();
         async move {
-            let body = encode_state_body(State::from_scalar(key), txn.clone()).await?;
+            let body = encode_state_body(State::from(key), txn.clone()).await?;
             let response =
                 send_request(&client, Method::Get, target, &txn, "application/json", body).await?;
             decode_state_response(response, &txn).await
@@ -56,17 +57,15 @@ impl RpcGateway for HttpGateway {
         let client = self.client.clone();
         async move {
             let (content_type, body) = if crate::uri::is_application_root(&target) {
-                encode_application_put(key, value).await?
+                encode_application_put(key, value)?
             } else {
                 (
                     "application/json",
-                    encode_state_body(
-                        State::Tuple(vec![State::from_scalar(key), value]),
-                        txn.clone(),
-                    )
-                    .await?,
+                    encode_state_body(State::from(vec![State::from(key), value]), txn.clone())
+                        .await?,
                 )
             };
+
             let response =
                 send_request(&client, Method::Put, target, &txn, content_type, body).await?;
             crate::outbound_http::consume(response, txn.deadline(), txn.request_body_limit(), false)
@@ -83,7 +82,7 @@ impl RpcGateway for HttpGateway {
     ) -> BoxFuture<'static, TCResult<State>> {
         let client = self.client.clone();
         async move {
-            let body = encode_state_body(State::Map(params), txn.clone()).await?;
+            let body = encode_state_body(State::from(params), txn.clone()).await?;
             let response = send_request(
                 &client,
                 Method::Post,
@@ -112,7 +111,7 @@ impl RpcGateway for HttpGateway {
     ) -> BoxFuture<'static, TCResult<()>> {
         let client = self.client.clone();
         async move {
-            let body = encode_state_body(State::from_scalar(key), txn.clone()).await?;
+            let body = encode_state_body(State::from(key), txn.clone()).await?;
             let response = send_request(
                 &client,
                 Method::Delete,
@@ -129,25 +128,25 @@ impl RpcGateway for HttpGateway {
     }
 }
 
-pub(crate) async fn encode_application_put(
+pub(crate) fn encode_application_put(
     key: Scalar,
     value: State,
 ) -> TCResult<(&'static str, hyper::Body)> {
-    match value {
-        State::Scalar(Scalar::Value(tc_value::Value::Bytes(module)))
-            if matches!(key, Scalar::Value(tc_value::Value::None)) =>
-        {
-            Ok((
-                "application/wasm",
-                hyper::Body::from(bytes::Bytes::from_owner(module)),
-            ))
-        }
-        value => {
-            let Scalar::Value(tc_value::Value::Link(identity)) = key else {
+    match (key, value) {
+        (
+            Scalar::Value(tc_value::Value::None),
+            State::Scalar(Scalar::Value(tc_value::Value::Bytes(module))),
+        ) => Ok((
+            "application/wasm",
+            hyper::Body::from(bytes::Bytes::from_owner(module)),
+        )),
+        (key, value) => {
+            let Some(tc_value::Value::Link(identity)) = tc_value::Value::opt_cast_from(key) else {
                 return Err(TCError::bad_request(
                     "application PUT requires an identity Link key",
                 ));
             };
+
             let definition = Scalar::try_cast_from(value, |_| {
                 TCError::bad_request("application PUT requires a scalar definition")
             })?;
@@ -170,7 +169,7 @@ impl crate::replication::ClusterGateway for HttpGateway {
         value: State,
     ) -> TCResult<()> {
         let (content_type, body) = if crate::uri::is_application_root(target) {
-            encode_application_put(key, value).await?
+            encode_application_put(key, value)?
         } else {
             let value = Scalar::try_cast_from(value, |_| {
                 TCError::bad_request("replicated PUT requires a scalar value")
@@ -178,6 +177,7 @@ impl crate::replication::ClusterGateway for HttpGateway {
             let body = crate::http_body::json_body(Scalar::Tuple(vec![key, value]));
             ("application/json", body)
         };
+
         send_peer_request(
             &self.client,
             build_http_request(
@@ -233,7 +233,11 @@ impl crate::replication::ClusterGateway for HttpGateway {
                 } else {
                     hyper::Method::DELETE
                 },
-                peer_txn_url(peer, &resource.to_string(), txn.id())?,
+                peer_txn_url(
+                    peer,
+                    &pathlink::ToUrl::from(&resource[..]).to_string(),
+                    txn.id(),
+                )?,
                 Some(format!("Bearer {token}")),
                 None,
                 hyper::Body::empty(),
@@ -362,20 +366,6 @@ async fn decode_state_response(
     response: hyper::Response<hyper::Body>,
     txn: &crate::TxnHandle,
 ) -> TCResult<State> {
-    let content_type = response
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok());
-    if content_type == Some("application/wasm") {
-        let bytes = crate::outbound_http::collect_bytes(
-            response,
-            txn.deadline(),
-            txn.application_body_limit(),
-        )
-        .await?;
-        return Ok(State::from(tc_value::Value::Bytes(bytes)));
-    }
-
     crate::outbound_http::decode(
         response,
         txn.clone(),

@@ -10,16 +10,16 @@ fn entry(name: &str, value: State) -> (Id, State) {
 }
 
 /// Return the authenticated host context as native state.
-pub fn auth_context(txn: &TxnHandle) -> TCResult<State> {
+pub(crate) fn auth_context(txn: &TxnHandle) -> TCResult<State> {
     let auth = txn
         .auth_context()
         .ok_or_else(|| TCError::unauthorized("missing authenticated request context"))?;
 
-    let claims = auth
+    let claims: Vec<_> = auth
         .claims
         .iter()
         .map(|claim| {
-            State::Map(Map::from_iter([
+            State::from(Map::from_iter([
                 entry("host", State::from(Value::from(claim.host.clone()))),
                 entry("actor_id", State::from(Value::from(claim.actor_id.clone()))),
                 entry(
@@ -33,13 +33,14 @@ pub fn auth_context(txn: &TxnHandle) -> TCResult<State> {
             ]))
         })
         .collect();
-    let token_hosts = auth
+
+    let token_hosts: Vec<_> = auth
         .token_hosts()
         .into_iter()
         .map(|host| State::from(Value::from(host)))
         .collect();
 
-    Ok(State::Map(Map::from_iter([
+    Ok(State::from(Map::from_iter([
         entry(
             "principal",
             State::from(Value::from(auth.principal.clone())),
@@ -52,7 +53,7 @@ pub fn auth_context(txn: &TxnHandle) -> TCResult<State> {
             "token_verified_at_nanos",
             State::from(Value::from(Number::from(auth.verified_at_nanos))),
         ),
-        entry("token_hosts", State::Tuple(token_hosts)),
-        entry("claims", State::Tuple(claims)),
+        entry("token_hosts", State::from(token_hosts)),
+        entry("claims", State::from(claims)),
     ])))
 }

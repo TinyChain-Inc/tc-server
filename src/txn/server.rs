@@ -1,21 +1,17 @@
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::FutureExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tc_error::{TCError, TCResult};
 use tc_ir::{NetworkTime, TxnId};
-
 use tokio::time::Instant;
 
-use super::{TxnConfig, TxnHandle, validate_signed_token};
 use crate::auth::{AuthContext, TokenVerifier};
+use super::{TxnConfig, TxnHandle, validate_signed_token};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransactionOutcome {
@@ -41,6 +37,8 @@ struct TxnState {
     notify: tokio::sync::Notify,
     ready: AtomicBool,
     verifier: Arc<dyn TokenVerifier>,
+    stop: tokio_util::sync::CancellationToken,
+    worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 struct Inner {
@@ -49,8 +47,8 @@ struct Inner {
     last_allocated: Option<TxnId>,
 }
 
-#[derive(Clone, Copy)]
 struct Active {
+    calls: tokio_util::task::TaskTracker,
     expires: Instant,
     retry: Option<Instant>,
 }
@@ -92,8 +90,11 @@ impl TxnServer {
                 notify: tokio::sync::Notify::new(),
                 ready: AtomicBool::new(false),
                 verifier,
+                stop: tokio_util::sync::CancellationToken::new(),
+                worker: tokio::sync::Mutex::new(None),
             }),
         };
+
         server.restore_frontier().await?;
         Ok(server)
     }
@@ -113,7 +114,18 @@ impl TxnServer {
         match txn_id {
             None => {
                 let txn_id = self.allocate().await?;
-                self.handle(txn_id, true, token, kernel)
+                let context = token
+                    .map(|auth| {
+                        let claims = auth
+                            .signed()
+                            .map(|signed| super::protocol_snapshot(txn_id, signed))
+                            .transpose()?;
+
+                        Ok::<_, TCError>((auth, claims.is_some_and(|claims| claims.read_only)))
+                    })
+                    .transpose()?;
+
+                self.handle(txn_id, true, context, kernel, false)
             }
             Some(txn_id) => {
                 self.reject_finalized(txn_id)?;
@@ -124,10 +136,12 @@ impl TxnServer {
                     .signed()
                     .map(Arc::as_ref)
                     .ok_or_else(|| TCError::unauthorized("missing signed transaction authority"))?;
-                validate_signed_token(txn_id, signed)
+
+                let claims = validate_signed_token(txn_id, signed)
                     .map_err(|_| TCError::unauthorized("invalid transaction authority"))?;
-                self.observe(txn_id);
-                self.handle(txn_id, false, Some(token), kernel)
+
+                let context = Some((token, claims.read_only));
+                self.handle(txn_id, false, context, kernel, false)
             }
         }
     }
@@ -139,8 +153,7 @@ impl TxnServer {
     ) -> TCResult<TxnHandle> {
         self.reject_finalized(txn_id)?;
         self.reject_expired(txn_id)?;
-        self.observe(txn_id);
-        self.handle(txn_id, false, None, kernel)
+        self.handle(txn_id, false, None, kernel, false)
     }
 
     /// Only startup recovery of validated Chain records may bind expired IDs.
@@ -156,10 +169,11 @@ impl TxnServer {
             return Err(TCError::conflict("recovery requires an unpublished host"));
         }
         self.reject_finalized(txn_id)?;
-        self.observe(txn_id);
-        Ok(self
-            .handle(txn_id, false, None, kernel)?
-            .subcontext_unique())
+        let mut txn = self.handle(txn_id, false, None, kernel, true)?;
+        // Startup replay is an unpublished inspection/recovery capability, not
+        // ordinary host execution. Its errors must prevent publication.
+        txn.recovering = true;
+        Ok(txn.subcontext_unique())
     }
 
     pub(crate) async fn finish_recovery(&self) -> TCResult<()> {
@@ -176,27 +190,70 @@ impl TxnServer {
         &self,
         id: TxnId,
         autocommit: bool,
-        context: Option<&AuthContext>,
+        context: Option<(&AuthContext, bool)>,
         kernel: Arc<crate::kernel::KernelInner>,
+        recovering: bool,
     ) -> TCResult<TxnHandle> {
-        TxnHandle::new(id, self.clone(), kernel, context, autocommit)
+        let (expires, activity) = {
+            let mut inner = self.state.inner.lock();
+            let active = self.admit(&mut inner, id)?;
+            if active.calls.is_closed() || (!recovering && active.expires <= Instant::now()) {
+                return Err(TCError::conflict("transaction has expired"));
+            }
+
+            let expires = if recovering {
+                self.resources().deadline().instant()
+            } else {
+                active.expires
+            };
+
+            (expires, active.calls.token())
+        };
+
+        self.state.notify.notify_one();
+        Ok(TxnHandle::new(
+            id,
+            self.clone(),
+            kernel,
+            context,
+            autocommit,
+            expires,
+            activity,
+        ))
     }
 
-    fn observe(&self, txn_id: TxnId) {
-        let expires = expiry(txn_id, self.state.config.ttl(), self.state.config.grace());
-        self.state
-            .inner
-            .lock()
-            .active
-            .entry(txn_id)
-            .or_insert(Active {
-                expires,
-                retry: None,
-            });
-        self.state.notify.notify_one();
+    fn admit<'a>(&self, inner: &'a mut Inner, id: TxnId) -> TCResult<&'a mut Active> {
+        if inner.latest_finalized.is_some_and(|cutoff| id <= cutoff) {
+            return Err(TCError::conflict("transaction is already finalized"));
+        }
+
+        Ok(inner.active.entry(id).or_insert_with(|| Active {
+            calls: tokio_util::task::TaskTracker::new(),
+            expires: expiry(id, self.state.config.ttl(), self.state.config.grace()),
+            retry: None,
+        }))
     }
 
     pub(crate) async fn allocate(&self) -> TCResult<TxnId> {
+        let txn_id = self.allocate_id().await?;
+        self.admit(&mut self.state.inner.lock(), txn_id)?;
+        self.state.notify.notify_one();
+        Ok(txn_id)
+    }
+
+    /// Allocate the ordinary read transaction used by unpublished kernel construction.
+    pub(crate) async fn allocate_bootstrap(&self) -> TCResult<TxnId> {
+        if self.is_ready() {
+            return Err(TCError::conflict("bootstrap requires an unpublished host"));
+        }
+
+        let txn_id = self.allocate_id().await?;
+        self.admit(&mut self.state.inner.lock(), txn_id)?;
+        self.state.notify.notify_one();
+        Ok(txn_id)
+    }
+
+    async fn allocate_id(&self) -> TCResult<TxnId> {
         let _allocation = self.state.allocation.lock().await;
         let txn_id = {
             let inner = self.state.inner.lock();
@@ -234,6 +291,13 @@ impl TxnServer {
             .write_last_allocated(txn_id)
             .await
         {
+            if error.requires_recovery() && self.is_ready() {
+                self.fatal_recovery(format!(
+                    "transaction frontier publication failed: {error}; causes: {:?}",
+                    error.causes()
+                ));
+            }
+
             self.state.ready.store(false, Ordering::Release);
             if let Ok((latest_finalized, last_allocated)) =
                 self.state.config.workspace().frontiers().await
@@ -245,8 +309,8 @@ impl TxnServer {
             }
             return Err(error);
         }
+
         self.state.inner.lock().last_allocated = Some(txn_id);
-        self.observe(txn_id);
         Ok(txn_id)
     }
 
@@ -255,11 +319,42 @@ impl TxnServer {
         F: Fn(TxnId) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = TCResult<()>> + Send + 'static,
     {
+        let mut worker = self
+            .state
+            .worker
+            .try_lock()
+            .expect("expiry starts before shutdown");
+
+        assert!(worker.is_none(), "expiry starts once");
         let server = self.clone();
-        runtime.spawn(async move { server.run_expiry(finalize).await });
+        *worker = Some(runtime.spawn(async move {
+            if std::panic::AssertUnwindSafe(server.run_expiry(finalize))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                server.fatal_recovery("canonical recovery required: finalizer worker panicked");
+            }
+        }));
     }
 
-    async fn run_expiry<F, Fut>(self, finalize: F)
+    pub(crate) async fn stop_expiry(&self) {
+        self.state.stop.cancel();
+        let mut worker = self.state.worker.lock().await;
+        if let Some(task) = worker.as_mut() {
+            // Borrow the handle until completion: cancelling this waiter must not
+            // detach a worker which another shutdown caller still needs to join.
+            if let Err(error) = task.await {
+                self.fatal_recovery(format!(
+                    "canonical recovery required: finalizer worker failed: {error}"
+                ));
+            }
+
+            *worker = None;
+        }
+    }
+
+    async fn run_expiry<F, Fut>(&self, finalize: F)
     where
         F: Fn(TxnId) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = TCResult<()>> + Send,
@@ -267,10 +362,16 @@ impl TxnServer {
         loop {
             match self.next_expiry() {
                 Some(deadline) => tokio::select! {
+                    biased;
+                    _ = self.state.stop.cancelled() => return,
                     _ = tokio::time::sleep_until(deadline) => self.expire_due(Instant::now(), &finalize).await,
                     _ = self.state.notify.notified() => {}
                 },
-                None => self.state.notify.notified().await,
+                None => tokio::select! {
+                    biased;
+                    _ = self.state.stop.cancelled() => return,
+                    _ = self.state.notify.notified() => {}
+                },
             }
         }
     }
@@ -289,20 +390,53 @@ impl TxnServer {
         F: Fn(TxnId) -> Fut,
         Fut: std::future::Future<Output = TCResult<()>>,
     {
-        let due = self
-            .state
-            .inner
-            .lock()
-            .active
-            .first_key_value()
-            .and_then(|(id, active)| {
-                (active.retry.unwrap_or(active.expires) <= now).then_some(*id)
-            });
-        let Some(cutoff) = due else { return };
-        if let Err(error) = finalize(cutoff).await {
-            self.defer(cutoff, "finalize resources", error);
-            return;
+        let due = {
+            let inner = self.state.inner.lock();
+            inner.active.first_key_value().and_then(|(id, active)| {
+                if active.retry.unwrap_or(active.expires) > now {
+                    return None;
+                }
+
+                // Binding and closure share this mutex. Existing capability clones
+                // retain tokens; no later binding can enter this transaction.
+                active.calls.close();
+                Some((*id, active.calls.clone()))
+            })
+        };
+
+        let Some((cutoff, calls)) = due else { return };
+
+        // Shutdown may stop this ownership wait, but never native materialization.
+        tokio::select! {
+            biased;
+            _ = self.state.stop.cancelled() => return,
+            _ = calls.wait() => {}
         }
+
+        // Coalesce only the expired, quiescent prefix. Binding and closure share
+        // this mutex; an active or not-yet-due identity remains a hard barrier.
+        let cutoff = {
+            let inner = self.state.inner.lock();
+            let mut last = cutoff;
+            for (&id, active) in inner.active.range(cutoff..) {
+                if active.retry.unwrap_or(active.expires) > now || !active.calls.is_empty() {
+                    break;
+                }
+
+                active.calls.close();
+                last = id;
+            }
+
+            last
+        };
+
+        if let Err(error) = finalize(cutoff).await {
+            self.fatal_recovery(format!(
+                "canonical recovery required: failed to finalize resources at {cutoff}: {error}; causes: {:?}",
+                error.causes()
+            ));
+        }
+
         if let Err(error) = self
             .state
             .config
@@ -313,25 +447,41 @@ impl TxnServer {
             self.defer(cutoff, "persist finalized cutoff", error);
             return;
         }
+
         if let Err(error) = self.state.config.workspace().remove_through(cutoff).await {
             self.defer(cutoff, "clean transaction workspaces", error);
             return;
         }
+
         {
             let mut inner = self.state.inner.lock();
             inner.latest_finalized = Some(cutoff);
             inner.active.retain(|id, _| *id > cutoff);
             self.state.ready.store(true, Ordering::Release);
         }
+
         self.state.notify.notify_one();
+    }
+
+    // Failed cleanup or materialization requires recovery. A task panic alone
+    // would leave the host serving requests against uncertain state.
+    pub(crate) fn fatal_recovery(&self, error: impl std::fmt::Display) -> ! {
+        use std::io::Write;
+
+        self.state.ready.store(false, Ordering::Release);
+
+        // Fatal diagnostics must survive an uninitialized logging backend.
+        let _ = writeln!(std::io::stderr().lock(), "{error}");
+        std::process::abort()
     }
 
     fn defer(&self, cutoff: TxnId, operation: &str, error: impl std::fmt::Display) {
         log::error!("failed to {operation} at transaction cutoff {cutoff}: {error}");
         self.state.ready.store(false, Ordering::Release);
-        if let Some(active) = self.state.inner.lock().active.get_mut(&cutoff) {
+        if let Some((_, active)) = self.state.inner.lock().active.range_mut(..=cutoff).next() {
             active.retry = Some(Instant::now() + Duration::from_secs(1));
         }
+
         self.state.notify.notify_one();
     }
 
@@ -344,20 +494,11 @@ impl TxnServer {
             inner.last_allocated = last_allocated;
             for txn_id in workspaces.iter().copied() {
                 if latest_finalized.is_none_or(|cutoff| txn_id > cutoff) {
-                    inner.active.insert(
-                        txn_id,
-                        Active {
-                            expires: expiry(
-                                txn_id,
-                                self.state.config.ttl(),
-                                self.state.config.grace(),
-                            ),
-                            retry: None,
-                        },
-                    );
+                    self.admit(&mut inner, txn_id)?;
                 }
             }
         }
+
         Ok(())
     }
 
@@ -387,19 +528,6 @@ impl TxnServer {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_decision_bearer(&self, txn: &TxnHandle) -> String {
-        txn.lock_for_test()
-            .expect("lock test transaction")
-            .raw_token()
-            .expect("decision bearer")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn contains(&self, txn_id: &TxnId) -> bool {
-        self.state.inner.lock().active.contains_key(txn_id)
-    }
-
     pub(crate) fn is_ready(&self) -> bool {
         self.state.ready.load(Ordering::Acquire)
     }
@@ -427,18 +555,8 @@ fn compute_trace(host_id: &str, timestamp: NetworkTime, nonce: u16) -> [u8; 32] 
 }
 
 #[cfg(test)]
-pub(super) fn test_verifier(config: &TxnConfig) -> Arc<dyn TokenVerifier> {
-    let actor = rjwt::Actor::with_verifying_key(
-        config.protocol().actor_id().to_string(),
-        config.protocol().verifying_key(),
-    );
-    let keyring = crate::auth::KeyringActorResolver::default();
-    keyring
-        .insert(config.protocol().host().clone(), actor)
-        .expect("test protocol actor is unique");
-    Arc::new(crate::auth::RjwtTokenVerifier::new(Arc::new(keyring)))
-}
+pub(super) use tests::test_verifier;
 
 #[cfg(test)]
 #[path = "../../tests/support/txn_server.rs"]
-mod tests;
+pub(crate) mod tests;

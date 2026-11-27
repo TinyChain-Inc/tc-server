@@ -2,11 +2,11 @@ use std::io;
 
 use bytes::Bytes;
 use futures::{TryStreamExt, stream};
+use hyper::Body;
 use tc_ir::Scalar;
 
 use crate::http_body::BoundedBody;
 use crate::{Deadline, HostLimits, HostResources};
-use hyper::Body;
 
 fn resources(application_bytes: usize) -> HostResources {
     let mut limits = HostLimits::default();
@@ -50,11 +50,12 @@ async fn admitted_stream_preserves_payload_limit_errors() {
         Some(resources.application_admission(Deadline::after(std::time::Duration::from_secs(1)))),
     );
 
-    let error = (&mut body)
+    (&mut body)
         .try_collect::<Vec<_>>()
         .await
         .expect_err("oversized body");
-    let error = body.decode_error(error);
+
+    let error = body.take_failure().expect("structured body failure");
     assert_eq!(error.code(), tc_error::ErrorKind::PayloadTooLarge);
     assert!(body.permit.take().is_none());
 }
@@ -74,11 +75,12 @@ async fn admitted_stream_preserves_admission_saturation() {
         Some(resources.application_admission(deadline)),
     );
 
-    let error = (&mut body)
+    (&mut body)
         .try_collect::<Vec<_>>()
         .await
         .expect_err("admission deadline");
-    let error = body.decode_error(error);
+
+    let error = body.take_failure().expect("structured body failure");
     assert_eq!(error.code(), tc_error::ErrorKind::Unavailable);
 }
 
@@ -104,4 +106,109 @@ async fn malformed_json_releases_its_admission_with_the_stream() {
         .admit_application_bytes(1, Deadline::after(std::time::Duration::from_secs(1)))
         .await
         .expect("released admission");
+}
+
+#[tokio::test]
+async fn shared_decoder_preserves_application_and_native_representations() {
+    let kernel = crate::txn::test_kernel("shared-http-decoder").await;
+    for root in ["/lib", "/class", "/service"] {
+        let guard = kernel
+            .begin_request(crate::Method::Put, root, false, None)
+            .await
+            .unwrap();
+
+        let encoded = format!(r#"{{"{root}/example/item/1.0.0":"definition"}}"#);
+        let request = hyper::Request::builder()
+            .body(Body::from(encoded.clone()))
+            .unwrap();
+
+        let (state, permit) = crate::http::parse::decode_body(request, &guard)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&state.unwrap(), crate::State::Tuple(values) if values.len() == 2),
+            "{root}"
+        );
+
+        assert_eq!(permit.unwrap().num_permits(), encoded.len(), "{root}");
+    }
+
+    let guard = kernel
+        .begin_request(crate::Method::Put, "/lib", false, None)
+        .await
+        .unwrap();
+
+    let bytes = b"\0asm\x01\0\0\0";
+    let request = hyper::Request::builder()
+        .header("content-type", "application/wasm")
+        .body(Body::from(bytes.as_slice()))
+        .unwrap();
+
+    let (state, permit) = crate::http::parse::decode_body(request, &guard)
+        .await
+        .unwrap();
+
+    assert!(matches!(&state.unwrap(), crate::State::Tuple(values) if values.len() == 2));
+    assert_eq!(permit.unwrap().num_permits(), bytes.len());
+    drop(guard);
+
+    for (body, present) in [(Body::empty(), false), (Body::from("null"), true)] {
+        let guard = kernel
+            .begin_request(crate::Method::Get, "/state", !present, None)
+            .await
+            .unwrap();
+
+        let request = hyper::Request::new(body);
+        let (state, permit) = crate::http::parse::decode_body(request, &guard)
+            .await
+            .unwrap();
+
+        assert_eq!(state.is_some(), present);
+        assert!(permit.is_none());
+    }
+
+    kernel.shutdown().await;
+}
+
+#[tokio::test]
+async fn expired_response_rejects_ready_chunks_and_releases_request() {
+    use hyper::body::HttpBody;
+
+    use tc_value::class::NativeClass;
+
+    let kernel = crate::txn::test_kernel("ready-response-deadline").await;
+    let target = tc_value::ValueType::None.path().to_string();
+    let request = kernel
+        .begin_request(crate::Method::Get, &target, true, None)
+        .await
+        .unwrap();
+
+    let deadline = request.deadline();
+    let state = crate::State::Tuple(vec![
+        crate::State::from(tc_value::Value::from(1_u64)),
+        crate::State::from(tc_value::Value::from(2_u64)),
+    ]);
+
+    let mut response = super::native_state_response(state, *request).await.unwrap();
+    response.body_mut().data().await.unwrap().unwrap();
+    // The source can immediately produce more output after the original deadline.
+    tokio::time::sleep_until(deadline.instant()).await;
+    let error = response.body_mut().data().await.unwrap().unwrap_err();
+    let error = std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<std::io::Error>()
+        .unwrap();
+
+    let error = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<tc_error::TCError>()
+        .unwrap();
+
+    assert_eq!(error.code(), tc_error::ErrorKind::Unavailable);
+    assert!(response.body_mut().data().await.is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(2), kernel.shutdown())
+        .await
+        .unwrap();
 }

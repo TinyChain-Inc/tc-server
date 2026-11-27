@@ -57,9 +57,10 @@ impl Compiler {
         let engine = Arc::clone(&self.engine);
         let module_bytes = Arc::clone(&bytes);
         let compilation = tokio::task::spawn_blocking(move || {
-            let result = wasmtime::Module::new(&engine, module_bytes.as_ref());
+            let result = wasmtime::Module::from_binary(&engine, module_bytes.as_ref());
             (result, permit)
         });
+
         let (module, _permit) = deadline
             .wait(compilation)
             .await?

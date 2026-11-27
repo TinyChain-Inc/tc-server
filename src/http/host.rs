@@ -14,13 +14,13 @@ pub(crate) async fn public_key_actor(req: &Request) -> Result<String, Box<Respon
         .map(|(_, value)| value)
         .ok_or_else(|| Box::new(bad_request_response("missing key query parameter")))?;
 
-    match destream_json::try_decode(
+    match destream_json::try_decode::<_, _, Value>(
         (),
         stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(key.into_bytes()))]),
     )
     .await
     {
-        Ok(Value::String(actor_id)) => Ok(actor_id),
+        Ok(tc_value::Value::String(actor_id)) => Ok(actor_id),
         _ => Err(Box::new(bad_request_response(
             "invalid key query parameter",
         ))),

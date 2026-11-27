@@ -14,6 +14,7 @@ impl super::KernelInner {
         target: &pathlink::Link,
         txn: &crate::TxnHandle,
     ) -> tc_error::TCResult<(Target, crate::TxnHandle)> {
+        txn.check_active()?;
         let scope = txn.application_scope().ok_or_else(|| {
             tc_error::TCError::unauthorized("application dependency call has no execution scope")
         })?;
@@ -34,12 +35,36 @@ impl super::KernelInner {
                 "unauthorized dependency {identity}"
             )));
         }
-        if target.host().is_none() {
-            return Ok((Target::Application(target.clone()), txn.clone()));
+
+        if matches!(method, Method::Put | Method::Delete) {
+            txn.check_write()?;
         }
-        let claim = crate::Claim::new(identity, umask::Mode::all());
+
+        if matches!(method, Method::Put | Method::Post | Method::Delete) {
+            txn.record_dependency(identity.clone())?;
+        }
+
+        let txn = if method == Method::Get {
+            txn.branch().read_only()
+        } else {
+            txn.branch()
+        };
+
+        // Delegation grants permission; only the destination establishes leadership.
+        let mask = if method == Method::Get {
+            umask::USER_READ
+        } else {
+            umask::USER_READ | umask::USER_WRITE
+        };
+
+        let claim = crate::Claim::new(identity, mask);
         let txn = txn.grant_claim(claim).await?;
-        Ok((Target::Remote(target.clone()), txn))
+
+        if target.host().is_none() {
+            Ok((Target::Application(target.clone()), txn))
+        } else {
+            Ok((Target::Remote(target.clone()), txn))
+        }
     }
 
     async fn application(
@@ -49,14 +74,10 @@ impl super::KernelInner {
         method: Method,
         body: State,
     ) -> tc_error::TCResult<State> {
-        self.dispatch(txn, target, method, Some(body))
+        Ok(self
+            .dispatch(txn, target, method, Some(body))
             .await?
-            .0
-            .ok_or_else(|| {
-                tc_error::TCError::internal(
-                    "nested application dispatch returned a transaction decision",
-                )
-            })
+            .expect("nested application dispatch returned a transaction decision"))
     }
 
     pub(crate) async fn get(
@@ -69,7 +90,7 @@ impl super::KernelInner {
         match target {
             Target::Host => crate::host::auth_context(&txn),
             Target::Application(application) => {
-                self.application(&txn, &application, Method::Get, State::from_scalar(key))
+                self.application(&txn, &application, Method::Get, State::from(key))
                     .await
             }
             Target::Remote(target) => {
@@ -97,7 +118,7 @@ impl super::KernelInner {
                     &txn,
                     &application,
                     Method::Put,
-                    State::Tuple(vec![State::from_scalar(key), value]),
+                    State::from(vec![State::from(key), value]),
                 )
                 .await
                 .map(|_| ()),
@@ -121,7 +142,7 @@ impl super::KernelInner {
                 crate::uri::HOST_ROOT,
             )),
             Target::Application(application) => {
-                self.application(&txn, &application, Method::Post, State::Map(params))
+                self.application(&txn, &application, Method::Post, State::from(params))
                     .await
             }
             Target::Remote(target) => {
@@ -144,7 +165,7 @@ impl super::KernelInner {
                 crate::uri::HOST_ROOT,
             )),
             Target::Application(application) => self
-                .application(&txn, &application, Method::Delete, State::from_scalar(key))
+                .application(&txn, &application, Method::Delete, State::from(key))
                 .await
                 .map(|_| ()),
             Target::Remote(target) => {

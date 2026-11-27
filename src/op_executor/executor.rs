@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
 
-use crate::State;
 use futures::stream::{self, StreamExt};
 use tc_error::{TCError, TCResult};
 use tc_ir::{Id, Scalar};
 use tc_state::resolve;
 
+use crate::State;
+
 pub(super) async fn resolve_with_admission(
     provider: Scalar,
-    values: &Arc<HashMap<Id, State>>,
+    values: &HashMap<Id, State>,
     txn: &crate::txn::TxnHandle,
     self_state: Option<&State>,
 ) -> TCResult<State> {
@@ -24,7 +24,7 @@ pub(super) async fn resolve_with_admission(
 
 pub(crate) struct Executor<'a> {
     txn: &'a crate::txn::TxnHandle,
-    resolved: Arc<HashMap<Id, State>>,
+    resolved: HashMap<Id, State>,
     bindings: BTreeMap<Id, Scalar>,
     self_state: Option<State>,
 }
@@ -67,7 +67,7 @@ impl<'a> Executor<'a> {
 
         Ok(Self {
             txn,
-            resolved: Arc::new(resolved),
+            resolved,
             bindings,
             self_state,
         })
@@ -76,7 +76,7 @@ impl<'a> Executor<'a> {
     pub(crate) async fn capture(mut self, capture: Id) -> TCResult<State> {
         if self.resolved.contains_key(&capture) {
             return self
-                .resolved_mut()
+                .resolved
                 .remove(&capture)
                 .ok_or_else(|| TCError::not_found(format!("capture {capture}")));
         }
@@ -97,9 +97,7 @@ impl<'a> Executor<'a> {
         )?;
 
         while !self.resolved.contains_key(&capture) {
-            let pending = std::mem::take(&mut schedule.ready)
-                .into_iter()
-                .collect::<Vec<_>>();
+            let pending = std::mem::take(&mut schedule.ready);
 
             if pending.is_empty() {
                 return Err(TCError::bad_request(format!(
@@ -109,34 +107,30 @@ impl<'a> Executor<'a> {
 
             let mut resolved = HashMap::with_capacity(pending.len());
             {
-                let values = Arc::clone(&self.resolved);
+                let values = &self.resolved;
+                let txn = self.txn;
+                let self_state = self.self_state.as_ref();
                 let pending = pending
                     .into_iter()
                     .map(|id| {
-                        let provider = self.bindings[&id].clone();
+                        let provider = self
+                            .bindings
+                            .remove(&id)
+                            .expect("scheduled provider exists");
+
                         (id, provider)
                     })
                     .collect::<Vec<_>>();
+
                 let limit = if self.txn.graph_admitted() {
                     1
                 } else {
                     limits.parallel_graph_ops
                 };
                 let mut futures = stream::iter(pending)
-                    .map(|(id, provider)| {
-                        let values = Arc::clone(&values);
-                        let txn = self.txn.clone();
-                        let self_state = self.self_state.clone();
-                        async move {
-                            let state = resolve_with_admission(
-                                provider,
-                                &values,
-                                &txn,
-                                self_state.as_ref(),
-                            )
-                            .await;
-                            (id, state)
-                        }
+                    .map(|(id, provider)| async move {
+                        let state = resolve_with_admission(provider, values, txn, self_state).await;
+                        (id, state)
                     })
                     .buffered(limit);
 
@@ -153,16 +147,13 @@ impl<'a> Executor<'a> {
             for id in resolved.keys() {
                 schedule.complete(id);
             }
-            self.resolved_mut().extend(resolved);
+
+            self.resolved.extend(resolved);
         }
 
-        self.resolved_mut()
+        self.resolved
             .remove(&capture)
             .ok_or_else(|| TCError::not_found(format!("capture {capture}")))
-    }
-
-    fn resolved_mut(&mut self) -> &mut HashMap<Id, State> {
-        Arc::make_mut(&mut self.resolved)
     }
 }
 
@@ -245,77 +236,5 @@ impl Schedule {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tc_ir::{IdRef, TCRef};
-
-    fn dependency(id: &str) -> Scalar {
-        Scalar::from(TCRef::Id(id.parse::<IdRef>().expect("IdRef")))
-    }
-
-    #[test]
-    fn provider_discovery_is_transitive_and_ordered() {
-        let bindings = BTreeMap::from([
-            ("a".parse().unwrap(), dependency("$b")),
-            ("b".parse().unwrap(), Scalar::from(1_u64)),
-        ]);
-        let schedule =
-            Schedule::build(&"a".parse().unwrap(), &bindings, &HashMap::new(), 10, 10).unwrap();
-        assert_eq!(
-            schedule
-                .indegree
-                .into_keys()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>(),
-            ["a", "b"]
-        );
-    }
-
-    #[test]
-    fn provider_discovery_rejects_missing_inputs_and_cycles() {
-        let missing = BTreeMap::from([("a".parse().unwrap(), dependency("$missing"))]);
-        let error =
-            Schedule::build(&"a".parse().unwrap(), &missing, &HashMap::new(), 10, 10).unwrap_err();
-        assert!(error.to_string().contains("missing input value"));
-
-        let cyclic = BTreeMap::from([
-            ("a".parse().unwrap(), dependency("$b")),
-            ("b".parse().unwrap(), dependency("$a")),
-        ]);
-        let schedule =
-            Schedule::build(&"a".parse().unwrap(), &cyclic, &HashMap::new(), 10, 10).unwrap();
-        assert!(schedule.ready.is_empty());
-    }
-
-    #[test]
-    fn scheduler_bounds_edges_and_handles_a_deep_chain_iteratively() {
-        let fan_in = BTreeMap::from([
-            (
-                "result".parse().unwrap(),
-                Scalar::Tuple(vec![dependency("$left"), dependency("$right")]),
-            ),
-            ("left".parse().unwrap(), Scalar::from(1_u64)),
-            ("right".parse().unwrap(), Scalar::from(2_u64)),
-        ]);
-        let error = Schedule::build(&"result".parse().unwrap(), &fan_in, &HashMap::new(), 10, 1)
-            .unwrap_err();
-        assert!(error.to_string().contains("1-edge limit"));
-
-        let mut chain = BTreeMap::new();
-        chain.insert("n0000".parse().unwrap(), Scalar::from(0_u64));
-        for index in 1..4_096 {
-            let id: Id = format!("n{index:04}").parse().unwrap();
-            chain.insert(id, dependency(&format!("$n{:04}", index - 1)));
-        }
-        let schedule = Schedule::build(
-            &"n4095".parse().unwrap(),
-            &chain,
-            &HashMap::new(),
-            4_096,
-            4_095,
-        )
-        .expect("iterative chain planning");
-        assert_eq!(schedule.indegree.len(), 4_096);
-        assert_eq!(schedule.ready.len(), 1);
-    }
-}
+#[path = "../../tests/support/op_executor_schedule.rs"]
+mod tests;

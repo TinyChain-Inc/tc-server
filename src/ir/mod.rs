@@ -10,9 +10,10 @@ pub(crate) struct LibraryAnalysis {
 }
 
 pub(crate) fn compile_ir_library(definition: Scalar) -> TCResult<LibraryAnalysis> {
-    let Scalar::Map(members) = definition else {
+    let tc_ir::Scalar::Map(members) = definition else {
         return Err(TCError::bad_request("a Library definition must be a map"));
     };
+
     let requirements = application_requirements(members.values());
     Ok(LibraryAnalysis {
         members,
@@ -38,11 +39,13 @@ pub(crate) fn member<'a>(members: &'a Map<Scalar>, path: &[PathSegment]) -> Opti
     let (name, suffix) = path.split_first()?;
     let mut member = members.get(name.as_str())?;
     for segment in suffix {
-        let Scalar::Map(children) = member else {
+        let tc_ir::Scalar::Map(children) = &member else {
             return None;
         };
+
         member = children.get(segment.as_str())?;
     }
+
     Some(member)
 }
 
@@ -52,7 +55,7 @@ pub(crate) fn route_member<'a>(
     path: &[PathSegment],
 ) -> Option<Box<dyn Handler<'a, State> + 'a>> {
     Some(tc_state::route_scalar(member(members, path)?, || {
-        State::from(tc_value::Value::Link(identity.clone()))
+        State::from(tc_value::Value::from(identity.clone()))
     }))
 }
 

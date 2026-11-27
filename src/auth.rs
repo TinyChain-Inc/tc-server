@@ -1,6 +1,7 @@
-use pathlink::Link;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use pathlink::Link;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claim {
@@ -110,13 +111,11 @@ impl AuthContext {
     pub(crate) fn take_signed(&mut self) -> Option<Arc<SignedToken>> {
         self.signed.take()
     }
-
-    #[cfg(test)]
-    pub(crate) fn with_signed(mut self, signed: SignedToken) -> Self {
-        self.signed = Some(Arc::new(signed));
-        self
-    }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/auth_context.rs"]
+mod test_context;
 
 mod rjwt_token {
     use std::collections::{BTreeMap, HashMap};

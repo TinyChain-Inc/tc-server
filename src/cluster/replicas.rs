@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
+use base64::Engine as _;
 use pathlink::PathSegment;
+use safecast::TryCastFrom;
 use tc_error::{TCError, TCResult};
 use tc_ir::{DeleteHandler, GetHandler, Handler, PutHandler, Route, Scalar, Transact, TxnId};
 
-use super::{AsyncHash, Cluster};
+use super::{AsyncHash, Cluster, Participation};
 
 pub(super) struct ReplicaHandler<'a, T> {
     pub(super) cluster: &'a Cluster<T>,
@@ -40,30 +43,63 @@ impl<T> Cluster<T> {
             .collect())
     }
 
+    pub(super) async fn replica_identities(
+        &self,
+        txn_id: TxnId,
+    ) -> TCResult<BTreeSet<(String, String, String, Vec<u8>)>> {
+        let key = self.protocol.verifying_key();
+        let mut identities = BTreeSet::from([(
+            self.protocol.host().to_string(),
+            self.protocol.actor_id().to_string(),
+            key.alg().name().to_string(),
+            key.to_bytes().to_vec(),
+        )]);
+
+        for replica in self.replica_snapshot(txn_id).await? {
+            let host = replica
+                .host
+                .parse::<pathlink::Link>()
+                .map_err(|error| TCError::internal(format!("invalid replica host: {error}")))?;
+
+            let key = base64::engine::general_purpose::STANDARD
+                .decode(replica.public_key_b64)
+                .map_err(|error| TCError::internal(format!("invalid replica key: {error}")))?;
+
+            identities.insert((
+                host.to_string(),
+                replica.actor_id,
+                replica.algorithm.name().to_string(),
+                key,
+            ));
+        }
+
+        Ok(identities)
+    }
+
+    pub(crate) async fn replication_peers(
+        &self,
+        txn: &crate::TxnHandle,
+    ) -> TCResult<BTreeSet<String>> {
+        if self.leads(txn) {
+            self.replica_endpoints(txn.id()).await
+        } else {
+            Ok(BTreeSet::new())
+        }
+    }
+
     pub(crate) async fn replicate(
         &self,
         txn: &crate::TxnHandle,
+        peers: &BTreeSet<String>,
         target: &pathlink::Link,
-        method: tc_ir::Method,
         key: Scalar,
         value: Option<crate::State>,
     ) -> TCResult<()> {
-        if !self.leads(txn) {
-            return Ok(());
-        }
-        let peers = self.replica_endpoints(txn.id()).await?;
         if peers.is_empty() {
             return Ok(());
         }
-        let result = match method {
-            tc_ir::Method::Put if value.is_some() => {
-                self.forward(txn, &peers, target, key, value).await?
-            }
-            tc_ir::Method::Delete if value.is_none() => {
-                self.forward(txn, &peers, target, key, value).await?
-            }
-            _ => return Err(TCError::internal("invalid replicated resource mutation")),
-        };
+
+        let result = self.forward(txn, peers, target, key, value).await?;
         self.accept_write_fanout(txn, result).await
     }
 
@@ -113,7 +149,6 @@ impl<T> Cluster<T> {
                 .await
                 .map_err(TCError::from)?;
         }
-        txn.mark_resource_mutated(self.path())?;
 
         if !evictions.delivered().is_empty() {
             let target = replicas_link(&self.path);
@@ -123,38 +158,95 @@ impl<T> Cluster<T> {
                     &delivered,
                     txn,
                     &target,
-                    Scalar::Value(tc_value::Value::String(endpoint)),
+                    Scalar::from(tc_value::Value::from(endpoint)),
                     self.gateway.as_ref(),
                 )
                 .await?;
+
                 removal.complete("failed to propagate replica eviction")?;
             }
         }
+
         Ok(())
     }
 
     async fn replicate_membership(
         &self,
         txn: &crate::TxnHandle,
+        mut peers: BTreeSet<String>,
         endpoint: &str,
         value: Option<crate::State>,
     ) -> TCResult<()> {
-        if !self.leads(txn) {
-            return Ok(());
-        }
+        // A peer does not retain its own identity as a remote replica.
+        peers.remove(endpoint);
 
-        let mut peers = self.replica_endpoints(txn.id()).await?;
-        if value.is_none() {
-            peers.remove(endpoint);
-        }
         if peers.is_empty() {
             return Ok(());
         }
 
         let target = replicas_link(&self.path);
-        let key = Scalar::Value(tc_value::Value::String(endpoint.to_string()));
+        let key = Scalar::from(tc_value::Value::from(endpoint.to_string()));
         let result = self.forward(txn, &peers, &target, key, value).await?;
         self.accept_write_fanout(txn, result).await
+    }
+
+    /// Resolve decision authority without admitting another application call.
+    async fn decision_participant(&self, txn: &crate::TxnHandle) -> TCResult<Arc<Participation>>
+    where
+        T: Clone,
+    {
+        let mut claims = txn
+            .protocol_snapshot()
+            .ok_or_else(|| TCError::unauthorized("missing transaction authority"))?;
+
+        if !claims.locked {
+            return Err(TCError::conflict("inconsistent transaction decision"));
+        }
+
+        let owner = claims
+            .owner
+            .as_ref()
+            .ok_or_else(|| TCError::unauthorized("missing transaction owner"))?;
+
+        let leader = claims.leaders.get(&self.path);
+        let existing = self.participation.lock().get(&txn.id()).cloned();
+        let participant = match existing {
+            Some(Some(existing)) => existing,
+            Some(None) => return Err(TCError::conflict("namespace structure is reserved")),
+            None => {
+                // An untouched replica may enroll for a decision, never new work.
+                let leader = leader.ok_or_else(|| TCError::conflict("resource was not claimed"))?;
+                self.verify_leader(txn, leader).await?;
+                let participant = Arc::new(Participation::new(owner.clone(), leader.clone()));
+                participant.seal()?;
+                // Membership access awaited; refresh authority before validating
+                // the winning entry. Existing participation needs no reparse.
+                claims = txn
+                    .protocol_snapshot()
+                    .ok_or_else(|| TCError::unauthorized("missing transaction authority"))?;
+
+                self.participation
+                    .lock()
+                    .entry(txn.id())
+                    .or_insert(Some(participant))
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| TCError::conflict("namespace structure is reserved"))?
+            }
+        };
+
+        if claims.owner.as_ref() != Some(&participant.owner)
+            || claims
+                .leaders
+                .get(&self.path)
+                .is_some_and(|leader| leader != &participant.leader)
+        {
+            return Err(TCError::unauthorized(
+                "decision does not match resource ownership",
+            ));
+        }
+
+        Ok(participant)
     }
 
     pub(crate) async fn decide(
@@ -163,28 +255,109 @@ impl<T> Cluster<T> {
         outcome: crate::txn::TransactionOutcome,
     ) -> TCResult<()>
     where
-        T: Transact,
+        T: Clone + Transact,
     {
-        if !self.leads(txn) {
-            return if outcome.commits() {
-                self.commit(txn.id()).await
-            } else {
-                self.rollback(&txn.id()).await
-            };
+        use futures::{StreamExt, TryStreamExt};
+
+        let participant = self.decision_participant(txn).await?;
+
+        let claims = txn
+            .protocol_snapshot()
+            .ok_or_else(|| TCError::unauthorized("missing decision authority"))?;
+
+        if !claims.locked || claims.decision.is_some_and(|previous| previous != outcome) {
+            return Err(TCError::conflict("inconsistent transaction decision"));
         }
-        crate::replication::forward_resource_decision(
-            &self.replica_endpoints(txn.id()).await?,
-            txn,
-            &self.path,
-            outcome.commits(),
-            self.gateway.as_ref(),
-        )
-        .await?;
-        if outcome.commits() {
+
+        let dependencies = participant.seal()?;
+        let leads = participant.leader
+            == (
+                self.protocol.host().to_string(),
+                self.protocol.actor_id().to_string(),
+            );
+
+        if !leads && txn.owns_invocation() {
+            // Bootstrap may own the invocation on a joining replica while the
+            // established resource leader remains on the seed host.
+            let leader = self
+                .replica_snapshot(txn.id())
+                .await?
+                .into_iter()
+                .find(|replica| {
+                    replica.host == participant.leader.0 && replica.actor_id == participant.leader.1
+                })
+                .ok_or_else(|| TCError::conflict("resource leader has no replica endpoint"))?;
+
+            let token = txn.raw_token().expect("locked owner decision");
+            self.gateway
+                .decide_resource(&leader.endpoint, &token, txn, &self.path, outcome.commits())
+                .await?;
+        }
+
+        if leads {
+            // Only the destination knows its retained leader. A valid signature
+            // for another actor or resource cannot suppress delivery here.
+            if claims.visited.contains(&(
+                participant.leader.0.clone(),
+                participant.leader.1.clone(),
+                self.path.clone(),
+            )) {
+                return Ok(());
+            }
+
+            let branch = txn.decision_branch(&self.path, outcome)?;
+            let token = branch.raw_token().expect("signed decision branch");
+            let mut deliveries = futures::stream::iter(dependencies)
+                .map(|target| {
+                    let branch = &branch;
+                    let token = &token;
+                    async move {
+                        if let Some(host) = target.host() {
+                            let peer = crate::replication::normalize_peer(&host.to_string())?;
+                            self.gateway
+                                .decide_resource(
+                                    &peer,
+                                    token,
+                                    branch,
+                                    target.path(),
+                                    outcome.commits(),
+                                )
+                                .await
+                        } else {
+                            branch.decide_local(&target, outcome).await
+                        }
+                    }
+                })
+                .buffered(8);
+
+            while deliveries.try_next().await?.is_some() {}
+
+            crate::replication::forward_resource_decision(
+                &self.replica_endpoints(txn.id()).await?,
+                &branch,
+                &self.path,
+                outcome.commits(),
+                self.gateway.as_ref(),
+            )
+            .await?;
+        }
+
+        let mut application = LocalDecision { txn, armed: true };
+        let result = if outcome.commits() {
             self.commit(txn.id()).await
         } else {
             self.rollback(&txn.id()).await
+        };
+
+        if let Err(error) = result {
+            txn.fatal_recovery(format!(
+                "local transaction application failed: {error}; causes: {:?}",
+                error.causes()
+            ));
         }
+
+        application.armed = false;
+        Ok(())
     }
 
     pub(super) async fn decide_request(
@@ -195,7 +368,7 @@ impl<T> Cluster<T> {
         has_body: bool,
     ) -> TCResult<bool>
     where
-        T: Transact,
+        T: Clone + Transact,
     {
         if !txn.is_locked() {
             return Ok(false);
@@ -301,17 +474,13 @@ impl<'a, T: AsyncHash> Handler<'a, crate::State> for ServiceMutation<'a, T> {
                 if !txn.may_mutate(&cluster.path.clone().into(), cluster.path()) {
                     return Err(TCError::unauthorized("unauthorized Service mutation"));
                 }
+
+                let peers = cluster.replication_peers(txn).await?;
+                put(txn, key.clone(), value.clone()).await?;
+
                 cluster
-                    .replicate(
-                        txn,
-                        &target,
-                        tc_ir::Method::Put,
-                        key.clone(),
-                        Some(value.clone()),
-                    )
-                    .await?;
-                put(txn, key, value).await?;
-                txn.mark_resource_mutated(cluster.path())
+                    .replicate(txn, &peers, &target, key, Some(value))
+                    .await
             })
         }))
     }
@@ -331,11 +500,11 @@ impl<'a, T: AsyncHash> Handler<'a, crate::State> for ServiceMutation<'a, T> {
                 if !txn.may_mutate(&cluster.path.clone().into(), cluster.path()) {
                     return Err(TCError::unauthorized("unauthorized Service mutation"));
                 }
-                cluster
-                    .replicate(txn, &target, tc_ir::Method::Delete, key.clone(), None)
-                    .await?;
-                delete(txn, key).await?;
-                txn.mark_resource_mutated(cluster.path())
+
+                let peers = cluster.replication_peers(txn).await?;
+                delete(txn, key.clone()).await?;
+
+                cluster.replicate(txn, &peers, &target, key, None).await
             })
         }))
     }
@@ -347,19 +516,23 @@ where
 {
     async fn commit(&self, txn_id: TxnId) -> TCResult<()> {
         self.state.commit(txn_id).await?;
-        self.replicas.commit(txn_id);
+        self.replicas.commit(txn_id)?;
         Ok(())
     }
 
     async fn rollback(&self, txn_id: &TxnId) -> TCResult<()> {
         self.state.rollback(txn_id).await?;
-        self.replicas.rollback(txn_id);
+        self.replicas.rollback(txn_id)?;
         Ok(())
     }
 
     async fn finalize(&self, cutoff: &TxnId) -> TCResult<()> {
         self.state.finalize(cutoff).await?;
-        self.replicas.finalize(*cutoff);
+        self.replicas.finalize(*cutoff)?;
+        self.participation
+            .lock()
+            .retain(|txn_id, _| txn_id > cutoff);
+
         Ok(())
     }
 }
@@ -396,11 +569,18 @@ where
     {
         Some(Box::new(move |txn, key, value| {
             Box::pin(async move {
+                if !txn.may_mutate(&replicas_link(self.cluster.path()), self.cluster.path()) {
+                    return Err(TCError::unauthorized(
+                        "unauthorized replica membership mutation",
+                    ));
+                }
+
                 if self.endpoint.is_some() {
                     return Err(TCError::bad_request(
                         "replica PUT must target the replicas collection",
                     ));
                 }
+
                 let endpoint = replica_key(None, key)?
                     .ok_or_else(|| TCError::bad_request("replica PUT requires an endpoint key"))?;
                 let (host, actor_id, algorithm, public_key_b64, expected_hash) =
@@ -411,7 +591,9 @@ where
                         "replica state hash does not match this resource",
                     ));
                 }
+
                 use txn_lock::map::Entry;
+
                 let replica = crate::replication::Replica {
                     endpoint: endpoint.clone(),
                     host,
@@ -419,42 +601,32 @@ where
                     algorithm,
                     public_key_b64,
                 };
-                let existing = self
-                    .cluster
-                    .replicas
-                    .get(txn.id(), &endpoint)
-                    .await
-                    .map_err(TCError::from)?
-                    .map(|entry| entry.clone());
-                match existing {
-                    Some(existing) if existing == replica => return Ok(()),
-                    Some(_) => {
+
+                let peers = self.cluster.replication_peers(txn).await?;
+                let value = replica_put_state(&replica, expected_hash);
+                {
+                    let entry = self
+                        .cluster
+                        .replicas
+                        .entry(txn.id(), endpoint.clone())
+                        .await
+                        .map_err(TCError::from)?;
+
+                    if matches!(&entry, Entry::Occupied(entry) if entry.get() != &replica) {
                         return Err(TCError::conflict("replica endpoint has another identity"));
                     }
-                    None => {}
+
+                    // Validate identity before registering its key. Registration is
+                    // synchronous; release the membership entry before any fanout.
+                    txn.register_peer_identity(&replica)?;
+                    if let Entry::Vacant(entry) = entry {
+                        entry.insert(replica)?;
+                    }
                 }
 
-                let value = replica_put_state(&replica, expected_hash);
                 self.cluster
-                    .replicate_membership(txn, &replica.endpoint, Some(value))
-                    .await?;
-                match self
-                    .cluster
-                    .replicas
-                    .entry(txn.id(), endpoint)
+                    .replicate_membership(txn, peers, &endpoint, Some(value))
                     .await
-                    .map_err(TCError::from)?
-                {
-                    Entry::Vacant(entry) => {
-                        entry.insert(replica);
-                        txn.mark_resource_mutated(self.cluster.path())?;
-                    }
-                    Entry::Occupied(entry) if entry.get() == &replica => return Ok(()),
-                    Entry::Occupied(_) => {
-                        return Err(TCError::conflict("replica endpoint has another identity"));
-                    }
-                }
-                Ok(())
             })
         }))
     }
@@ -465,6 +637,12 @@ where
     {
         Some(Box::new(move |txn, key| {
             Box::pin(async move {
+                if !txn.may_mutate(&replicas_link(self.cluster.path()), self.cluster.path()) {
+                    return Err(TCError::unauthorized(
+                        "unauthorized replica membership mutation",
+                    ));
+                }
+
                 let endpoint = replica_key(self.endpoint.as_deref(), key)?
                     .ok_or_else(|| TCError::bad_request("replica DELETE requires an endpoint"))?;
                 if self
@@ -477,16 +655,17 @@ where
                 {
                     return Ok(());
                 }
-                self.cluster
-                    .replicate_membership(txn, &endpoint, None)
-                    .await?;
+
+                let peers = self.cluster.replication_peers(txn).await?;
                 self.cluster
                     .replicas
                     .remove(txn.id(), &endpoint)
                     .await
                     .map_err(TCError::from)?;
-                txn.mark_resource_mutated(self.cluster.path())?;
-                Ok(())
+
+                self.cluster
+                    .replicate_membership(txn, peers, &endpoint, None)
+                    .await
             })
         }))
     }
@@ -494,15 +673,16 @@ where
 
 fn replica_key(path: Option<&str>, key: Scalar) -> TCResult<Option<String>> {
     let from_path = path.map(str::to_string);
-    let from_key = match key {
-        Scalar::Value(tc_value::Value::None) => None,
-        Scalar::Value(tc_value::Value::String(endpoint)) => Some(endpoint),
+    let from_key = match tc_value::Value::opt_cast_from(key) {
+        Some(tc_value::Value::None) => None,
+        Some(tc_value::Value::String(endpoint)) => Some(endpoint),
         _ => {
             return Err(TCError::bad_request(
                 "replica key must be an endpoint string",
             ));
         }
     };
+
     match (from_path, from_key) {
         (Some(path), Some(key)) if path != key => {
             Err(TCError::bad_request("conflicting replica keys"))
@@ -511,7 +691,7 @@ fn replica_key(path: Option<&str>, key: Scalar) -> TCResult<Option<String>> {
     }
 }
 
-fn replicas_link(path: &pathlink::PathBuf) -> pathlink::Link {
+pub(super) fn replicas_link(path: &pathlink::PathBuf) -> pathlink::Link {
     pathlink::Link::from(
         path.clone().append(
             super::REPLICAS
@@ -522,11 +702,12 @@ fn replicas_link(path: &pathlink::PathBuf) -> pathlink::Link {
 }
 
 fn replica_value(value: crate::State) -> TCResult<(String, String, rjwt::AlgKind, String, String)> {
-    let crate::State::Tuple(values) = value else {
+    let tc_state::State::Tuple(values) = value else {
         return Err(TCError::bad_request(
             "replica value must be [host, actor, algorithm, public_key, state_hash]",
         ));
     };
+
     let [host, actor, algorithm, key, hash]: [crate::State; 5] =
         values.try_into().map_err(|_| {
             TCError::bad_request(
@@ -545,8 +726,8 @@ fn replica_value(value: crate::State) -> TCResult<(String, String, rjwt::AlgKind
 }
 
 fn state_string(state: crate::State) -> TCResult<String> {
-    match state {
-        crate::State::Scalar(Scalar::Value(tc_value::Value::String(value))) => Ok(value),
+    match tc_value::Value::opt_cast_from(state) {
+        Some(tc_value::Value::String(value)) => Ok(value),
         _ => Err(TCError::bad_request(
             "replica record fields must be strings",
         )),
@@ -563,7 +744,7 @@ fn replica_state(replica: crate::replication::Replica) -> crate::State {
             replica.public_key_b64,
         ]
         .into_iter()
-        .map(|value| crate::State::from(tc_value::Value::String(value)))
+        .map(|value| crate::State::from(tc_value::Value::from(value)))
         .collect(),
     )
 }
@@ -581,7 +762,26 @@ pub(crate) fn replica_put_state(
             state_hash,
         ]
         .into_iter()
-        .map(|value| crate::State::from(tc_value::Value::String(value)))
+        .map(|value| crate::State::from(tc_value::Value::from(value)))
         .collect(),
     )
+}
+
+#[cfg(test)]
+#[path = "../../tests/support/integrity.rs"]
+mod integrity_tests;
+
+/// Once local lifecycle application starts, cancellation cannot leave the host reusable.
+struct LocalDecision<'a> {
+    txn: &'a crate::TxnHandle,
+    armed: bool,
+}
+
+impl Drop for LocalDecision<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.txn
+                .fatal_recovery("local transaction application interrupted");
+        }
+    }
 }

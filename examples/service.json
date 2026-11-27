@@ -2,8 +2,9 @@
   "/service/example-devco/btree/1.0.0": {
     "label": "native",
     "data": {
-      "/state/chain/sync": [
-        {"/state/collection/btree": [[["key", "/state/scalar/value/number"]]]}
+      "/state/scalar/ref/op/get": [
+        "/state/chain/sync",
+        {"/state/scalar/ref/op/get": ["/state/collection/btree", {"/state/scalar/value/tuple": [["key", "/state/scalar/value/number"]]}]}
       ]
     },
     "count": {

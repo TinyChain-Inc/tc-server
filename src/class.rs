@@ -2,19 +2,18 @@ use std::sync::Arc;
 
 use pathlink::{Link, PathSegment};
 use tc_error::{TCError, TCResult};
-use tc_ir::{
-    DeleteHandler, GetHandler, Handler, PostHandler, Public, PutHandler, Route, Transact, TxnId,
-};
+use tc_ir::{DeleteHandler, GetHandler, Handler, PostHandler, PutHandler, Route, Transact, TxnId};
 use tc_state::{ClassBody, ClassDef};
 
 use crate::storage::ApplicationBlock;
 
 const MANIFEST: &str = "manifest.json";
+
 pub(crate) const MAX_CLASS_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct Root<'a>(pub(crate) &'a crate::cluster::Cluster<crate::cluster::Dir<Class>>);
 
-impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
+impl<'a> Handler<'a, crate::State> for &'a Root<'_> {
     fn put<'txn>(self: Box<Self>) -> Option<PutHandler<'a, 'txn, crate::State>>
     where
         'txn: 'a,
@@ -28,8 +27,8 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
                 }
                 let body = ClassBody::try_from(definition.clone())
                     .map_err(|error| TCError::bad_request(error.to_string()))?;
+
                 let class = ClassDef::from_body(identity.clone(), body);
-                let expected = class.clone();
                 let conflict_identity = identity.clone();
                 let path = identity.path()[1..].to_vec();
                 self.0
@@ -38,29 +37,22 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
                         txn,
                         &path,
                         &segments,
-                        move |existing| {
-                            (existing.class == expected).then_some(()).ok_or_else(|| {
+                        class,
+                        move |existing, expected| {
+                            (existing.class == *expected).then_some(()).ok_or_else(|| {
                                 TCError::conflict(format!(
                                     "immutable Class version {conflict_identity} has conflicting content"
                                 ))
                             })
                         },
-                        move |parent, remaining| async move {
-                            self.0
-                                .replicate(
-                                    txn,
-                                    &"/class".parse().expect("Class root"),
-                                    tc_ir::Method::Put,
-                                    tc_ir::Scalar::Value(tc_value::Value::Link(identity.clone())),
-                                    Some(crate::State::from_scalar(definition)),
-                                )
-                                .await?;
-                            parent
-                                .create_item(txn, &remaining, move |storage| {
-                                    Class::create(txn.id(), storage, class)
-                                })
-                                .await
-                                .map(|_| ())
+                        move |class| {
+                            (
+                                (
+                                    tc_ir::Scalar::from(tc_value::Value::from(identity)),
+                                    crate::State::from(definition),
+                                ),
+                                move |storage| Class::create(txn.id(), storage, class),
+                            )
                         },
                     )
                     .await
@@ -70,7 +62,7 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
 }
 
 #[derive(Clone)]
-pub struct Class {
+pub(crate) struct Class {
     storage: txfs::Dir<TxnId, ApplicationBlock>,
     class: ClassDef,
     scope: Arc<crate::txn::DependencyScope>,
@@ -86,10 +78,14 @@ impl Class {
             .create_file(
                 txn_id,
                 MANIFEST.parse().expect("manifest file name"),
-                ApplicationBlock::Manifest(class.identity().clone(), class.body().definition()),
+                ApplicationBlock::Manifest(
+                    class.identity().clone(),
+                    Box::new(class.body().definition()),
+                ),
             )
             .await
             .map_err(TCError::from)?;
+
         Ok(Self::new(storage, class))
     }
 
@@ -111,16 +107,20 @@ impl Class {
         let txfs::DirEntry::File(manifest) = &*entry else {
             return Err(TCError::bad_request("unsupported Class layout"));
         };
+
         let block = manifest
             .read::<ApplicationBlock>(txn_id)
             .await
             .map_err(TCError::from)?;
+
         let ApplicationBlock::Manifest(identity, definition) = &*block else {
             return Err(TCError::bad_request("unsupported Class layout"));
         };
+
         crate::uri::validate_identity(identity, "class")?;
-        let body = ClassBody::try_from(definition.clone())
+        let body = ClassBody::try_from(tc_ir::Scalar::clone(definition))
             .map_err(|error| TCError::bad_request(error.to_string()))?;
+
         let class = ClassDef::from_body(identity.clone(), body);
         Ok(Self::new(storage, class))
     }
@@ -130,6 +130,7 @@ impl Class {
             class.identity().clone(),
             crate::ir::application_requirements(class.prototype().values()),
         );
+
         Self {
             storage,
             class,
@@ -140,9 +141,11 @@ impl Class {
     pub(crate) fn scope(&self) -> Arc<crate::txn::DependencyScope> {
         Arc::clone(&self.scope)
     }
+
     pub(crate) fn identity(&self) -> &Link {
         self.class.identity()
     }
+
     pub(crate) fn definition(&self) -> &ClassDef {
         &self.class
     }
@@ -166,6 +169,7 @@ impl crate::cluster::DirItem for Class {
     fn identity(&self) -> &Link {
         self.identity()
     }
+
     fn bind(&self, txn: &crate::TxnHandle) -> crate::TxnHandle {
         txn.for_application(self.scope())
     }
@@ -195,34 +199,26 @@ impl<'a> Handler<'a, crate::State> for &'a Class {
     where
         'txn: 'a,
     {
-        Some(Box::new(move |txn, key| {
-            Box::pin(async move { self.class.get(txn, &[], key).await })
-        }))
+        let class = *self;
+        Box::new(&class.class).get()
     }
+
     fn post<'txn>(self: Box<Self>) -> Option<PostHandler<'a, 'txn, crate::State>>
     where
         'txn: 'a,
     {
-        Some(Box::new(move |txn, params| {
-            Box::pin(async move { self.class.post(txn, &[], params).await })
-        }))
+        let class = *self;
+        Box::new(&class.class).post()
     }
+
     fn delete<'txn>(self: Box<Self>) -> Option<DeleteHandler<'a, 'txn, crate::State>>
     where
         'txn: 'a,
     {
         Some(Box::new(move |txn, key| {
-            Box::pin(async move {
-                if !matches!(key, tc_ir::Scalar::Value(tc_value::Value::None)) {
-                    return Err(TCError::bad_request(
-                        "Class deletion requires an explicit JSON null",
-                    ));
-                }
-                if !txn.may_mutate(self.identity(), self.identity().path()) {
-                    return Err(TCError::unauthorized("unauthorized Class deletion"));
-                }
-                Ok(())
-            })
+            Box::pin(
+                async move { crate::literal::check_delete(txn, self.identity(), &key, "Class") },
+            )
         }))
     }
 }

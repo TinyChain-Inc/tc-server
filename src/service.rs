@@ -8,22 +8,24 @@ use std::sync::Arc;
 use async_hash::{Digest, Hash, Sha256};
 use pathlink::{Link, PathSegment};
 use safecast::TryCastFrom;
-use tc_collection::{Collection, collection::CollectionSchema};
+use tc_collection::Collection;
+use tc_collection::collection::CollectionSchema;
 use tc_error::{TCError, TCResult};
 use tc_ir::{
     DeleteHandler, GetHandler, Handler, Map, OpDef, OpRef, PutHandler, Route, Scalar, Subject,
-    TCRef, Transact, TxnId,
+    Transact, TxnId,
 };
 use tc_value::Value;
 
 use crate::storage::ApplicationBlock;
 
 const MANIFEST: &str = "manifest.json";
+
 const MEMBERS: &str = ".native";
 
 pub(crate) struct Root<'a>(pub(crate) &'a crate::cluster::Cluster<crate::cluster::Dir<Service>>);
 
-impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
+impl<'a> Handler<'a, crate::State> for &'a Root<'_> {
     fn put<'txn>(self: Box<Self>) -> Option<PutHandler<'a, 'txn, crate::State>>
     where
         'txn: 'a,
@@ -35,7 +37,6 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
                 if !txn.may_mutate(&identity, self.0.path()) {
                     return Err(TCError::unauthorized("unauthorized Service install"));
                 }
-                let expected = definition.clone();
                 let conflict_identity = identity.clone();
                 let path = identity.path()[1..].to_vec();
                 self.0
@@ -44,8 +45,9 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
                         txn,
                         &path,
                         &segments,
-                        move |existing| {
-                            (existing.definition == expected)
+                        definition,
+                        move |existing, expected| {
+                            (existing.definition == *expected)
                                 .then_some(())
                                 .ok_or_else(|| {
                                     TCError::conflict(format!(
@@ -53,25 +55,18 @@ impl<'a, 'runtime: 'a> Handler<'a, crate::State> for Root<'runtime> {
                                     ))
                                 })
                         },
-                        move |parent, remaining| async move {
-                            self.0
-                                .replicate(
-                                    txn,
-                                    &"/service".parse().expect("Service root"),
-                                    tc_ir::Method::Put,
-                                    tc_ir::Scalar::Value(tc_value::Value::Link(identity.clone())),
-                                    Some(crate::State::from_scalar(definition.clone())),
+                        move |definition| {
+                            let replication = (
+                                Scalar::from(Value::from(identity.clone())),
+                                crate::State::from(definition.clone()),
+                            );
+
+                            (replication, move |storage| {
+                                Service::create(
+                                    txn.id(), storage, identity, definition,
+                                    txn.execution_limits().max_op_invocations,
                                 )
-                                .await?;
-                            parent
-                                .create_item(txn, &remaining, move |storage| {
-                                    Service::create(
-                                        txn.id(), storage, identity, definition,
-                                        txn.execution_limits().max_op_invocations,
-                                    )
-                                })
-                                .await
-                                .map(|_| ())
+                            })
                         },
                     )
                     .await
@@ -90,14 +85,14 @@ enum Attr<C = tc_chain::SyncChain<crate::TxnHandle, ApplicationBlock>> {
 impl From<Attr> for crate::State {
     fn from(attr: Attr) -> Self {
         match attr {
-            Attr::Chain(chain) => Self::Chain(chain),
-            Attr::Scalar(scalar) => Self::from_scalar(scalar),
+            Attr::Chain(chain) => crate::State::Chain(chain),
+            Attr::Scalar(scalar) => Self::from(scalar),
         }
     }
 }
 
 #[derive(Clone)]
-pub struct Service {
+pub(crate) struct Service {
     storage: txfs::Dir<TxnId, ApplicationBlock>,
     identity: Link,
     definition: Scalar,
@@ -132,6 +127,7 @@ impl Service {
                             )
                             .clone(),
                     };
+
                     let member = native.write().await.create_dir(name.to_string())?;
                     let (subject, wal, values) = {
                         let mut member = member.write().await;
@@ -141,27 +137,31 @@ impl Service {
                             member.create_dir("values".into())?,
                         )
                     };
-                    let subject = Collection::create(subject, schema)?;
-                    let chain = tc_chain::SyncChain::create(
-                        subject,
-                        wal,
-                        values,
-                        tc_chain::TxnTaskQueue::new(capacity),
-                    )
-                    .await?;
+
+                    // Establish delegated roots and the member's namespace before
+                    // their independent owners publish contents. The enclosing
+                    // txfs lifecycle publishes .native in the Service directory.
+                    member.sync_all().await?;
+
+                    let subject = Collection::create(subject, schema).await?;
+                    let chain = tc_chain::SyncChain::create(subject, wal, values, capacity).await?;
+
                     Attr::Chain(chain)
                 }
                 Attr::Scalar(scalar) => Attr::Scalar(scalar),
             };
+
             attrs.insert(name, attr);
         }
+
         storage
             .create_file(
                 txn_id,
                 MANIFEST.parse().expect("manifest name"),
-                ApplicationBlock::Manifest(identity.clone(), definition.clone()),
+                ApplicationBlock::Manifest(identity.clone(), Box::new(definition.clone())),
             )
             .await?;
+
         Ok(Self::new(storage, identity, definition, attrs))
     }
 
@@ -187,13 +187,16 @@ impl Service {
                 native,
             )
         };
+
         let (identity, definition) = {
             let block = manifest.read::<ApplicationBlock>(txn_id).await?;
             let ApplicationBlock::Manifest(identity, definition) = &*block else {
                 return Err(TCError::bad_request("unsupported Service manifest"));
             };
-            (identity.clone(), definition.clone())
+
+            (identity.clone(), Scalar::clone(definition))
         };
+
         let proto = validate(&identity, &definition)?;
         let mut attrs = Map::new();
         for (name, attr) in proto {
@@ -212,9 +215,7 @@ impl Service {
                         return Err(TCError::bad_request("unsupported Chain member layout"));
                     }
                     let wal = required_dir(&member, "wal").await?;
-                    // Empty capture stores have no files and freqfs does not persist
-                    // empty directories. Every referenced capture is strictly loaded by Chain.
-                    let values = member.write().await.get_or_create_dir("values".into())?;
+                    let values = required_dir(&member, "values").await?;
                     let chain = tc_chain::SyncChain::open(
                         || async {
                             let subject = required_dir(&member, "subject").await?;
@@ -222,15 +223,18 @@ impl Service {
                         },
                         wal,
                         values,
-                        tc_chain::TxnTaskQueue::new(capacity),
+                        capacity,
                     )
                     .await?;
+
                     Attr::Chain(chain)
                 }
                 Attr::Scalar(scalar) => Attr::Scalar(scalar),
             };
+
             attrs.insert(name, attr);
         }
+
         if let Some(native) = native {
             let native = native.read().await;
             if native
@@ -254,10 +258,12 @@ impl Service {
                 Attr::Scalar(scalar) => Some(scalar),
                 Attr::Chain(_) => None,
             }));
+
         let scope = Arc::new(crate::txn::DependencyScope::new(
             identity.clone(),
             requirements,
         ));
+
         Self {
             storage,
             identity,
@@ -282,43 +288,6 @@ impl Service {
             }
         }
         Ok(())
-    }
-
-    #[cfg(feature = "http-client")]
-    pub(crate) async fn synchronize(
-        &self,
-        txn: &crate::TxnHandle,
-        seed: &str,
-        session: &crate::cluster::BootstrapSession,
-    ) -> TCResult<()> {
-        use crate::cluster::AsyncHash;
-
-        if hex::encode(self.hash(txn).await?) == session.state_hash() {
-            return Ok(());
-        }
-        for (name, attr) in &self.attrs {
-            if let Attr::Chain(chain) = attr {
-                let target = self.identity.clone().append(name.clone());
-                let snapshot = crate::replication::read_seed_snapshot(
-                    seed,
-                    session.token(),
-                    txn,
-                    &target,
-                    txn.application_body_limit(),
-                )
-                .await?;
-                let snapshot = Collection::try_cast_from(snapshot, |_| {
-                    TCError::bad_gateway("Service member snapshot is not a collection")
-                })?;
-                chain.restore_from(txn, &snapshot).await?;
-            }
-        }
-        if hex::encode(self.hash(txn).await?) != session.state_hash() {
-            return Err(TCError::conflict(
-                "Service snapshot hash does not match its authenticated source",
-            ));
-        }
-        txn.mark_resource_mutated(self.identity.path())
     }
 
     pub(crate) fn identity(&self) -> &Link {
@@ -372,6 +341,50 @@ impl crate::cluster::DirItem for Service {
     fn bind(&self, txn: &crate::TxnHandle) -> crate::TxnHandle {
         txn.for_application(Arc::clone(&self.scope))
     }
+
+    #[cfg(feature = "http-client")]
+    async fn synchronize(
+        cluster: &crate::cluster::Cluster<Self>,
+        txn: &crate::TxnHandle,
+        seed: &str,
+        session: &crate::cluster::BootstrapSession,
+    ) -> TCResult<()> {
+        use crate::cluster::AsyncHash;
+
+        let (txn, _call) = cluster.enter(txn).await?;
+        let service = cluster.state();
+        if hex::encode(service.hash(&txn).await?) == session.state_hash() {
+            return Ok(());
+        }
+
+        for (name, attr) in &service.attrs {
+            if let Attr::Chain(chain) = attr {
+                let target = service.identity.clone().append(name.clone());
+                let snapshot = crate::replication::read_seed_snapshot(
+                    seed,
+                    session.token(),
+                    &txn,
+                    &target,
+                    txn.application_body_limit(),
+                )
+                .await?;
+
+                let snapshot = Collection::try_cast_from(snapshot, |_| {
+                    TCError::bad_gateway("Service member snapshot is not a collection")
+                })?;
+
+                chain.restore_from(&txn, &snapshot).await?;
+            }
+        }
+
+        if hex::encode(service.hash(&txn).await?) != session.state_hash() {
+            return Err(TCError::conflict(
+                "Service snapshot hash does not match its authenticated source",
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 impl crate::cluster::AsyncHash for Service {
@@ -386,11 +399,13 @@ impl crate::cluster::AsyncHash for Service {
                 Attr::Chain(chain) => <[u8; 32]>::from(chain.hash(txn).await?),
                 Attr::Scalar(scalar) => Hash::<Sha256>::hash(scalar).into(),
             };
+
             let mut attribute = Sha256::new();
             attribute.update(Hash::<Sha256>::hash(name));
             attribute.update(value);
             hash.update(attribute.finalize());
         }
+
         Ok(hash.finalize().into())
     }
 }
@@ -401,7 +416,7 @@ impl<'a> Handler<'a, crate::State> for &'a Service {
         'txn: 'a,
     {
         Some(Box::new(move |_txn, _key| {
-            Box::pin(async move { Ok(crate::State::from_scalar(self.definition.clone())) })
+            Box::pin(async move { Ok(crate::State::from(self.definition.clone())) })
         }))
     }
 
@@ -410,17 +425,9 @@ impl<'a> Handler<'a, crate::State> for &'a Service {
         'txn: 'a,
     {
         Some(Box::new(move |txn, key| {
-            Box::pin(async move {
-                if !matches!(key, Scalar::Value(Value::None)) {
-                    return Err(TCError::bad_request(
-                        "Service deletion requires an explicit JSON null",
-                    ));
-                }
-                if !txn.may_mutate(self.identity(), self.identity().path()) {
-                    return Err(TCError::unauthorized("unauthorized Service deletion"));
-                }
-                Ok(())
-            })
+            Box::pin(
+                async move { crate::literal::check_delete(txn, self.identity(), &key, "Service") },
+            )
         }))
     }
 }
@@ -433,17 +440,20 @@ impl Route<crate::State> for Service {
         let Some((name, suffix)) = path.split_first() else {
             return Some(Box::new(self));
         };
+
         match self.attrs.get(name.as_str())? {
             Attr::Chain(chain) => chain.route(suffix),
             Attr::Scalar(scalar) => {
                 let scalar = if suffix.is_empty() {
                     scalar
                 } else {
-                    let Scalar::Map(map) = scalar else {
+                    let tc_ir::Scalar::Map(map) = &scalar else {
                         return None;
                     };
+
                     crate::ir::member(map, suffix)?
                 };
+
                 Some(tc_state::route_scalar(scalar, || self.as_state()))
             }
         }
@@ -463,7 +473,7 @@ async fn required_dir(
 }
 
 fn collection_schema(scalar: &Scalar) -> TCResult<Option<CollectionSchema>> {
-    let Scalar::Ref(reference) = scalar else {
+    let tc_ir::Scalar::Ref(reference) = &scalar else {
         return if scalar.is_ref() {
             Err(TCError::bad_request(
                 "Service attributes must be literal scalars or Chains",
@@ -472,37 +482,46 @@ fn collection_schema(scalar: &Scalar) -> TCResult<Option<CollectionSchema>> {
             Ok(None)
         };
     };
-    let TCRef::Op(OpRef::Get((Subject::Link(class), collection))) = reference.as_ref() else {
+
+    let tc_ir::TCRef::Op(OpRef::Get((Subject::Link(class), collection))) = reference.as_ref()
+    else {
         return Err(TCError::bad_request("expected a native Chain declaration"));
     };
+
     if class.host().is_some() || class.path().as_ref() != &tc_chain::SYNC_CHAIN[..] {
         return Err(TCError::bad_request("unsupported Chain variant"));
     }
-    let Scalar::Ref(reference) = collection else {
+
+    let tc_ir::Scalar::Ref(reference) = &collection else {
         return Err(TCError::bad_request("invalid collection declaration"));
     };
-    let TCRef::Op(OpRef::Get((Subject::Link(class), schema))) = reference.as_ref() else {
+
+    let tc_ir::TCRef::Op(OpRef::Get((Subject::Link(class), schema))) = reference.as_ref() else {
         return Err(TCError::bad_request("invalid collection declaration"));
     };
+
     if class.host().is_some() {
         return Err(TCError::bad_request("collection class must be native"));
     }
     let schema = Value::try_cast_from(schema.clone(), |_| {
         TCError::bad_request("invalid collection schema")
     })?;
-    CollectionSchema::try_cast_from((class.path().clone(), schema), |_| {
-        TCError::bad_request("unsupported persistent collection schema")
-    })
-    .map(Some)
+
+    CollectionSchema::try_from((class.path().clone(), schema))
+        .map_err(|error| {
+            TCError::bad_request("unsupported persistent collection schema").consume(error)
+        })
+        .map(Some)
 }
 
 fn validate(identity: &Link, definition: &Scalar) -> TCResult<Map<Attr<CollectionSchema>>> {
     crate::uri::validate_identity(identity, "service")?;
-    let Scalar::Map(proto) = definition else {
+    let tc_ir::Scalar::Map(proto) = &definition else {
         return Err(TCError::bad_request(
             "Service definition must be an attribute map",
         ));
     };
+
     let mut attrs = Map::new();
     for (name, scalar) in proto {
         if name.as_str() == "replicas" {
@@ -511,7 +530,7 @@ fn validate(identity: &Link, definition: &Scalar) -> TCResult<Map<Attr<Collectio
             ));
         }
         let attr = match scalar.clone() {
-            Scalar::Op(op) => {
+            tc_ir::Scalar::Op(op) => {
                 op.validate()?;
                 let op = if matches!(op, OpDef::Put(_) | OpDef::Delete(_)) {
                     let op = op.reference_self(identity);
@@ -531,63 +550,24 @@ fn validate(identity: &Link, definition: &Scalar) -> TCResult<Map<Attr<Collectio
                 } else {
                     op.dereference_self(identity)
                 };
-                Attr::Scalar(Scalar::Op(op))
+
+                Attr::Scalar(Scalar::from(op))
             }
-            scalar => match collection_schema(&scalar)? {
-                Some(schema) => Attr::Chain(schema),
-                None => Attr::Scalar(scalar),
-            },
+            kind => {
+                let scalar = kind;
+                match collection_schema(&scalar)? {
+                    Some(schema) => Attr::Chain(schema),
+                    None => Attr::Scalar(scalar),
+                }
+            }
         };
+
         attrs.insert(name.clone(), attr);
     }
+
     Ok(attrs)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn declarations_and_replicated_methods_fail_before_storage_allocation() {
-        let identity = "/service/test/native/1.0.0".parse().unwrap();
-        let definition =
-            |value| Scalar::Map([("data".parse().unwrap(), value)].into_iter().collect());
-        let get = |path: &str, key| {
-            Scalar::from(TCRef::Op(OpRef::Get((
-                Subject::Link(path.parse().unwrap()),
-                key,
-            ))))
-        };
-        for value in [
-            get("/state/chain/block", Scalar::default()),
-            get(
-                "/state/chain/sync",
-                get("/state/collection/tensor", Scalar::default()),
-            ),
-            get(
-                "/state/chain/sync",
-                get(
-                    "/state/collection/btree",
-                    Value::from("invalid schema").into(),
-                ),
-            ),
-            Scalar::Tuple(vec![get("/service/test/other/1.0.0", Scalar::default())]),
-        ] {
-            assert!(validate(&identity, &definition(value)).is_err());
-        }
-        let external = Scalar::Op(OpDef::Put((
-            "key".parse().unwrap(),
-            "value".parse().unwrap(),
-            vec![(
-                "write".parse().unwrap(),
-                Scalar::from(TCRef::Op(OpRef::Put((
-                    Subject::Link("/service/test/other/1.0.0/data".parse().unwrap()),
-                    Scalar::default(),
-                    Scalar::default(),
-                )))),
-            )],
-        )));
-        assert!(validate(&identity, &definition(external)).is_err());
-        assert!(validate(&identity, &definition(Value::from("literal").into())).is_ok());
-    }
-}
+#[path = "../tests/support/service_validation.rs"]
+mod tests;

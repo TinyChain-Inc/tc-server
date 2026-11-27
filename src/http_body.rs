@@ -59,14 +59,6 @@ impl BoundedBody {
         }
     }
 
-    #[cfg(feature = "http-server")]
-    pub(crate) fn decode_error(&mut self, error: impl std::fmt::Display) -> TCError {
-        self.failure
-            .take()
-            .unwrap_or_else(|| TCError::bad_request(error.to_string()))
-    }
-
-    #[cfg(feature = "http-client")]
     pub(crate) fn take_failure(&mut self) -> Option<TCError> {
         self.failure.take()
     }

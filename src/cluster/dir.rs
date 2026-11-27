@@ -1,12 +1,15 @@
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use pathlink::PathSegment;
 use semver::Version;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Handler, Id, Map, Route, Transact, TxnId};
 
-use super::{AsyncHash, Cluster, DirItem, REPLICAS};
 use crate::storage::ApplicationBlock;
+use super::{AsyncHash, Cluster, DirItem, REPLICAS};
 
 impl<T> Cluster<Dir<T>>
 where
@@ -106,19 +109,30 @@ where
     T: AsyncHash + Clone + Send + Sync + 'static,
 {
     pub(crate) async fn exact_hash(self, txn: &crate::TxnHandle) -> TCResult<[u8; 32]> {
-        match self {
-            Self::Dir { cluster, unmatched } if unmatched.is_empty() => {
-                cluster.state().hash(txn).await
+        match self.into_exact()? {
+            DirEntry::Dir(cluster) => {
+                let (txn, _call) = cluster.enter(txn).await?;
+                cluster.state().hash(&txn).await
             }
-            Self::Item {
-                cluster, suffix, ..
-            } if suffix.is_empty() => cluster.state().hash(txn).await,
-            _ => Err(TCError::not_found("bootstrap resource")),
+            DirEntry::Item(cluster) => {
+                let (txn, _call) = cluster.enter(txn).await?;
+                cluster.state().hash(&txn).await
+            }
         }
     }
 }
 
 impl<T> Resolved<T> {
+    pub(super) fn into_exact(self) -> TCResult<DirEntry<T>> {
+        match self {
+            Self::Dir { cluster, unmatched } if unmatched.is_empty() => Ok(DirEntry::Dir(cluster)),
+            Self::Item {
+                cluster, suffix, ..
+            } if suffix.is_empty() => Ok(DirEntry::Item(cluster)),
+            _ => Err(TCError::not_found("bootstrap resource")),
+        }
+    }
+
     pub(crate) fn exact_item(self) -> TCResult<Option<Cluster<T>>> {
         match self {
             Self::Item {
@@ -183,8 +197,8 @@ where
     let Some((parent, name)) = ancestors.next() else {
         return Err(TCError::conflict("an application root cannot be deleted"));
     };
+
     parent.state().delete(txn.id(), name).await?;
-    txn.mark_resource_mutated(parent.path())?;
     let mut empty = parent.state().entries(txn.id()).await?.is_empty();
     for (parent, name) in ancestors {
         if !empty {
@@ -196,7 +210,6 @@ where
         empty = child.state().entries(txn.id()).await?.is_empty();
         if empty {
             parent.state().delete(txn.id(), name).await?;
-            txn.mark_resource_mutated(parent.path())?;
         }
     }
     Ok(())
@@ -271,6 +284,7 @@ where
 
     async fn create(&self, txn_id: TxnId, name: Id, value: DirEntry<T>) -> TCResult<DirEntry<T>> {
         use txn_lock::map::Entry;
+
         match self
             .members
             .entry(txn_id, name)
@@ -278,7 +292,7 @@ where
             .map_err(TCError::from)?
         {
             Entry::Vacant(entry) => {
-                entry.insert(value.clone());
+                entry.insert(value.clone())?;
                 Ok(value)
             }
             Entry::Occupied(entry)
@@ -313,32 +327,75 @@ impl<T> Cluster<Dir<T>>
 where
     T: Clone + Send + Sync + 'static,
 {
-    pub(crate) fn lookup<'a>(
-        self,
-        txn: &'a crate::TxnHandle,
-        path: &'a [PathSegment],
-    ) -> Pin<Box<dyn Future<Output = TCResult<Resolved<T>>> + Send + 'a>> {
-        self.lookup_from(txn, path, Vec::new())
+    pub(crate) async fn lookup(
+        mut self,
+        txn: &crate::TxnHandle,
+        mut path: &[PathSegment],
+    ) -> TCResult<Resolved<T>> {
+        let mut ancestors = Vec::new();
+
+        loop {
+            let Some((segment, suffix)) = path.split_first() else {
+                return Ok(Resolved::Dir {
+                    cluster: self,
+                    unmatched: Box::new([]),
+                });
+            };
+
+            if segment.as_str() == REPLICAS {
+                return Ok(Resolved::Dir {
+                    cluster: self,
+                    unmatched: path.into(),
+                });
+            }
+
+            let entry = self.state.entry(txn.id(), segment).await?;
+            match entry {
+                Some(DirEntry::Dir(dir)) => {
+                    ancestors.push((self, segment.clone()));
+                    self = dir;
+                    path = suffix;
+                }
+                Some(DirEntry::Item(item)) => {
+                    ancestors.push((self, segment.clone()));
+                    return Ok(Resolved::Item {
+                        cluster: item,
+                        suffix: suffix.into(),
+                        ancestors,
+                    });
+                }
+                None => {
+                    return Ok(Resolved::Dir {
+                        cluster: self,
+                        unmatched: path.into(),
+                    });
+                }
+            }
+        }
     }
 
-    pub(crate) fn create_item_if_absent<'a, Verify, Create, Fut>(
+    pub(crate) fn create_item_if_absent<'a, Input, Verify, Prepare, Create, Fut>(
         self,
         txn: &'a crate::TxnHandle,
         path: &'a [PathSegment],
         structural: &'a [Id],
+        input: Input,
         verify: Verify,
-        create: Create,
+        prepare: Prepare,
     ) -> Pin<Box<dyn Future<Output = TCResult<()>> + Send + 'a>>
     where
-        Verify: FnOnce(&T) -> TCResult<()> + Send + 'a,
-        Create: FnOnce(Cluster<Dir<T>>, Vec<Id>) -> Fut + Send + 'a,
-        Fut: Future<Output = TCResult<()>> + Send + 'a,
+        Input: Send + 'a,
+        Verify: FnOnce(&T, &Input) -> TCResult<()> + Send + 'a,
+        Prepare: FnOnce(Input) -> ((tc_ir::Scalar, crate::State), Create) + Send + 'a,
+        Create: FnOnce(txfs::Dir<TxnId, ApplicationBlock>) -> Fut + Send + 'a,
+        Fut: Future<Output = TCResult<T>> + Send + 'a,
     {
         Box::pin(async move {
-            match self.lookup(txn, path).await? {
+            self.check_structure(txn.id(), path).await?;
+            match self.clone().lookup(txn, path).await? {
                 Resolved::Item {
                     cluster, suffix, ..
-                } if suffix.is_empty() => verify(cluster.state()),
+                } if suffix.is_empty() => verify(cluster.state(), &input),
                 Resolved::Item { .. } => Err(TCError::conflict(
                     "an application item blocks this immutable identity",
                 )),
@@ -348,60 +405,71 @@ where
                             "a directory already occupies this immutable identity",
                         ));
                     }
+
                     let consumed = cluster.path().len().saturating_sub(1);
-                    create(cluster, structural[consumed..].to_vec()).await
+                    let peers = self.replication_peers(txn).await?;
+                    let ((key, value), create) = prepare(input);
+                    cluster
+                        .create_item(txn, &structural[consumed..], create)
+                        .await?;
+
+                    self.replicate(
+                        txn,
+                        &peers,
+                        &pathlink::Link::from(self.path().clone()),
+                        key,
+                        Some(value),
+                    )
+                    .await
                 }
             }
         })
     }
 
-    fn lookup_from<'a>(
-        self,
-        txn: &'a crate::TxnHandle,
-        path: &'a [PathSegment],
-        mut ancestors: Vec<(Cluster<Dir<T>>, Id)>,
-    ) -> Pin<Box<dyn Future<Output = TCResult<Resolved<T>>> + Send + 'a>> {
-        Box::pin(async move {
-            self.claim(txn).await?;
-            let Some((segment, suffix)) = path.split_first() else {
-                return Ok(Resolved::Dir {
-                    cluster: self,
-                    unmatched: Box::new([]),
-                });
-            };
-            if segment.as_str() == REPLICAS {
-                return Ok(Resolved::Dir {
-                    cluster: self,
-                    unmatched: path.into(),
-                });
-            }
-            let Ok(name) = segment.as_str().parse::<Id>() else {
-                return Ok(Resolved::Dir {
-                    cluster: self,
-                    unmatched: path.into(),
-                });
-            };
-            let entry = self.state.entry(txn.id(), &name).await?;
-            match entry {
-                Some(DirEntry::Dir(dir)) => {
-                    ancestors.push((self, name));
-                    dir.lookup_from(txn, suffix, ancestors).await
+    // A namespace decision recursively covers its members. Structural mutation
+    // cannot overlap another enlisted descendant or a different replica set.
+    async fn check_structure(&self, txn_id: TxnId, target: &[PathSegment]) -> TCResult<()> {
+        let identities = self.replica_identities(txn_id).await?;
+        let mut pending = vec![self.clone()];
+
+        while let Some(directory) = pending.pop() {
+            let entries = directory
+                .state
+                .members
+                .iter(txn_id)
+                .await
+                .map_err(TCError::from)?;
+
+            for (_, entry) in entries {
+                match &*entry {
+                    DirEntry::Dir(child) => {
+                        child.reserve_structure(txn_id)?;
+                        let suffix = &child.path()[self.path().len()..];
+                        if target.starts_with(suffix)
+                            && child.replica_identities(txn_id).await? != identities
+                        {
+                            return Err(TCError::conflict(
+                                "structural mutation requires matching namespace replica sets",
+                            ));
+                        }
+
+                        pending.push(child.clone());
+                    }
+                    DirEntry::Item(child) => {
+                        child.reserve_structure(txn_id)?;
+                        if target == &child.path()[self.path().len()..]
+                            && child.replica_identities(txn_id).await? != identities
+                        {
+                            return Err(TCError::conflict(
+                                "structural mutation requires matching namespace replica sets",
+                            ));
+                        }
+                    }
                 }
-                Some(DirEntry::Item(item)) => {
-                    item.claim(txn).await?;
-                    ancestors.push((self, name));
-                    Ok(Resolved::Item {
-                        cluster: item.clone(),
-                        suffix: suffix.into(),
-                        ancestors,
-                    })
-                }
-                None => Ok(Resolved::Dir {
-                    cluster: self,
-                    unmatched: path.into(),
-                }),
             }
-        })
+        }
+
+        Ok(())
     }
 
     pub(crate) fn create_item<'a, F, Fut>(
@@ -415,7 +483,6 @@ where
         Fut: Future<Output = TCResult<T>> + Send + 'a,
     {
         Box::pin(async move {
-            self.claim(txn).await?;
             let Some((name, suffix)) = path.split_first() else {
                 return Err(TCError::bad_request("an application item requires a name"));
             };
@@ -446,18 +513,19 @@ where
                     Arc::clone(&self.gateway),
                     replicas,
                 );
+
+                cluster.reserve_structure(txn.id())?;
                 let DirEntry::Item(cluster) = self
                     .state
                     .create(txn.id(), name.clone(), DirEntry::Item(cluster))
                     .await?
                 else {
-                    return Err(TCError::internal("directory returned the wrong entry type"));
+                    unreachable!("directory returned the wrong entry type");
                 };
-                cluster.claim(txn).await?;
-                txn.mark_resource_mutated(self.path())?;
-                txn.mark_resource_mutated(cluster.path())?;
+
                 return Ok(cluster);
             }
+
             let child = match self.state.entry(txn.id(), name).await? {
                 Some(DirEntry::Dir(dir)) => dir,
                 Some(DirEntry::Item(_)) => {
@@ -485,17 +553,20 @@ where
                         Arc::clone(&self.gateway),
                         replicas,
                     );
+
+                    child.reserve_structure(txn.id())?;
                     let DirEntry::Dir(child) = self
                         .state
                         .create(txn.id(), name.clone(), DirEntry::Dir(child))
                         .await?
                     else {
-                        return Err(TCError::internal("directory returned the wrong entry type"));
+                        unreachable!("directory returned the wrong entry type");
                     };
-                    txn.mark_resource_mutated(self.path())?;
+
                     child
                 }
             };
+
             child.create_item(txn, suffix, create).await
         })
     }
@@ -505,67 +576,104 @@ impl<T> Cluster<Dir<T>>
 where
     T: DirItem,
 {
-    pub(crate) async fn dispatch<'a>(
+    pub(crate) fn dispatch<'a, Namespace>(
         self,
         txn: &'a crate::TxnHandle,
-        target: &pathlink::Link,
+        target: &'a pathlink::Link,
         method: tc_ir::Method,
         body: Option<crate::State>,
-        namespace: Box<dyn Handler<'a, crate::State> + 'a>,
-    ) -> TCResult<(Option<crate::State>, bool)> {
-        let segments = target.path().get(1..).unwrap_or_default();
-        match self.lookup(txn, segments).await? {
-            Resolved::Dir { cluster, unmatched } => {
-                if segments.is_empty()
-                    && unmatched.is_empty()
-                    && method == tc_ir::Method::Put
-                    && body.is_some()
-                    && !txn.is_locked()
-                {
-                    return crate::kernel::invoke_handler(namespace, txn, method, body)
-                        .await
-                        .map(|state| (Some(state), false));
-                }
-                cluster
-                    .invoke(txn, unmatched, method, body, &target.to_string())
-                    .await
-                    .map(|state| (state, false))
-            }
-            Resolved::Item {
-                cluster,
-                suffix,
-                ancestors,
-            } => {
-                let exact_item = suffix.is_empty();
-                let explicit_delete = method == tc_ir::Method::Delete
-                    && exact_item
-                    && matches!(
-                        &body,
-                        Some(crate::State::None)
-                            | Some(crate::State::Scalar(tc_ir::Scalar::Value(
-                                tc_value::Value::None
-                            )))
-                    );
-                let txn = cluster.state().bind(txn);
-                let state = cluster
-                    .clone()
-                    .invoke(&txn, suffix, method, body, &target.to_string())
-                    .await?;
-                if explicit_delete {
-                    remove_membership(&txn, ancestors).await?;
+        namespace: Namespace,
+    ) -> impl Future<Output = TCResult<Option<crate::State>>> + Send + 'a
+    where
+        Namespace: Send + 'a,
+        for<'handler> &'handler Namespace: Handler<'handler, crate::State>,
+    {
+        // Keep the three concrete directory dispatch frames out of the kernel's
+        // recursive application polling frame on ordinary worker stacks.
+        Box::pin(async move {
+            let segments = target.path().get(1..).unwrap_or_default();
+            match self.clone().lookup(txn, segments).await? {
+                Resolved::Dir { cluster, unmatched } => {
+                    if txn.is_locked() {
+                        return cluster
+                            .invoke(txn, unmatched, method, body, &target.to_string())
+                            .await;
+                    }
+
+                    if method != tc_ir::Method::Get {
+                        cluster.check_structure(txn.id(), &unmatched).await?;
+                    }
+
+                    let (txn, _call) = cluster.enter(txn).await?;
+                    if segments.is_empty()
+                        && unmatched.is_empty()
+                        && method == tc_ir::Method::Put
+                        && body.is_some()
+                    {
+                        return crate::kernel::invoke_handler(Box::new(&namespace), &txn, method, body)
+                            .await
+                            .map(Some);
+                    }
+
                     cluster
-                        .replicate(
+                        .invoke(&txn, unmatched, method, body, &target.to_string())
+                        .await
+                }
+                Resolved::Item {
+                    cluster,
+                    suffix,
+                    ancestors,
+                } => {
+                    let explicit_delete = method == tc_ir::Method::Delete
+                        && suffix.is_empty()
+                        && body.as_ref().is_some_and(|state| {
+                            matches!(
+                                state,
+                                tc_state::State::None
+                                    | tc_state::State::Scalar(tc_ir::Scalar::Value(
+                                        tc_value::Value::None
+                                    ))
+                            )
+                        });
+
+                    if explicit_delete && !txn.is_locked() {
+                        let (txn, _call) = self.enter(txn).await?;
+                        self.check_structure(txn.id(), segments).await?;
+                        let peers = self.replication_peers(&txn).await?;
+
+                        let txn = cluster.state().bind(&txn);
+                        let state = cluster
+                            .invoke(&txn, suffix, method, body, &target.to_string())
+                            .await?;
+
+                        remove_membership(&txn, ancestors).await?;
+
+                        self.replicate(
                             &txn,
+                            &peers,
                             cluster.state().identity(),
-                            tc_ir::Method::Delete,
-                            tc_ir::Scalar::Value(tc_value::Value::None),
+                            tc_ir::Scalar::default(),
                             None,
                         )
                         .await?;
+
+                        return Ok(state);
+                    }
+
+                    if txn.is_locked() {
+                        return cluster
+                            .invoke(txn, suffix, method, body, &target.to_string())
+                            .await;
+                    }
+
+                    let (txn, _call) = cluster.enter(txn).await?;
+                    let txn = cluster.state().bind(&txn);
+                    cluster
+                        .invoke(&txn, suffix, method, body, &target.to_string())
+                        .await
                 }
-                Ok((state, exact_item))
             }
-        }
+        })
     }
 }
 
@@ -575,7 +683,7 @@ where
 {
     async fn commit(&self, txn_id: TxnId) -> TCResult<()> {
         self.storage.commit(txn_id).await.map_err(TCError::from)?;
-        let (members, _) = self.members.read_and_commit(txn_id).await;
+        let (members, _) = self.members.read_and_commit(txn_id).await?;
         for member in members.values() {
             member.commit(txn_id).await?;
         }
@@ -587,7 +695,8 @@ where
             .rollback(*txn_id)
             .await
             .map_err(TCError::from)?;
-        let (members, _) = self.members.read_and_rollback(*txn_id).await;
+
+        let members = self.members.read_and_rollback(*txn_id).await?;
         for member in members.values() {
             member.rollback(txn_id).await?;
         }
@@ -595,11 +704,12 @@ where
     }
 
     async fn finalize(&self, cutoff: &TxnId) -> TCResult<()> {
-        if let Some(members) = self.members.read_and_finalize(*cutoff) {
+        if let Some(members) = self.members.read_and_finalize(*cutoff)? {
             for member in members.values() {
                 member.finalize(cutoff).await?;
             }
         }
+
         self.storage.finalize(*cutoff).await.map_err(TCError::from)
     }
 }
@@ -646,100 +756,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Cluster, Resolved};
-    use crate::replication::Replica;
-    use tc_ir::{Scalar, Transact, TxnId};
-    use txn_lock::map::Entry;
-    #[tokio::test]
-    async fn root_lifecycle_delegates_to_nested_cluster_replica_state() {
-        let kernel = crate::txn::test_kernel("nested-cluster-lifecycle").await;
-        let identity: pathlink::Link = "/service/example/nested/resource/1.0.0"
-            .parse()
-            .expect("Service identity");
-        let segments = crate::uri::validate_identity(&identity, "service").expect("identity");
-        let path = identity.path()[1..].to_vec();
-        let definition = Scalar::Map(tc_ir::Map::new());
-        let create_txn = kernel.test_txn().await;
-        let create_txn_id = create_txn.id();
-        kernel
-            .test_services()
-            .create_item(&create_txn, &segments, move |storage| {
-                crate::service::Service::create(create_txn_id, storage, identity, definition, 8)
-            })
-            .await
-            .expect("create nested Service");
-        kernel
-            .test_services()
-            .commit(create_txn_id)
-            .await
-            .expect("commit nested tree");
-        let txn = kernel.test_txn().await;
-        let Resolved::Item { ancestors, .. } = kernel
-            .test_services()
-            .lookup(&txn, &path)
-            .await
-            .expect("resolve nested Service")
-        else {
-            panic!("expected nested Service item");
-        };
-        let parent = &ancestors.last().expect("parent directory").0;
-        let replica = Replica {
-            endpoint: "http://replica.example".into(),
-            host: "/host".into(),
-            actor_id: "replica".into(),
-            algorithm: rjwt::AlgKind::Falcon512,
-            public_key_b64: "key".into(),
-        };
-        insert_replica(parent, txn.id(), replica.clone()).await;
-        kernel
-            .test_services()
-            .commit(txn.id())
-            .await
-            .expect("recursive commit");
-        assert!(has_replica(parent, txn.id(), &replica.endpoint).await);
-        let rollback_txn = kernel.test_txn().await;
-        parent
-            .replicas
-            .remove(rollback_txn.id(), &replica.endpoint)
-            .await
-            .expect("stage replica removal");
-        kernel
-            .test_services()
-            .rollback(&rollback_txn.id())
-            .await
-            .expect("recursive rollback");
-        assert!(has_replica(parent, rollback_txn.id(), &replica.endpoint).await);
-        let pending_txn = kernel.test_txn().await;
-        let pending = Replica {
-            endpoint: "http://pending.example".into(),
-            ..replica
-        };
-        insert_replica(parent, pending_txn.id(), pending.clone()).await;
-        kernel
-            .test_services()
-            .finalize(&pending_txn.id())
-            .await
-            .expect("recursive finalization");
-        assert!(!has_replica(parent, pending_txn.id(), &pending.endpoint).await);
-    }
-    async fn has_replica<T>(cluster: &Cluster<T>, txn_id: TxnId, endpoint: &str) -> bool {
-        cluster
-            .replica_snapshot(txn_id)
-            .await
-            .unwrap()
-            .iter()
-            .any(|known| known.endpoint == endpoint)
-    }
-    async fn insert_replica<T>(cluster: &Cluster<T>, txn_id: TxnId, replica: Replica) {
-        let entry = cluster
-            .replicas
-            .entry(txn_id, replica.endpoint.clone())
-            .await
-            .unwrap();
-        let Entry::Vacant(entry) = entry else {
-            panic!("new replica already exists")
-        };
-        entry.insert(replica);
-    }
-}
+#[path = "../../tests/support/cluster_dir.rs"]
+mod tests;

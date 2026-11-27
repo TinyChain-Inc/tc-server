@@ -1,7 +1,10 @@
+use futures::TryStreamExt;
 use hyper::body::HttpBody;
 use hyper::header::AUTHORIZATION;
-use tc_error::TCResult;
+use tc_error::{TCError, TCResult};
+use tokio::sync::OwnedSemaphorePermit;
 
+use crate::BodyContract;
 use super::Request;
 
 pub(crate) fn parse_bearer_token(req: &Request) -> Option<String> {
@@ -13,17 +16,41 @@ pub(crate) fn parse_bearer_token(req: &Request) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub(crate) async fn decode_native_body(
+/// Decode transport representations without selecting or executing an operation.
+pub(crate) async fn decode_body(
     req: Request,
-    txn: crate::txn::TxnHandle,
-    max_request_bytes: usize,
-) -> TCResult<Option<tc_state::State<crate::txn::TxnHandle>>> {
-    if req.body().size_hint().exact() == Some(0) {
-        return Ok(None);
-    }
-    let mut stream = crate::http_body::BoundedBody::new(req.into_body(), max_request_bytes, None);
-    match destream_json::try_decode(txn, &mut stream).await {
-        Ok(state) => Ok(Some(state)),
-        Err(err) => Err(stream.decode_error(err)),
-    }
+    request: &crate::BoundRequest,
+) -> TCResult<(Option<crate::State>, Option<OwnedSemaphorePermit>)> {
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+
+    let contract = request.body_contract(content_type)?;
+    let (limit, admission) = match contract {
+        BodyContract::Native(_) if req.body().size_hint().exact() == Some(0) => {
+            return Ok((None, None));
+        }
+        BodyContract::Native(limit) => (limit, None),
+        BodyContract::Definition(limit) | BodyContract::Wasm(limit) => {
+            (limit, Some(request.application_admission()))
+        }
+    };
+
+    let mut body = crate::http_body::BoundedBody::new(req.into_body(), limit, admission);
+    let result = if matches!(contract, BodyContract::Wasm(_)) {
+        (&mut body)
+            .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                bytes.extend_from_slice(&chunk);
+                Ok(bytes)
+            })
+            .await
+            .map_err(|error| TCError::bad_request(error.to_string()))
+            .and_then(|bytes| crate::wasm_installation(bytes.into()))
+    } else {
+        request.decode_json(&mut body).await
+    };
+
+    let state = result.map_err(|error| body.take_failure().unwrap_or(error))?;
+    Ok((Some(state), body.permit.take()))
 }

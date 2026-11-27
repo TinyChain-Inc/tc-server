@@ -6,13 +6,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{Duration, SystemTime};
 
     use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
-    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
     use pathlink::Link;
     use rjwt::{AlgKind, SigningKey};
-    use tinychain::Claim;
     use umask::{USER_EXEC, USER_WRITE};
 
+    use tinychain::Claim;
     use tinychain::auth::{Actor, Token};
 
     let mut host: Option<String> = None;
@@ -81,7 +80,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(ttl_secs),
         actor.id().clone(),
         tinychain::auth::wire_claim(claims.first().cloned().ok_or("missing --lib claim")?),
-    );
+    )
+    .expect("valid token time");
+
     let mut signed = actor.sign_token(token)?;
     for claim in claims.iter().skip(1).cloned() {
         signed = actor.consume_and_sign(

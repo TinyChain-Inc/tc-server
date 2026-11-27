@@ -51,7 +51,6 @@ impl ProtocolAuthority {
 
 #[derive(Clone)]
 pub(crate) struct TxnConfig {
-    ttl: Duration,
     grace: Duration,
     protocol: ProtocolAuthority,
     workspace: Workspace,
@@ -63,10 +62,8 @@ impl TxnConfig {
         authority: ProtocolAuthority,
         workspace: Workspace,
         resources: crate::HostResources,
-        ttl: Duration,
     ) -> Self {
         Self {
-            ttl,
             grace: Duration::from_nanos(super::wire::MAX_INBOUND_TXN_CLOCK_SKEW_NANOS),
             protocol: authority,
             workspace,
@@ -75,7 +72,7 @@ impl TxnConfig {
     }
 
     pub(super) fn ttl(&self) -> Duration {
-        self.ttl
+        self.resources.limits().transaction_ttl
     }
 
     pub(super) fn grace(&self) -> Duration {

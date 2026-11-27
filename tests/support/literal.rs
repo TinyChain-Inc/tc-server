@@ -1,8 +1,10 @@
-use super::*;
+use std::io;
+
 use bytes::Bytes;
 use futures::TryStreamExt;
-use std::io;
 use tc_value::Value;
+
+use super::*;
 
 #[tokio::test]
 async fn definition_is_exactly_one_entry() {

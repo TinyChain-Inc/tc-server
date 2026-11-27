@@ -1,8 +1,8 @@
-use crate::State;
 use safecast::TryCastFrom;
 use tc_error::{TCError, TCResult};
 use tc_ir::OpDef;
 
+use crate::State;
 use super::executor::Executor;
 
 pub(crate) async fn execute(
@@ -18,12 +18,14 @@ pub(crate) async fn execute(
             let key = tc_ir::Scalar::try_cast_from(args, |_| {
                 TCError::bad_request("GET and DELETE OpDefs expect a scalar key")
             })?;
-            (vec![(key_name, State::from_scalar(key))], form)
+
+            (vec![(key_name, State::from(key))], form)
         }
         OpDef::Put((key_name, value_name, form)) => {
-            let State::Tuple(mut args) = args else {
+            let tc_state::State::Tuple(mut args) = args else {
                 return Err(TCError::bad_request("PUT OpDef expects [key, value]"));
             };
+
             if args.len() != 2 {
                 return Err(TCError::bad_request("PUT OpDef expects [key, value]"));
             }
@@ -33,14 +35,15 @@ pub(crate) async fn execute(
                 |_| TCError::bad_request("PUT OpDef expects a scalar key"),
             )?;
             (
-                vec![(key_name, State::from_scalar(key)), (value_name, value)],
+                vec![(key_name, State::from(key)), (value_name, value)],
                 form,
             )
         }
         OpDef::Post(form) => {
-            let State::Map(params) = args else {
+            let tc_state::State::Map(params) = args else {
                 return Err(TCError::bad_request("POST OpDef expects a parameter map"));
             };
+
             (params.into_iter().collect(), form)
         }
     };

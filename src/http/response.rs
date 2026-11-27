@@ -49,3 +49,13 @@ pub(crate) fn tc_error_response(err: TCError) -> Response {
         .body(crate::http_body::json_body(err))
         .expect("tc error response")
 }
+
+/// Project ordinary values; completed requests have no response body.
+pub(crate) async fn request_response(
+    response: Option<(crate::State, crate::BoundRequest)>,
+) -> tc_error::TCResult<Response> {
+    match response {
+        Some((state, request)) => super::native_state_response(state, request).await,
+        None => Ok(no_content()),
+    }
+}

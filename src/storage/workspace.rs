@@ -1,14 +1,14 @@
-use std::{io, path::Path};
+use std::io;
+use std::path::Path;
 
+use destream::{EncodeMap, de, en};
 use freqfs::{FileLoad, FileSave};
 use futures::StreamExt;
 use get_size::GetSize;
 use safecast::AsType;
+use tc_ir::{Id, TxnId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
-
-use destream::{EncodeMap, de, en};
-use tc_ir::{Id, TxnId};
 
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
@@ -114,10 +114,12 @@ impl AsType<ControlFile> for ControlFile {
 }
 
 impl GetSize for ControlFile {
-    fn get_size(&self) -> usize {
+    fn get_heap_size(&self) -> usize {
         match self {
-            Self::Authority(record) => record_size(record),
-            Self::Frontier(txn_id) => txn_id.to_string().len(),
+            Self::Authority(record) => {
+                record.actor_id.get_heap_size() + record.signing_key.capacity()
+            }
+            Self::Frontier(_) => 0,
         }
     }
 }
@@ -173,10 +175,6 @@ impl FileSave for ControlFile {
             }
         }
     }
-}
-
-fn record_size(record: &AuthorityRecord) -> usize {
-    record.actor_id.as_str().len() + record.algorithm.name().len() + record.signing_key.len()
 }
 
 fn invalid(error: impl std::fmt::Display) -> io::Error {
